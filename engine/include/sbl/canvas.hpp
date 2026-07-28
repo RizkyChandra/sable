@@ -392,6 +392,16 @@ struct UndoRecord {
     [[nodiscard]] std::size_t memoryBytes() const noexcept;
 };
 
+/// Folds `next`'s tile snapshots into `into`, so a run of redraws undoes as one
+/// step.
+///
+/// Only tiles `into` has not already recorded are taken, because the state
+/// `into` holds is the one from before the session started — which is exactly
+/// what "undo the whole edit" has to restore. What both the text tool and the
+/// linework tool build a session out of: they redraw their layer on every
+/// keystroke or every pixel of a drag, and one undo step has to cover the lot.
+void mergeTileRecord(UndoRecord& into, UndoRecord&& next);
+
 struct Document;
 
 /// One stack for pixel and structural changes both, or Ctrl+Z will surprise

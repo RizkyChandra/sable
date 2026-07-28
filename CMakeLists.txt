@@ -185,7 +185,7 @@ if(SABLE_BUILD_APP)
   add_executable(sable app/src/main.cpp app/src/canvas_view.cpp
                        app/src/widgets.cpp app/src/settings.cpp
                        app/src/shortcuts.cpp app/src/icons.cpp
-                       app/src/text_tool.cpp)
+                       app/src/text_tool.cpp app/src/linework_tool.cpp)
 
   # A GUI application on Windows, and a real bundle on macOS — an unbundled
   # binary there cannot take keyboard focus properly.

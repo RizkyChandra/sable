@@ -138,6 +138,17 @@ void drawIcon(ImDrawList* draw, Icon icon, ImVec2 topLeft, float size, ImU32 col
             p.line(0.32f, 0.84f, 0.68f, 0.84f, 0.11f);   // foot
             break;
 
+        case Icon::Linework:
+            // A curve with its control points on it — the thing the tool makes,
+            // and the one part of it that is not just a stroke of paint.
+            p.line(0.16f, 0.70f, 0.40f, 0.30f, 0.08f);
+            p.line(0.40f, 0.30f, 0.62f, 0.66f, 0.08f);
+            p.line(0.62f, 0.66f, 0.86f, 0.28f, 0.08f);
+            p.disc(0.16f, 0.70f, 0.10f);
+            p.disc(0.40f, 0.30f, 0.10f);
+            p.disc(0.86f, 0.28f, 0.10f);
+            break;
+
         case Icon::Plus:
             p.line(0.50f, 0.14f, 0.50f, 0.86f, 0.15f);
             p.line(0.14f, 0.50f, 0.86f, 0.50f, 0.15f);

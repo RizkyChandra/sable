@@ -315,6 +315,17 @@ const std::string kNoLabel{};
 
 }  // namespace
 
+void mergeTileRecord(UndoRecord& into, UndoRecord&& next) {
+    for (TileSnapshot& snap : next.tiles) {
+        const bool known = std::any_of(
+            into.tiles.begin(), into.tiles.end(),
+            [&](const TileSnapshot& s) { return s.key == snap.key; });
+        // Already recorded means `into` holds the state from BEFORE the session,
+        // and that is the one undo has to put back.
+        if (!known) into.tiles.push_back(std::move(snap));
+    }
+}
+
 void UndoStack::push(UndoRecord&& rec) {
     if (rec.empty()) return;              // a stroke that painted nothing costs no step
     done_.push_back(std::move(rec));

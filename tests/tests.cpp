@@ -4715,7 +4715,7 @@ TEST_CASE("drawing text puts ink on the canvas and undo takes all of it away") {
 
     // One session, one step: the merge keeps the state from before the FIRST
     // keystroke, which is what undoing a whole edit has to restore.
-    mergeTextRecord(first, std::move(second));
+    mergeTileRecord(first, std::move(second));
     doc.undo.push(std::move(first));
     doc.undo.undo(doc);
     CHECK(inkedPixels(doc) == 0);
