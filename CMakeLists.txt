@@ -109,7 +109,8 @@ add_library(engine STATIC
   engine/src/input.cpp
   engine/src/paint.cpp
   engine/src/io.cpp
-  engine/src/project.cpp)
+  engine/src/project.cpp
+  engine/src/format.cpp)
 target_include_directories(engine PUBLIC engine/include)
 target_link_libraries(engine PRIVATE lodepng miniz nlohmann_json)
 target_compile_options(engine PRIVATE ${SABLE_WARNINGS})

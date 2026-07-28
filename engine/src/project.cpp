@@ -215,8 +215,13 @@ std::expected<Document, Error> loadProject(const std::filesystem::path& path) {
         return fail(ErrorKind::NotFound, path.string() + " does not exist");
 
     mz_zip_archive zip{};
+    // Say what actually went wrong. Since .sable, .ora and .kra are all ZIP
+    // containers, the format registry decides what a file is; this reader only
+    // reports why it could not read one.
     if (!mz_zip_reader_init_file(&zip, path.string().c_str(), 0))
-        return fail(ErrorKind::Malformed, path.string() + " is not a .sable file");
+        return fail(ErrorKind::Malformed,
+                    path.string() + " is not a readable ZIP archive, so it cannot "
+                    "be a Sable project");
 
     struct ZipGuard {
         mz_zip_archive* z;

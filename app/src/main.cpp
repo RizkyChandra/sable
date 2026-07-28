@@ -33,6 +33,7 @@
 #include "canvas_view.hpp"
 #include "icons.hpp"
 #include "sbl/canvas.hpp"
+#include "sbl/format.hpp"
 #include "sbl/io.hpp"
 #include "sbl/paint.hpp"
 #include "sbl/project.hpp"
@@ -49,7 +50,7 @@ constexpr float kRightPanelBase = 250.0f;
 constexpr float kDegToRad      = 3.14159265358979323846f / 180.0f;
 
 /// What to do once the artist answers the "discard unsaved work?" prompt.
-enum class Pending { None, NewCanvas, Quit, Open };
+enum class Pending { None, NewCanvas, Quit, Open, Import };
 
 enum class Tool { Brush, Eraser, Fill, Select, Transform };
 
@@ -152,8 +153,15 @@ struct App {
     bool openAbout    = false;
 
     /// Which dialog the pending save/open belongs to.
-    enum class FileAction { ExportPng, SaveProject, OpenProject } fileAction =
-        FileAction::ExportPng;
+    enum class FileAction { ExportImage, SaveProject, OpenProject, ImportDocument }
+        fileAction = FileAction::ExportImage;
+
+    // The filters of the dialog currently open. SDL_DialogFileFilter holds
+    // pointers rather than copies, so the strings have to outlive the dialog —
+    // and the chosen index is what decides the extension of a bare filename.
+    std::vector<sbl::DialogFilter>    filterList;
+    std::vector<SDL_DialogFileFilter> filterViews;
+    int                               chosenFilter = -1;
 
     // Dialog results arrive on SDL's thread, not ours.
     std::mutex  dialogMutex;
@@ -380,7 +388,8 @@ void refreshAllTextures(App& app) {
 }
 
 void doSaveProject(App& app, const std::filesystem::path& path) {
-    if (const auto result = sbl::saveProject(app.doc, path); !result.has_value()) {
+    // Through the registry, so Save and Export share one dispatch.
+    if (const auto result = sbl::exportDocument(app.doc, path); !result.has_value()) {
         showError(app, result.error());
         return;
     }
@@ -396,8 +405,10 @@ void doSaveProject(App& app, const std::filesystem::path& path) {
     }
 }
 
-void doOpenProject(App& app, const std::filesystem::path& path) {
-    auto loaded = sbl::loadProject(path);
+/// Open and Import are the same code path: the registry picks the reader, and
+/// it is what decides whether the document keeps a path to save back to.
+void doOpenDocument(App& app, const std::filesystem::path& path) {
+    auto loaded = sbl::importDocument(path);
     if (!loaded.has_value()) {
         showError(app, loaded.error());
         return;
@@ -448,7 +459,7 @@ void maybeAutosave(App& app, std::uint64_t nowMs) {
 }
 
 void doExport(App& app, const std::string& path) {
-    if (const auto result = sbl::exportPng(app.doc, path); !result.has_value())
+    if (const auto result = sbl::exportDocument(app.doc, path); !result.has_value())
         showError(app, result.error());
     // US-07.5: exporting changes nothing about the document, dirty flag included.
 }
@@ -634,14 +645,15 @@ void stepSizePreset(App& app, int direction) {
 
 // -------------------------------------------------------------------- dialogs
 
-void SDLCALL onSaveChosen(void* userdata, const char* const* filelist, int) {
+void SDLCALL onSaveChosen(void* userdata, const char* const* filelist, int filter) {
     App* app = static_cast<App*>(userdata);
     if (filelist == nullptr || filelist[0] == nullptr) return;   // error or cancelled
 
     {
         const std::lock_guard lock(app->dialogMutex);
-        app->dialogPath  = filelist[0];
-        app->dialogReady = true;
+        app->dialogPath   = filelist[0];
+        app->chosenFilter = filter;
+        app->dialogReady  = true;
     }
     // The loop is blocked in SDL_WaitEvent. Wake it.
     SDL_Event wake{};
@@ -649,23 +661,45 @@ void SDLCALL onSaveChosen(void* userdata, const char* const* filelist, int) {
     SDL_PushEvent(&wake);
 }
 
+/// Opens the native dialog with the filters the registry supplies, so a new
+/// importer or exporter appears here without a line changing.
+///
+/// D-002: SDL3's native file dialog, never an ImGui file browser.
+void showFileDialog(App& app, sbl::FormatUse use, bool native, bool saving) {
+    app.filterList = sbl::dialogFilters(use, native);
+    app.filterViews.clear();
+    for (const sbl::DialogFilter& filter : app.filterList)
+        app.filterViews.push_back(
+            SDL_DialogFileFilter{filter.label.c_str(), filter.pattern.c_str()});
+    app.chosenFilter = -1;
+
+    const int count = static_cast<int>(app.filterViews.size());
+    if (saving)
+        SDL_ShowSaveFileDialog(onSaveChosen, &app, app.window,
+                               app.filterViews.data(), count, nullptr);
+    else
+        SDL_ShowOpenFileDialog(onSaveChosen, &app, app.window,
+                               app.filterViews.data(), count, nullptr, false);
+}
+
 void askForExportPath(App& app) {
-    // D-002: SDL3's native file dialog, never an ImGui file browser.
-    static const SDL_DialogFileFilter filters[] = {{"PNG image", "png"}};
-    app.fileAction = App::FileAction::ExportPng;
-    SDL_ShowSaveFileDialog(onSaveChosen, &app, app.window, filters, 1, nullptr);
+    app.fileAction = App::FileAction::ExportImage;
+    showFileDialog(app, sbl::FormatUse::Write, false, true);
 }
 
 void askForSavePath(App& app) {
-    static const SDL_DialogFileFilter filters[] = {{"Sable project", "sable"}};
     app.fileAction = App::FileAction::SaveProject;
-    SDL_ShowSaveFileDialog(onSaveChosen, &app, app.window, filters, 1, nullptr);
+    showFileDialog(app, sbl::FormatUse::Write, true, true);
 }
 
 void askForOpenPath(App& app) {
-    static const SDL_DialogFileFilter filters[] = {{"Sable project", "sable"}};
     app.fileAction = App::FileAction::OpenProject;
-    SDL_ShowOpenFileDialog(onSaveChosen, &app, app.window, filters, 1, nullptr, false);
+    showFileDialog(app, sbl::FormatUse::Read, true, false);
+}
+
+void askForImportPath(App& app) {
+    app.fileAction = App::FileAction::ImportDocument;
+    showFileDialog(app, sbl::FormatUse::Read, false, false);
 }
 
 /// Carries out a Pending::Open once nothing stands in its way. A path that
@@ -675,13 +709,25 @@ void openPending(App& app) {
     if (app.pendingOpenPath.empty()) { askForOpenPath(app); return; }
     const std::filesystem::path path = std::move(app.pendingOpenPath);
     app.pendingOpenPath.clear();
-    doOpenProject(app, path);
+    doOpenDocument(app, path);
 }
 
 /// Ctrl+S: straight to the known path, or the dialog if there is not one yet.
 void doSave(App& app) {
     if (app.doc.path.empty()) askForSavePath(app);
     else                      doSaveProject(app, app.doc.path);
+}
+
+/// The extension of the filter the artist picked, for when they typed a bare
+/// name. A platform that does not report the choice gives -1, and the first
+/// filter is the sensible default.
+std::string chosenExtension(const App& app) {
+    if (app.filterList.empty()) return {};
+    const std::size_t index =
+        app.chosenFilter >= 0 && static_cast<std::size_t>(app.chosenFilter) < app.filterList.size()
+            ? static_cast<std::size_t>(app.chosenFilter) : 0;
+    const std::string& pattern = app.filterList[index].pattern;
+    return "." + pattern.substr(0, pattern.find(';'));   // "jpg;jpeg" -> ".jpg"
 }
 
 void pumpDialog(App& app) {
@@ -695,14 +741,14 @@ void pumpDialog(App& app) {
     }
     if (path.empty()) return;
 
-    if (app.fileAction == App::FileAction::OpenProject) {
-        doOpenProject(app, path);
+    if (app.fileAction == App::FileAction::OpenProject ||
+        app.fileAction == App::FileAction::ImportDocument) {
+        doOpenDocument(app, path);
         return;
     }
 
-    const char* extension =
-        app.fileAction == App::FileAction::SaveProject ? ".sable" : ".png";
-    if (!path.ends_with(extension)) path += extension;
+    const std::string extension = chosenExtension(app);
+    if (!extension.empty() && !path.ends_with(extension)) path += extension;
 
     std::error_code ec;
     if (std::filesystem::exists(path, ec)) {   // US-07.6
@@ -726,6 +772,7 @@ void requestPending(App& app, Pending what, std::string path = {}) {
     if (app.doc.dirty) { app.openDiscard = true; return; }
     if (what == Pending::NewCanvas)   app.openNew = true;
     else if (what == Pending::Open)   openPending(app);
+    else if (what == Pending::Import) askForImportPath(app);
     else                              app.running = false;
     app.pending = Pending::None;
 }
@@ -1003,10 +1050,14 @@ void drawMenuBar(App& app, float& menuHeight) {
         if (ImGui::MenuItem("Save", app.shortcuts.get(Action::Save).label().c_str())) doSave(app);
         if (ImGui::MenuItem("Save as...", app.shortcuts.get(Action::SaveAs).label().c_str())) askForSavePath(app);
         ImGui::Separator();
-        if (ImGui::BeginMenu("Export")) {
-            if (ImGui::MenuItem("PNG...", app.shortcuts.get(Action::ExportPng).label().c_str())) askForExportPath(app);
-            ImGui::EndMenu();
-        }
+        // Import and Export are whatever the registry knows about; the menu
+        // greys out rather than opening a dialog with nothing in it.
+        if (ImGui::MenuItem("Import...", nullptr, false,
+                            !sbl::dialogFilters(sbl::FormatUse::Read, false).empty()))
+            requestPending(app, Pending::Import);
+        if (ImGui::MenuItem("Export...", app.shortcuts.get(Action::ExportPng).label().c_str(), false,
+                            !sbl::dialogFilters(sbl::FormatUse::Write, false).empty()))
+            askForExportPath(app);
         ImGui::Separator();
         if (ImGui::MenuItem("Quit", app.shortcuts.get(Action::Quit).label().c_str())) requestPending(app, Pending::Quit);
         ImGui::EndMenu();
@@ -1640,7 +1691,7 @@ void drawModals(App& app) {
                     ? std::string("(never saved)")
                     : entry.originalPath.filename().string();
             if (ImGui::Button("Open")) {
-                doOpenProject(app, entry.recoveryFile);
+                doOpenDocument(app, entry.recoveryFile);
                 // Opened from recovery, so it is NOT the artist's file — clear
                 // the path so Ctrl+S cannot quietly overwrite the original.
                 app.doc.path.clear();
@@ -1701,6 +1752,7 @@ void drawModals(App& app) {
             ImGui::CloseCurrentPopup();
             if (what == Pending::NewCanvas) app.openNew = true;
             else if (what == Pending::Open) openPending(app);
+            else if (what == Pending::Import) askForImportPath(app);
             else if (what == Pending::Quit) app.running = false;
         }
         ImGui::SameLine();
@@ -1950,7 +2002,7 @@ int main(int argc, char** argv) {
     // not load leaves the blank canvas above in place and shows the error
     // modal — refusing to start is never the right answer to a bad argument
     // (D-012).
-    if (!selfTest && argc > 1) doOpenProject(app, std::filesystem::path(argv[1]));
+    if (!selfTest && argc > 1) doOpenDocument(app, std::filesystem::path(argv[1]));
 
     if (selfTest) {
         // Paint a pressure-varying stroke through the real app path, then
@@ -1989,9 +2041,12 @@ int main(int argc, char** argv) {
         std::error_code ec;
         std::filesystem::remove(project, ec);
         doSaveProject(app, project);
-        const auto reloaded = sbl::loadProject(project);
+        // Through the registry, which is how the app opens files now — and the
+        // native format is the one case that keeps a path to save back to.
+        const auto reloaded = sbl::importDocument(project);
         if (!reloaded.has_value() || reloaded->layers.size() != 2 ||
-            reloaded->layers[1].blend != sbl::BlendMode::Multiply) {
+            reloaded->layers[1].blend != sbl::BlendMode::Multiply ||
+            reloaded->path != project) {
             SDL_Log("selftest FAILED: project round trip");
             return 1;
         }
@@ -2003,7 +2058,7 @@ int main(int argc, char** argv) {
         // because they live above the engine boundary. A path that cannot be
         // loaded must leave the document exactly as it was, and a drop onto a
         // dirty canvas must prompt rather than discard the artist's strokes.
-        doOpenProject(app, std::filesystem::path("/sable-selftest/no-such.sable"));
+        doOpenDocument(app, std::filesystem::path("/sable-selftest/no-such.sable"));
         if (!app.openError || app.doc.layers.size() != 2) {
             SDL_Log("selftest FAILED: a bad path did not fall back to the error modal");
             return 1;
