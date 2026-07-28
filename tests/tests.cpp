@@ -2700,6 +2700,9 @@ TEST_CASE("a layered PSD imports its stack, groups, names and modes") {
     CHECK(doc->background.a == 0);
     CHECK(doc->path.empty());
     CHECK(!doc->dirty);
+    // No layer in this file has a mask, so the mask warning (#40) must stay
+    // quiet — a channel that fires on every PSD is one nobody reads.
+    CHECK(doc->warnings.empty());
 
     // Bottom to top, a folder ahead of its own children — Sable's order, which
     // PSD writes the other way round.
@@ -3498,6 +3501,32 @@ TEST_CASE("a .kra written by Krita imports with its layer stack intact") {
     const auto viaOra = importDocument(fixture("krita.ora"));
     REQUIRE(viaOra.has_value());
     CHECK(hashCanvas(*doc) == hashCanvas(*viaOra));
+}
+
+TEST_CASE("an import that drops a layer says so on the document (#40)") {
+    // The failure this guards against is silence, not the dropped layer: an
+    // artist who opens a .kra with an invert filter in it gets a document that
+    // does not look like their file, and stderr is nowhere they will read.
+    const auto doc = importDocument(fixture("krita.kra"));
+    REQUIRE(doc.has_value());
+    REQUIRE(!doc->warnings.empty());
+
+    const bool namesTheLayer =
+        std::ranges::any_of(doc->warnings, [](const std::string& warning) {
+            return warning.find("Invert") != std::string::npos;
+        });
+    CHECK(namesTheLayer);       // which layer, not just "something was dropped"
+
+    // Carried by the clone the autosave worker gets. `Document` is deep-copied
+    // there field by field, so anything new is dropped by default (the rulers
+    // and the selection both landed in that trap first).
+    CHECK(cloneDocument(*doc).warnings == doc->warnings);
+
+    // And a file with nothing to apologise for says nothing: a channel that
+    // cried wolf on every import would be ignored on the one that mattered.
+    const auto whole = importDocument(fixture("krita.ora"));
+    REQUIRE(whole.has_value());
+    CHECK(whole->warnings.empty());
 }
 
 TEST_CASE("a misnamed .kra is still read as one") {

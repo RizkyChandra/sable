@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
@@ -226,14 +225,13 @@ void fillCanvas(Layer& layer, StraightRgba8 colour,
 struct Importer {
     mz_zip_archive& zip;
     Document& doc;
-    std::string file;          // for messages
     std::string layerPrefix;   // "<document name>/layers/"
 
-    /// The engine has no channel to the UI (D-003 keeps SDL out of it), so
-    /// this is stderr for now. Losing part of someone's document silently
-    /// would be worse than saying it in the wrong place.
-    void warn(const std::string& message) const {
-        std::fprintf(stderr, "sable: %s: %s\n", file.c_str(), message.c_str());
+    /// Onto the document, which is what carries these across the engine/app
+    /// boundary and into the status bar (#40). It used to be stderr, which
+    /// nobody who launched Sable from a desktop icon was ever going to read.
+    void warn(std::string message) const {
+        doc.warnings.push_back(std::move(message));
     }
 
     [[nodiscard]] std::string entry(const std::string& name) const {
@@ -408,7 +406,7 @@ std::expected<Document, Error> readKrita(const std::filesystem::path& path) {
     } guard{&zip};
 
     Document doc;
-    Importer importer{zip, doc, path.filename().string(), {}};
+    Importer importer{zip, doc, {}};
 
     const std::string manifest = importer.entry("maindoc.xml");
     if (manifest.empty())

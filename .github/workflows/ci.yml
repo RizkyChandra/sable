@@ -145,7 +145,10 @@ jobs:
       - name: Run the save path
         env:
           SDL_VIDEODRIVER: offscreen
-          TSAN_OPTIONS: halt_on_error=1
+          # halt_on_error stays on: a race in the save path must fail the job,
+          # not scroll past. The suppression file is third-party only and says
+          # so in its own comments — see tests/tsan.supp.
+          TSAN_OPTIONS: halt_on_error=1 suppressions=${{ github.workspace }}/tests/tsan.supp
         run: ./build-tsan/sable --selftest
 
   # Metadata that a software centre will reject on is cheaper to catch here

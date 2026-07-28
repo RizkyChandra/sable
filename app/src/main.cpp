@@ -194,6 +194,14 @@ struct App {
     std::string gpuWhy = "not tried yet";
     bool useGpu = false;
 
+    /// Things the artist has to be told but must not be interrupted by: what an
+    /// import dropped (#40), why the GPU was refused (#15). The status bar
+    /// shows them in the same amber as the dropped-undo notice.
+    ///
+    /// Replaced, never queued. The newest thing worth saying is the one on
+    /// screen, and a queue would mean a stale message outliving what caused it.
+    std::vector<std::string> notices;
+
     Shortcuts shortcuts;
     Action    rebinding = Action::Count;   // which row is waiting for a key
     /// Interface scale, for low-vision users (PRD §6).
@@ -456,7 +464,13 @@ void applyGpuMode(App& app) {
     if (app.painting) return;
     if (app.useGpu && app.gpu == nullptr) {
         app.gpu = sbl::makeGpuBackend(&app.gpuWhy);
-        if (app.gpu == nullptr) app.useGpu = false;   // no device: stay on the CPU
+        if (app.gpu == nullptr) {
+            app.useGpu = false;                       // no device: stay on the CPU
+            // #15: the fallback has to be visible. An artist who ticked the box
+            // and is still on the CPU would otherwise blame the machine for
+            // performance they were never getting.
+            app.notices = {"Staying on the CPU: " + app.gpuWhy};
+        }
         SDL_Log("paint backend: %s", app.gpuWhy.c_str());
     }
     if (!app.useGpu && app.gpu != nullptr) {
@@ -470,8 +484,10 @@ void applyGpuMode(App& app) {
 }
 
 void resetDocument(App& app, std::int32_t w, std::int32_t h, bool transparent) {
-    // Nothing may outlive the document it was editing.
+    // Nothing may outlive the document it was editing — an import warning
+    // included, since it describes a document that no longer exists.
     app.text.finish(app.window, app.doc);
+    app.notices.clear();
     app.canvas->releaseAll();
     app.doc = sbl::makeDocument(
         w, h, transparent ? sbl::StraightRgba8{0, 0, 0, 0}
@@ -555,6 +571,12 @@ void doOpenDocument(App& app, const std::filesystem::path& path) {
     }
     refreshAllTextures(app);
     app.doc = std::move(*loaded);
+    // #40: once, here, for every format — the registry is the one front door,
+    // so no importer can be added that forgets to be listened to. Assigned
+    // rather than appended, so opening a clean file clears the last file's.
+    app.notices = app.doc.warnings;
+    for (const std::string& warning : app.notices)
+        SDL_Log("%s: %s", path.filename().string().c_str(), warning.c_str());
     applyUndoBudget(app);
     centreSymmetry(app);
     fitToViewport(app.view, app.doc, app.viewport);
@@ -2178,6 +2200,11 @@ void drawStatusBar(const App& app, float windowW, float windowH, float height) {
             ImGui::TextDisabled("   sel %d x %d",
                                 app.doc.selection->w, app.doc.selection->h);
         }
+        // #15: which backend is actually painting, always. The View menu says
+        // what was ASKED for; only this says what happened, which is the
+        // difference that matters when the answer is "not what you ticked".
+        ImGui::SameLine();
+        ImGui::TextDisabled("   %s", app.useGpu ? "GPU" : "CPU");
         // Two memory numbers, because there are two memories. The undo budget
         // is host RAM and still counts exactly what it always counted (#12);
         // this is the other one, and leaving it off the bar would make the
@@ -2195,6 +2222,27 @@ void drawStatusBar(const App& app, float windowW, float windowH, float height) {
             ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.35f, 1.0f),
                                "   %zu older undo step(s) dropped (%d MB limit)",
                                app.doc.undo.droppedRecords(), app.undoBudgetMb);
+        }
+        // #40 and #15. Non-modal on purpose: an import that dropped a filter
+        // layer must not stand between the artist and their drawing, but it
+        // must not be invisible either. One line here, the whole list on hover
+        // — a .kra with six unsupported layers has six different things to say
+        // and no room to say them.
+        if (!app.notices.empty()) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.35f, 1.0f), "   %s",
+                               app.notices.front().c_str());
+            if (app.notices.size() > 1) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.35f, 1.0f), "(+%zu more)",
+                                   app.notices.size() - 1);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::BeginTooltip();
+                for (const std::string& notice : app.notices)
+                    ImGui::TextUnformatted(notice.c_str());
+                ImGui::EndTooltip();
+            }
         }
     }
     ImGui::End();
@@ -3177,7 +3225,23 @@ int main(int argc, char** argv) {
         // pixel. What this checks is the wiring: that flicking the switch
         // mid-session repaints the same canvas rather than a different one.
         const std::vector<sbl::StraightRgba8> onCpu = sbl::flatten(app.doc);
+        const std::size_t undoBefore   = app.doc.undo.size();
+        const std::size_t layersBefore = app.doc.layers.size();
+
+        // #15 asks that a switch preserve the stroke in progress. It does so by
+        // refusing to happen: the backend is holding a batch of dabs for the
+        // layer being painted, and swapping it out would drop them. The menu
+        // item is disabled mid-stroke, so this guard is the only thing that can
+        // still be checked — and a regression here loses pixels silently.
+        beginPaint(app);
         app.useGpu = true;
+        applyGpuMode(app);
+        if (&sbl::paintBackend() != static_cast<sbl::PaintBackend*>(&sbl::cpuBackend())) {
+            SDL_Log("selftest FAILED: the paint backend changed mid-stroke");
+            return 1;
+        }
+        endPaint(app);
+
         applyGpuMode(app);
         if (app.useGpu) {
             const std::vector<sbl::StraightRgba8> onGpu = sbl::flatten(app.doc);
@@ -3192,6 +3256,15 @@ int main(int argc, char** argv) {
             applyGpuMode(app);
             if (worst > 1 || onGpu.size() != onCpu.size()) {
                 SDL_Log("selftest FAILED: the GPU backend differs by %d levels", worst);
+                return 1;
+            }
+            // Back on the CPU, with the tiles read out of VRAM: the document
+            // and its history have to be exactly what they were before the
+            // round trip, or a switch costs the artist work.
+            if (app.doc.undo.size() != undoBefore ||
+                app.doc.layers.size() != layersBefore ||
+                sbl::flatten(app.doc) != onCpu) {
+                SDL_Log("selftest FAILED: switching backends changed the document");
                 return 1;
             }
             SDL_Log("selftest: %s, agrees with the CPU within %d level(s)",

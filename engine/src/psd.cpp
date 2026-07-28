@@ -246,6 +246,11 @@ struct Record {
     /// children, then 1 or 2.
     std::uint32_t section = 0;
 
+    /// The layer carried a mask, which Sable has no home for yet (#35). The
+    /// pixels arrive unmasked, so the artist has to be told (#40) — a mask is
+    /// often the only thing making half a layer invisible.
+    bool hadMask = false;
+
     [[nodiscard]] std::size_t width()  const noexcept {
         return static_cast<std::size_t>(right - left);
     }
@@ -259,7 +264,9 @@ bool readExtraData(Cursor& in, Record& rec) {
     if (!in.ok() || extraLength > in.remaining()) return false;
     const std::size_t extraEnd = in.pos() + extraLength;
 
-    in.skip(in.u32());                             // layer mask: unsupported
+    const std::uint32_t maskLength = in.u32();     // layer mask: unsupported
+    rec.hadMask = maskLength > 0;
+    in.skip(maskLength);
     in.skip(in.u32());                             // layer blending ranges
     if (!in.ok()) return false;
 
@@ -522,6 +529,10 @@ std::expected<Document, Error> readPsd(const std::filesystem::path& path) {
 
         Layer layer;
         layer.name    = rec.name.empty() ? "Layer" : rec.name;
+        if (rec.hadMask)
+            doc.warnings.push_back("layer \"" + layer.name + "\" arrives without its "
+                                   "mask — Sable does not read layer masks yet, so "
+                                   "what the mask hid is visible here");
         layer.opacity = static_cast<float>(rec.opacity) / 255.0f;
         layer.blend   = blendFromKey(rec.blendKey);
         layer.visible = !rec.hidden;
