@@ -3332,6 +3332,80 @@ int main(int argc, char** argv) {
             SDL_Log("selftest: no GPU backend here (%s); CPU only",
                     app.gpuWhy.c_str());
         }
+
+        // --- #21: a 16-bit document, through the application rather than the
+        // engine. The unit tests cover the maths; this covers the wiring the
+        // artist actually touches — the New-canvas checkbox, the paint path,
+        // Ctrl+S and reopening. Last, because it replaces the document every
+        // phase above was counting.
+        {
+            // Asked for, so that the decline is what turns it off rather than
+            // it having happened to be off already.
+            app.useGpu = true;
+            resetDocument(app, 512, 512, false, sbl::ColourDepth::Bits16);
+            if (app.doc.depth != sbl::ColourDepth::Bits16) {
+                SDL_Log("selftest FAILED: the new canvas is not 16-bit");
+                return 1;
+            }
+            if (app.useGpu) {
+                SDL_Log("selftest FAILED: the GPU stayed on for a 16-bit document");
+                return 1;
+            }
+
+            activeBrush(app) = sbl::defaultAirbrush();
+            app.foreground = sbl::StraightRgba8{30, 30, 30, 255};
+            // Stacked low-opacity passes: the workflow D-004 named as the cost
+            // it was accepting, driven through the real app paint path.
+            for (int pass = 0; pass < 12; ++pass) {
+                beginPaint(app);
+                for (int i = 0; i < 24; ++i) {
+                    const double cx = 120.0 + i * 8.0;
+                    sbl::InputSample sample =
+                        mouseSample(app, toScreenX(app.view, cx, 300.0),
+                                         toScreenY(app.view, cx, 300.0));
+                    sample.fromMouse = false;
+                    sample.pressure  = 0.8f;
+                    paintWith(app, sample);
+                }
+                endPaint(app);
+            }
+
+            const auto path = std::filesystem::temp_directory_path() /
+                              "sable_selftest_16bit.sable";
+            app.doc.path = path;
+            doSaveProject(app, path);
+            auto reopened = sbl::importDocument(path);
+            if (!reopened.has_value() ||
+                reopened->depth != sbl::ColourDepth::Bits16) {
+                SDL_Log("selftest FAILED: a 16-bit project did not reopen as 16-bit");
+                return 1;
+            }
+            // The pixels, not merely the manifest: a save that narrowed them
+            // would reload as a perfectly valid 16-bit document full of 8-bit
+            // values, which is the failure that looks like success.
+            const sbl::Tile* saved = app.doc.layers.front().find(sbl::TileKey{0, 1});
+            const sbl::Tile* back  = reopened->layers.front().find(sbl::TileKey{0, 1});
+            if (saved == nullptr || back == nullptr) {
+                SDL_Log("selftest FAILED: the 16-bit stroke wrote no tile");
+                return 1;
+            }
+            int worst16 = 0;
+            for (int y = 0; y < sbl::TILE_SIZE; y += 4)
+                for (int x = 0; x < sbl::TILE_SIZE; x += 4)
+                    worst16 = std::max(worst16,
+                                       std::abs(static_cast<int>(saved->pixel(x, y).a) -
+                                                static_cast<int>(back->pixel(x, y).a)));
+            if (worst16 > 4) {
+                SDL_Log("selftest FAILED: a 16-bit round trip moved alpha by %d",
+                        worst16);
+                return 1;
+            }
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+            SDL_Log("selftest: 16-bit canvas paints, saves and reopens "
+                    "(alpha within %d of 65535), GPU declined it", worst16);
+        }
+
         SDL_Log("selftest OK");
 
         // Exit before the settings write below. The self-test drives the app

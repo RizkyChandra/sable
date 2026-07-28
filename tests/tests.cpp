@@ -5234,3 +5234,59 @@ TEST_CASE("a 16-bit layer merges, fills and transforms without narrowing") {
     CHECK(!moved.empty());
     CHECK(doc.layerById(lower)->find(TileKey{0, 0})->pixel(80, 20).r == 300);
 }
+
+TEST_CASE("the GPU backend declines a 16-bit document and the CPU finishes it") {
+    // #21: the arena, both shaders and every transfer are 8-bit RGBA. Declining
+    // has to mean "the CPU does it", not "nothing happens" and not "half the
+    // depth gets painted" — so this drives the GPU backend as the process
+    // default over a 16-bit document and asks for the same picture back.
+    PaintBackend* gpu = gpuForTests();
+    if (gpu == nullptr) {
+        MESSAGE("no GPU device here; the decline path is not exercised");
+        return;
+    }
+
+    const auto paint = [](Document& doc, PaintBackend* backend) {
+        std::vector<Dab> scratch;
+        Stroke s;
+        beginStroke(s, defaultAirbrush(), StraightRgba8{200, 30, 60, 255}, doc.activeLayer);
+        PaintTarget t{*doc.active(), s.pending, s.touched, doc.width, doc.height,
+                      nullptr, backend};
+        for (int i = 0; i < 30; ++i) paintSample(s, t, at(60.0 + i * 4, 120.0), scratch);
+        doc.undo.push(std::move(s.pending));
+    };
+
+    Document reference = makeDocument(256, 256, StraightRgba8{255, 255, 255, 255},
+                                      ColourDepth::Bits16);
+    Document candidate = makeDocument(256, 256, StraightRgba8{255, 255, 255, 255},
+                                      ColourDepth::Bits16);
+    paint(reference, &cpuBackend());
+    {
+        WithBackend installed{gpu};
+        paint(candidate, gpu);
+        // Whatever the backend thinks it is holding, the host tiles must be the
+        // truth afterwards — this is the call save and autosave make.
+        CHECK(gpu->readback(candidate).has_value());
+    }
+
+    // Identical, not merely close: the GPU never touched these pixels, so there
+    // is no tolerance to allow. Anything else means it painted some of them.
+    const Tile* wanted = reference.layers.front().find(TileKey{0, 0});
+    const Tile* got    = candidate.layers.front().find(TileKey{0, 0});
+    REQUIRE(wanted != nullptr);
+    REQUIRE(got    != nullptr);
+    CHECK(got->depth() == ColourDepth::Bits16);
+    std::size_t differing = 0;
+    for (int y = 0; y < TILE_SIZE; ++y)
+        for (int x = 0; x < TILE_SIZE; ++x)
+            if (!(got->pixel(x, y) == wanted->pixel(x, y))) ++differing;
+    CHECK(differing == 0);
+
+    // And the composite the artist would be looking at agrees too, which goes
+    // through GpuBackend::compositeRect and its own decline.
+    WithBackend installed{gpu};
+    const std::vector<StraightRgba8> onGpu = flatten(candidate);
+    const std::vector<StraightRgba8> onCpu = flatten(reference, cpuBackend());
+    REQUIRE(onGpu.size() == onCpu.size());
+    CHECK(onGpu == onCpu);
+}

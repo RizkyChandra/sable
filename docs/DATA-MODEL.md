@@ -71,6 +71,34 @@ Compositing is then `dst = src + dst * (1 - src.a)` per channel, with no
 per-pixel divide. The 8-bit round-trip is lossy at low alpha, so a
 save/load/save cycle must be tested for drift.
 
+### The second axis: channel width (D-023)
+
+`PremulRgba16` and `StraightRgba16` are the same pair one channel width up.
+Full scale is 65535, not 255 — a 16-bit value is **not** an 8-bit value with
+room to spare, and the type says so.
+
+The four named crossings are the only legal traffic between the widths:
+
+```cpp
+constexpr uint16_t widenChannel(uint8_t)  noexcept;   // c * 257
+constexpr uint8_t  narrowChannel(uint16_t) noexcept;  // round(c / 257)
+
+constexpr PremulRgba16   widen(PremulRgba8)    noexcept;
+constexpr StraightRgba16 widen(StraightRgba8)  noexcept;
+constexpr PremulRgba8    narrow(PremulRgba16)  noexcept;
+constexpr StraightRgba8  narrow(StraightRgba16) noexcept;
+```
+
+`narrow(widen(c)) == c` for every byte, exactly. That identity is load-bearing:
+it is what lets an 8-bit source colour — a picker colour, a fill, a glyph —
+travel through 16-bit code and land on an 8-bit tile as the byte it started as,
+so most paths exist once rather than twice. `narrow` is where precision is
+actually lost, which is why it is spelled out at every call site: an
+unavoidable one is at the PNG export boundary, and an avoidable one is a bug.
+
+This is what D-004's enforcement note was for. When the wider types were added,
+the first build listed every conversion site in the engine as an error.
+
 **Matching SDL:** canvas textures are drawn with
 `SDL_BLENDMODE_BLEND_PREMULTIPLIED` (D-002). The default blend mode assumes
 straight alpha and will render "nearly right" — dark fringes on soft edges — for
@@ -88,34 +116,63 @@ else follows from it.
 ```cpp
 inline constexpr int TILE_SIZE   = 256;
 inline constexpr int TILE_PIXELS = TILE_SIZE * TILE_SIZE;
-inline constexpr int TILE_BYTES  = TILE_PIXELS * 4;   // 262'144
 
-/// Premultiplied RGBA8, row-major, no padding.
+/// D-023: a tile is 256 KiB at 8 bits and 512 KiB at 16, so there is no
+/// TILE_BYTES constant any more. Every byte count asks.
+constexpr std::size_t tileBytes(ColourDepth) noexcept;
+
+/// Premultiplied RGBA, row-major, no padding, at one of the two channel widths.
 /// Heap-allocated deliberately: 256 KiB must never land on the stack, and
 /// moving a Tile must stay a pointer move rather than a memcpy.
 class Tile {
 public:
-    Tile() : px_(std::make_unique<PremulRgba8[]>(TILE_PIXELS)) {}
+    Tile() : Tile(ColourDepth::Bits8) {}          // the default, still
+    explicit Tile(ColourDepth depth);
     Tile(Tile&&) noexcept = default;              // move-only, by design
     Tile& operator=(Tile&&) noexcept = default;
     Tile(const Tile&) = delete;                   // copy must be explicit
     Tile& operator=(const Tile&) = delete;
 
     [[nodiscard]] Tile clone() const;             // for undo snapshots
-    [[nodiscard]] PremulRgba8*       pixels() noexcept       { return px_.get(); }
-    [[nodiscard]] const PremulRgba8* pixels() const noexcept { return px_.get(); }
-    [[nodiscard]] PremulRgba8 pixel(int x, int y) const noexcept;
-    void setPixel(int x, int y, PremulRgba8) noexcept;
+    [[nodiscard]] ColourDepth depth()    const noexcept;
+    [[nodiscard]] std::size_t byteSize() const noexcept;
+
+    // Raw access at ONE width. Null when the tile is the other depth.
+    [[nodiscard]] PremulRgba8*        pixels8()  noexcept;
+    [[nodiscard]] const PremulRgba8*  pixels8()  const noexcept;
+    [[nodiscard]] PremulRgba16*       pixels16() noexcept;
+    [[nodiscard]] const PremulRgba16* pixels16() const noexcept;
+
+    // Depth-agnostic, always in 16-bit units.
+    [[nodiscard]] PremulRgba16 pixel(int x, int y) const noexcept;
+    void setPixel(int x, int y, PremulRgba16) noexcept;
+    void setPixel(int x, int y, PremulRgba8) noexcept;   // widens; always lossless
+    void fill(PremulRgba16) noexcept;
     void fill(PremulRgba8) noexcept;
 
 private:
-    std::unique_ptr<PremulRgba8[]> px_;
+    std::unique_ptr<PremulRgba8[]>  px8_;         // exactly one is allocated
+    std::unique_ptr<PremulRgba16[]> px16_;
+    ColourDepth depth_;
 };
 ```
 
-The buffer is typed rather than `std::byte[]` so the pixel accessors need no
-`reinterpret_cast`. The layout is identical, which is what lets the whole tile
-go to `SDL_UpdateTexture` as one `SDL_PIXELFORMAT_RGBA32` upload.
+The buffers are typed rather than `std::byte[]` so the pixel accessors need no
+`reinterpret_cast`. The 8-bit layout is identical to an RGBA32 texture, which is
+what lets the whole tile go to `SDL_UpdateTexture` as one
+`SDL_PIXELFORMAT_RGBA32` upload — and the reason the GPU backend paints 8-bit
+documents only.
+
+**`pixels8()` and `pixels16()` return null at the wrong depth, on purpose.** A
+path that has not been taught about the other width fails at once and visibly
+rather than writing half a drawing's worth of truncated colour. `pixel()` and
+`setPixel()` are the depth-agnostic pair for everything that does not need the
+raw pointer; reading through them is always safe, and writing 8-bit data is
+always lossless.
+
+**A tile's depth is fixed at construction.** `Layer::depth` decides what
+`tileFor` allocates, and `Document::depth` is the authority that every layer
+copies from — including `cloneDocument`, which is the autosave hand-off.
 
 Move-only with an explicit `clone()` is the point: an accidental copy of a tile
 is 256 KB of silent memcpy, and in the undo path it happens once per touched
@@ -359,7 +416,11 @@ struct Dab {
     float density  = 0.0f;     // 0..1, this dab's paint strength
     float hardness = 0.0f;     // 0..1, edge falloff
     float angle    = 0.0f;     // radians, from tilt/rotation; 0 when round
-    PremulRgba8 colour{};      // density already folded in
+    /// Density already folded in, and 16-bit whatever the document's depth
+    /// (D-023). An airbrush at density 0.06 has an 8-bit dab alpha of 15, and
+    /// its soft edge then multiplies 15 by a few percent of coverage and rounds
+    /// it away — this is where the banding is made, before storage is reached.
+    PremulRgba16 colour{};
     bool  erase = false;       // from BrushPreset::isEraser
 };
 ```
@@ -392,7 +453,7 @@ struct Stroke {
     std::unordered_set<TileKey, TileKeyHash> touched;
 
     // Watercolour and smudge only: colour picked up from the canvas.
-    PremulRgba8 loadedColour{};
+    PremulRgba16 loadedColour{};   // wide, so a smear does not band along itself
     float loadedAmount = 0.0f;
 };
 ```
@@ -596,7 +657,7 @@ layers/<layerId>/tiles/<tx>_<ty>.png   one PNG per non-empty tile, straight alph
 
 ```jsonc
 {
-  "format_version": 3,
+  "format_version": 4,
   "app": "Sable 0.1.0",
   "width": 1024, "height": 1024, "dpi": 72,
   "background": "#ffffff",
@@ -629,8 +690,18 @@ Rules:
 - `format_version` is checked on load. Refuse a higher version with a clear
   message rather than reading it wrong. Version 2 added `vanishing_points`,
   version 3 `selection`, version 4 `"kind": "text"` and the `text` object
-  beside it. Everything each adds is optional, so v1, v2 and v3 files still
-  load unchanged.
+  beside it, version 5 16-bit colour. Everything each adds is optional, so v1,
+  v2 and v3 files still load unchanged.
+- **Version 5 is written only by a 16-bit document.** Every earlier bump was
+  unconditional because each added something an ordinary document might
+  contain; depth is a per-document choice most documents never make. An 8-bit
+  document keeps declaring 4, so saving from a build that has 16-bit does not
+  lock an ordinary painting out of an older Sable in exchange for nothing —
+  and a 16-bit file, which an older Sable genuinely would misread, is still
+  refused by name.
+- `colour.depth` is 8 or 16 (D-023). At 16 the tile PNGs are 16 bits per
+  channel, which PNG carries natively, so they stay openable in any image
+  viewer. Absent, or anything that is not 16, means 8.
 - `"mask": true` means `selection.png` holds the coverage, one byte per pixel of
   the selection's own w x h. A selection whose mask will not decode, or decodes
   at the wrong size, is DROPPED rather than downgraded to its rectangle: a
