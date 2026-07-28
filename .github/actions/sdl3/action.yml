@@ -1,0 +1,63 @@
+name: Build SDL3
+description: >
+  Installs SDL3's build dependencies and builds it from a pinned tag, cached
+  between runs. SDL3 is not in Ubuntu's archive yet, so there is no apt package
+  to use instead. Shared by every job that needs the application rather than
+  just the engine.
+
+inputs:
+  version:
+    description: SDL release tag to build
+    required: true
+  prefix:
+    description: Install prefix
+    required: false
+    default: ${{ github.workspace }}/.sdl3
+
+outputs:
+  prefix:
+    description: Where SDL3 was installed
+    value: ${{ inputs.prefix }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install SDL3 build dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        # From SDL's README-linux. libxss-dev is the one whose absence stops
+        # the configure outright rather than just disabling a feature.
+        sudo apt-get install -y \
+          libasound2-dev libpulse-dev libdbus-1-dev libudev-dev \
+          libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev \
+          libxi-dev libxss-dev libxtst-dev libxkbcommon-dev \
+          libwayland-dev wayland-protocols libdecor-0-dev \
+          libdrm-dev libgbm-dev libgl1-mesa-dev libegl1-mesa-dev
+
+    - name: Cache SDL3
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ inputs.prefix }}
+        key: sdl3-${{ runner.os }}-${{ inputs.version }}-v2
+
+    - name: Build SDL3
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        git clone --depth 1 --branch "${{ inputs.version }}" \
+          https://github.com/libsdl-org/SDL.git "${RUNNER_TEMP}/SDL"
+        cmake -S "${RUNNER_TEMP}/SDL" -B "${RUNNER_TEMP}/SDL/build" -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX="${{ inputs.prefix }}" \
+              -DSDL_SHARED=ON -DSDL_STATIC=OFF \
+              -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_INSTALL_TESTS=OFF
+        cmake --build "${RUNNER_TEMP}/SDL/build"
+        cmake --install "${RUNNER_TEMP}/SDL/build"
+
+    - name: Expose SDL3 to the linker and loader
+      shell: bash
+      run: |
+        echo "CMAKE_PREFIX_PATH=${{ inputs.prefix }}" >> "$GITHUB_ENV"
+        echo "LD_LIBRARY_PATH=${{ inputs.prefix }}/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"

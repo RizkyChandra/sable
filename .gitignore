@@ -26,3 +26,6 @@ layout.ini
 .idea/
 *.swp
 *~
+
+# CI builds SDL3 into the workspace
+.sdl3/

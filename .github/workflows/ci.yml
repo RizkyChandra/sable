@@ -80,32 +80,18 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build g++-14 \
-            libx11-dev libxext-dev libxrandr-dev libxi-dev libxfixes-dev \
-            libxcursor-dev libwayland-dev libxkbcommon-dev libegl1-mesa-dev
-
-      - name: Cache SDL3
-        id: sdl-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/sdl3
-          key: sdl3-${{ runner.os }}-${{ env.SDL_VERSION }}
+          sudo apt-get install -y ninja-build g++-14
 
       - name: Build SDL3
-        if: steps.sdl-cache.outputs.cache-hit != 'true'
-        run: |
-          git clone --depth 1 --branch "$SDL_VERSION" https://github.com/libsdl-org/SDL.git /tmp/SDL
-          cmake -S /tmp/SDL -B /tmp/SDL/build -G Ninja \
-                -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOME/sdl3"
-          cmake --build /tmp/SDL/build
-          cmake --install /tmp/SDL/build
+        uses: ./.github/actions/sdl3
+        with:
+          version: ${{ env.SDL_VERSION }}
 
       - name: Configure
         run: >
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DCMAKE_CXX_COMPILER=g++-14
-          -DCMAKE_PREFIX_PATH="$HOME/sdl3"
 
       - name: Build
         run: cmake --build build
@@ -116,10 +102,7 @@ jobs:
         # background recovery, and exports a PNG.
         env:
           SDL_VIDEODRIVER: offscreen
-          LD_LIBRARY_PATH: ${{ github.workspace }}/../sdl3/lib
-        run: |
-          export LD_LIBRARY_PATH="$HOME/sdl3/lib:${LD_LIBRARY_PATH:-}"
-          ./build/sable --selftest
+        run: ./build/sable --selftest
 
       - name: Check the install tree
         run: |
@@ -140,32 +123,18 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build g++-14 \
-            libx11-dev libxext-dev libxrandr-dev libxi-dev libxfixes-dev \
-            libxcursor-dev libwayland-dev libxkbcommon-dev libegl1-mesa-dev
-
-      - name: Cache SDL3
-        id: sdl-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/sdl3
-          key: sdl3-${{ runner.os }}-${{ env.SDL_VERSION }}
+          sudo apt-get install -y ninja-build g++-14
 
       - name: Build SDL3
-        if: steps.sdl-cache.outputs.cache-hit != 'true'
-        run: |
-          git clone --depth 1 --branch "$SDL_VERSION" https://github.com/libsdl-org/SDL.git /tmp/SDL
-          cmake -S /tmp/SDL -B /tmp/SDL/build -G Ninja \
-                -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOME/sdl3"
-          cmake --build /tmp/SDL/build
-          cmake --install /tmp/SDL/build
+        uses: ./.github/actions/sdl3
+        with:
+          version: ${{ env.SDL_VERSION }}
 
       - name: Configure
         run: >
           cmake -S . -B build-tsan -G Ninja
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DCMAKE_CXX_COMPILER=g++-14
-          -DCMAKE_PREFIX_PATH="$HOME/sdl3"
           -DSABLE_BUILD_TESTS=OFF
           "-DCMAKE_CXX_FLAGS=-fsanitize=thread -fno-omit-frame-pointer"
           "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread"
@@ -177,9 +146,7 @@ jobs:
         env:
           SDL_VIDEODRIVER: offscreen
           TSAN_OPTIONS: halt_on_error=1
-        run: |
-          export LD_LIBRARY_PATH="$HOME/sdl3/lib:${LD_LIBRARY_PATH:-}"
-          ./build-tsan/sable --selftest
+        run: ./build-tsan/sable --selftest
 
   # Metadata that a software centre will reject on is cheaper to catch here
   # than after a release. The homepage URL is knowingly absent until the
