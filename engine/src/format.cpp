@@ -54,7 +54,7 @@ std::vector<Format> builtinFormats() {
     all.push_back(Format{
         .id = "psd", .label = "Photoshop document", .extensions = {"psd"},
         .nativeProject = false,
-        .read = &readPsd, .write = nullptr, .sniff = &looksLikePsd});
+        .read = &readPsd, .write = &writePsd, .sniff = &looksLikePsd});
     return all;
 }
 

@@ -2206,6 +2206,208 @@ TEST_CASE("PSDs Sable cannot read are refused, not read wrong") {
     std::filesystem::remove(stub);
 }
 
+// ------------------------------------------------------------ PSD export (#7)
+
+namespace {
+
+/// Everything the writer has to carry: a group with children, a clipped layer,
+/// a hidden layer, non-Normal blend modes and partial opacities.
+///
+/// The background is transparent because PSD has no document background — one
+/// that is not becomes an extra layer, which has its own test below.
+Document psdSampleDocument() {
+    Document doc = makeDocument(300, 200, StraightRgba8{0, 0, 0, 0});
+    doc.dpi = 144;
+    doc.layers[0].name = "Base";
+    paintSquare(doc, doc.activeLayer, StraightRgba8{200, 30, 40, 255}, 80.0, 80.0);
+
+    doc.undo.push(addLayerAbove(doc, doc.activeLayer, "Group"));
+    const LayerId group = doc.activeLayer;
+    doc.layerById(group)->kind    = LayerKind::Folder;
+    doc.layerById(group)->opacity = 0.6f;
+
+    doc.undo.push(addLayerAbove(doc, group, "Fill"));
+    const LayerId fill = doc.activeLayer;
+    doc.layerById(fill)->parent = group;
+    paintSquare(doc, fill, StraightRgba8{20, 60, 200, 255}, 150.0, 100.0);
+
+    doc.undo.push(addLayerAbove(doc, fill, "Tint"));
+    const LayerId tint = doc.activeLayer;
+    doc.layerById(tint)->parent      = group;
+    doc.layerById(tint)->clipToBelow = true;
+    doc.layerById(tint)->blend       = BlendMode::Screen;
+    paintSquare(doc, tint, StraightRgba8{240, 220, 60, 200}, 160.0, 110.0);
+
+    doc.undo.push(addLayerAbove(doc, tint, "Hidden"));
+    doc.layerById(doc.activeLayer)->visible         = false;
+    doc.layerById(doc.activeLayer)->preserveOpacity = true;
+    paintSquare(doc, doc.activeLayer, StraightRgba8{0, 0, 0, 255}, 40.0, 160.0);
+
+    doc.undo.push(addLayerAbove(doc, doc.activeLayer, "Ink"));
+    doc.layerById(doc.activeLayer)->blend   = BlendMode::Multiply;
+    doc.layerById(doc.activeLayer)->opacity = 0.4f;
+    paintSquare(doc, doc.activeLayer, StraightRgba8{40, 200, 90, 220}, 200.0, 150.0);
+    return doc;
+}
+
+/// The same PSD with its layer section removed, so importing it yields only the
+/// merged composite the file carries — which is exactly what a viewer that does
+/// not parse layers shows.
+std::filesystem::path flattenedCopyOfPsd(const std::filesystem::path& src,
+                                         const char* name) {
+    std::vector<unsigned char> bytes;
+    { FILE* in = std::fopen(src.string().c_str(), "rb");
+      REQUIRE(in != nullptr);
+      std::fseek(in, 0, SEEK_END);
+      bytes.resize(static_cast<std::size_t>(std::ftell(in)));
+      std::fseek(in, 0, SEEK_SET);
+      bytes.resize(std::fread(bytes.data(), 1, bytes.size(), in));
+      std::fclose(in); }
+    REQUIRE(bytes.size() > 26);
+
+    // Header, then three length-prefixed sections; the merged image follows.
+    std::size_t at = 26;
+    for (int i = 0; i < 3; ++i) {
+        REQUIRE(at + 4 <= bytes.size());
+        at += 4 + ((static_cast<std::size_t>(bytes[at]) << 24) |
+                   (static_cast<std::size_t>(bytes[at + 1]) << 16) |
+                   (static_cast<std::size_t>(bytes[at + 2]) << 8) |
+                    static_cast<std::size_t>(bytes[at + 3]));
+    }
+    REQUIRE(at <= bytes.size());
+
+    const auto out = scratchFile(name);
+    FILE* file = std::fopen(out.string().c_str(), "wb");
+    REQUIRE(file != nullptr);
+    const std::vector<unsigned char> empty(12, 0);      // three zero lengths
+    std::fwrite(bytes.data(), 1, 26, file);
+    std::fwrite(empty.data(), 1, empty.size(), file);
+    std::fwrite(bytes.data() + at, 1, bytes.size() - at, file);
+    std::fclose(file);
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("a document round-trips through PSD") {
+    const Document original = psdSampleDocument();
+    const std::uint64_t before = hashCanvas(original);
+    const auto path = scratchFile("psd_export_roundtrip.psd");
+
+    REQUIRE(exportDocument(original, path).has_value());
+    const auto loaded = importDocument(path);
+    REQUIRE(loaded.has_value());
+
+    CHECK(loaded->width  == original.width);
+    CHECK(loaded->height == original.height);
+    REQUIRE(loaded->layers.size() == original.layers.size());
+
+    for (std::size_t i = 0; i < loaded->layers.size(); ++i) {
+        const Layer& a = original.layers[i];
+        const Layer& b = loaded->layers[i];
+        CHECK(b.name    == a.name);
+        CHECK(b.kind    == a.kind);
+        CHECK(b.blend   == a.blend);
+        CHECK(b.visible == a.visible);
+        CHECK(b.clipToBelow     == a.clipToBelow);
+        CHECK(b.preserveOpacity == a.preserveOpacity);
+        CHECK(b.opacity == doctest::Approx(a.opacity).epsilon(0.005));
+        // Ids are reassigned on import, so group membership is checked by
+        // position rather than by number.
+        CHECK(b.parent.has_value() == a.parent.has_value());
+    }
+
+    // Group membership survives, which is the part PSD's begin/end markers are
+    // doing all the work for.
+    const Layer* group = layerNamed(*loaded, "Group");
+    REQUIRE(group != nullptr);
+    CHECK(group->kind == LayerKind::Folder);
+    for (const char* child : {"Fill", "Tint"})
+        CHECK(layerNamed(*loaded, child)->parent == group->id);
+
+    // Pixels: exact, not merely close. Layer data is straight alpha in a PSD
+    // exactly as it is in a .sable, so this is the same premultiply round trip
+    // the project format already relies on (D-004).
+    CHECK(hashCanvas(*loaded) == before);
+    CHECK(loaded->path.empty());
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("the PSD composite section matches flatten()") {
+    // Many viewers read only the merged image, so it is not decoration. The
+    // copy below has its layer section stripped, which is what those viewers
+    // effectively see.
+    const Document original = psdSampleDocument();
+    const auto path = scratchFile("psd_export_composite.psd");
+    REQUIRE(exportDocument(original, path).has_value());
+
+    const auto stripped = flattenedCopyOfPsd(path, "psd_export_merged.psd");
+    const auto merged = importDocument(stripped);
+    REQUIRE(merged.has_value());
+    REQUIRE(merged->layers.size() == 1);
+
+    const std::vector<StraightRgba8> expected = flatten(original);
+    const std::vector<StraightRgba8> got      = flatten(*merged);
+    REQUIRE(got.size() == expected.size());
+    CHECK(got == expected);
+
+    std::filesystem::remove(path);
+    std::filesystem::remove(stripped);
+}
+
+TEST_CASE("an opaque document background is written as a layer") {
+    // PSD has nowhere to put a document background, so it becomes the bottom
+    // layer. One more layer than was exported, and identical pixels — the
+    // alternative loses the background entirely.
+    Document doc = psdSampleDocument();
+    doc.background = StraightRgba8{240, 230, 220, 255};
+    const std::uint64_t before = hashCanvas(doc);
+
+    const auto path = scratchFile("psd_export_background.psd");
+    REQUIRE(exportDocument(doc, path).has_value());
+    const auto loaded = importDocument(path);
+    REQUIRE(loaded.has_value());
+
+    REQUIRE(loaded->layers.size() == doc.layers.size() + 1);
+    CHECK(loaded->layers.front().name == "Background");
+    CHECK(loaded->background.a == 0);
+    CHECK(hashCanvas(*loaded) == before);
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("exporting a PSD leaves the document alone, dirty flag included") {
+    // US-07.5, the same guarantee PNG export gives.
+    Document doc = psdSampleDocument();
+    doc.dirty = true;
+    const std::uint64_t before = hashCanvas(doc);
+    const std::size_t layers = doc.layers.size();
+
+    const auto path = scratchFile("psd_export_untouched.psd");
+    REQUIRE(exportDocument(doc, path).has_value());
+    CHECK(doc.dirty);
+    CHECK(doc.layers.size() == layers);
+    CHECK(hashCanvas(doc) == before);
+    CHECK(doc.path.empty());
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("PSD export refuses rather than writing a file no reader accepts") {
+    Document doc = psdSampleDocument();
+    doc.width = 40000;                       // past PSD's own limit; PSB territory
+    const auto path = scratchFile("psd_export_huge.psd");
+    const auto written = exportDocument(doc, path);
+    REQUIRE(!written.has_value());
+    CHECK(written.error().detail.find("30000") != std::string::npos);
+    CHECK(!std::filesystem::exists(path));
+}
+
+TEST_CASE("the registry offers PSD for export as well as import") {
+    const auto exportable = dialogFilters(FormatUse::Write, false);
+    CHECK(std::ranges::any_of(exportable, [](const DialogFilter& f) {
+        return f.pattern == "psd";
+    }));
+}
+
 TEST_CASE("recovery never writes over the artist's own file") {
     // D-013, and the one failure mode that destroys work permanently.
     const auto userFile = scratchFile("sable_precious.sable");

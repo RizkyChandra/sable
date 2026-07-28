@@ -27,4 +27,18 @@ namespace sbl {
 /// 16-bit support (D-023) lands.
 [[nodiscard]] std::expected<Document, Error> readPsd(const std::filesystem::path& path);
 
+/// Writes a layered PSD: the stack, names, opacity, visibility, groups, the
+/// blend modes that map, and a flattened composite section — many viewers read
+/// only that composite, so it is not optional.
+///
+/// Never modifies the document, dirty flag included (US-07.5); the const
+/// reference is the guarantee.
+///
+/// A document background that is not fully transparent is written as an extra
+/// bottom-most layer called "Background", because PSD has nowhere else to put
+/// one. Opening the result in Sable therefore gives one more layer than was
+/// exported, and identical pixels.
+[[nodiscard]] std::expected<void, Error> writePsd(const Document& doc,
+                                                  const std::filesystem::path& path);
+
 }  // namespace sbl

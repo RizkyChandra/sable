@@ -2,20 +2,22 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <vector>
 
-// A hand-written reader rather than a library.
+// A hand-written reader and writer rather than a library.
 //
-// Sable needs the layer section from both directions — the exporter (#7) writes
-// the same records this reads — and the permissively licensed PSD libraries all
-// read or write, never both. A dependency would therefore have left the writer
-// to do anyway, and brought a second file-access and allocator abstraction with
-// it. Adobe publishes the specification, and the part Sable uses is small.
+// Sable needs the layer section from both directions, and the permissively
+// licensed PSD libraries all read or write, never both. A dependency would
+// therefore have left half the job to do anyway, and brought a second
+// file-access and allocator abstraction with it. Adobe publishes the
+// specification, and the part Sable uses is small.
 //
 // Everything here treats the file as hostile. Every length in a PSD is a
 // number some other program wrote, so nothing is read without a bounds check
@@ -119,6 +121,12 @@ BlendMode blendFromKey(std::string_view key) noexcept {
     for (const BlendKey& entry : kBlendKeys)
         if (entry.key == key) return entry.mode;
     return BlendMode::Normal;
+}
+
+std::string_view keyForBlend(BlendMode mode) noexcept {
+    for (const BlendKey& entry : kBlendKeys)
+        if (entry.mode == mode) return entry.key;
+    return "norm";
 }
 
 // -------------------------------------------------------------------- names
@@ -621,6 +629,451 @@ std::expected<Document, Error> readPsd(const std::filesystem::path& path) {
     doc.dirty = false;
     // Document::path is the registry's business, not an importer's (D-024).
     return doc;
+}
+
+// -------------------------------------------------------------------- write
+
+namespace {
+
+/// PSD's own canvas limit. Beyond it the format is PSB, which Sable does not
+/// write either — better to say so than to produce a file Photoshop rejects.
+constexpr std::int32_t kMaxPsdDimension = 30000;
+
+/// Deep enough for any real layer tree, and the thing that stops a document
+/// with a corrupt parent chain recursing until the stack runs out.
+constexpr int kMaxNesting = 32;
+
+struct Writer {
+    std::vector<unsigned char> out;
+
+    void u8(std::uint32_t v)  { out.push_back(static_cast<unsigned char>(v & 0xFF)); }
+    void u16(std::uint32_t v) { u8(v >> 8); u8(v); }
+    void u32(std::uint32_t v) { u16(v >> 16); u16(v); }
+    void i32(std::int32_t v)  { u32(static_cast<std::uint32_t>(v)); }
+    void pad(std::size_t n)   { out.insert(out.end(), n, 0); }
+    void text(std::string_view s) { out.insert(out.end(), s.begin(), s.end()); }
+    void bytes(const std::vector<std::uint8_t>& b) { out.insert(out.end(), b.begin(), b.end()); }
+
+    /// Backfills a 4-byte length written before a section whose size was not
+    /// known yet. Cheaper and much clearer than measuring everything twice.
+    [[nodiscard]] std::size_t reserveLength() { u32(0); return out.size() - 4; }
+    void fillLength(std::size_t at) {
+        const auto length = static_cast<std::uint32_t>(out.size() - at - 4);
+        for (int i = 0; i < 4; ++i)
+            out[at + static_cast<std::size_t>(i)] =
+                static_cast<unsigned char>((length >> (24 - 8 * i)) & 0xFF);
+    }
+};
+
+/// UTF-8 in, UTF-16BE code units out, for PSD's 'luni' layer name. Malformed
+/// input becomes U+FFFD rather than being rejected — an odd byte in a layer
+/// name must not cost the artist the export.
+std::vector<std::uint16_t> utf16From(std::string_view text) {
+    std::vector<std::uint16_t> units;
+    units.reserve(text.size());
+
+    for (std::size_t i = 0; i < text.size();) {
+        const auto lead = static_cast<std::uint8_t>(text[i]);
+        std::uint32_t cp = 0xFFFD;
+        std::size_t len = 1;
+
+        if (lead < 0x80)               { cp = lead; }
+        else if ((lead & 0xE0) == 0xC0) { len = 2; cp = lead & 0x1Fu; }
+        else if ((lead & 0xF0) == 0xE0) { len = 3; cp = lead & 0x0Fu; }
+        else if ((lead & 0xF8) == 0xF0) { len = 4; cp = lead & 0x07u; }
+
+        if (len > 1) {
+            if (i + len > text.size()) { cp = 0xFFFD; len = 1; }
+            for (std::size_t k = 1; k < len; ++k) {
+                const auto cont = static_cast<std::uint8_t>(text[i + k]);
+                if ((cont & 0xC0) != 0x80) { cp = 0xFFFD; len = 1; break; }
+                cp = (cp << 6) | (cont & 0x3Fu);
+            }
+        }
+        i += len;
+
+        if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) cp = 0xFFFD;
+        if (cp < 0x10000) {
+            units.push_back(static_cast<std::uint16_t>(cp));
+        } else {
+            cp -= 0x10000;
+            units.push_back(static_cast<std::uint16_t>(0xD800 + (cp >> 10)));
+            units.push_back(static_cast<std::uint16_t>(0xDC00 + (cp & 0x3FF)));
+        }
+    }
+    return units;
+}
+
+/// PackBits, the other half of unpackBits above.
+void packBitsRow(const std::uint8_t* row, std::size_t n, std::vector<std::uint8_t>& out) {
+    std::size_t i = 0;
+    while (i < n) {
+        std::size_t run = 1;
+        while (i + run < n && row[i + run] == row[i] && run < 128) ++run;
+
+        if (run >= 3) {
+            out.push_back(static_cast<std::uint8_t>(257 - run));   // -(run - 1)
+            out.push_back(row[i]);
+            i += run;
+        } else {
+            // A literal run, ended by the next run of three — below three a run
+            // costs more to encode than to copy.
+            const std::size_t start = i;
+            std::size_t literal = 0;
+            while (i < n && literal < 128) {
+                if (i + 2 < n && row[i] == row[i + 1] && row[i] == row[i + 2]) break;
+                ++i;
+                ++literal;
+            }
+            out.push_back(static_cast<std::uint8_t>(literal - 1));
+            out.insert(out.end(), row + start, row + start + literal);
+        }
+    }
+}
+
+/// RLE-compresses `planes` rows of `w` bytes into PSD's layout: every row's
+/// packed length first, then the rows. One function for both places PSD uses
+/// it — a layer channel is one plane, the merged image is all four under a
+/// single shared table.
+struct Packed {
+    std::vector<std::uint8_t> counts;   // two bytes per row
+    std::vector<std::uint8_t> data;
+};
+
+Packed packPlanes(const std::uint8_t* planes, std::size_t w, std::size_t h,
+                  std::size_t count) {
+    Packed packed;
+    packed.counts.reserve(2 * h * count);
+    packed.data.reserve(w * h * count / 2);
+
+    std::vector<std::uint8_t> row;
+    for (std::size_t r = 0; r < h * count; ++r) {
+        row.clear();
+        packBitsRow(planes + r * w, w, row);
+        packed.counts.push_back(static_cast<std::uint8_t>(row.size() >> 8));
+        packed.counts.push_back(static_cast<std::uint8_t>(row.size() & 0xFF));
+        packed.data.insert(packed.data.end(), row.begin(), row.end());
+    }
+    return packed;
+}
+
+/// One layer as PSD sees it. Groups become two of these: a header and the
+/// hidden marker that closes them.
+struct OutRecord {
+    std::int32_t top = 0, left = 0, bottom = 0, right = 0;
+    std::string name;
+    std::string_view blendKey = "norm";
+    std::uint8_t opacity = 255;
+    bool clipping = false;
+    bool visible = true;
+    bool preserveOpacity = false;
+    std::optional<std::uint32_t> section;      // 'lsct' type, for groups
+    /// Alpha, red, green, blue, each already carrying its compression tag.
+    std::array<std::vector<std::uint8_t>, 4> channels;
+};
+
+/// Wraps one already-planar channel in the compression tag and row table PSD
+/// expects, in place.
+void packChannel(std::vector<std::uint8_t>& out, const std::uint8_t* plane,
+                 std::size_t w, std::size_t h) {
+    const Packed packed = packPlanes(plane, w, h, 1);
+    out.assign({0, 1});                              // compression 1: RLE
+    out.insert(out.end(), packed.counts.begin(), packed.counts.end());
+    out.insert(out.end(), packed.data.begin(), packed.data.end());
+}
+
+std::uint8_t opacityByte(float opacity) noexcept {
+    return static_cast<std::uint8_t>(
+        std::lround(std::clamp(opacity, 0.0f, 1.0f) * 255.0f));
+}
+
+/// An empty channel: just the compression tag, which is what Photoshop writes
+/// for a group marker or a layer that has never been painted on.
+std::vector<std::uint8_t> emptyChannel() { return {0, 0}; }
+
+void fillCommon(OutRecord& rec, const Layer& layer) {
+    rec.name            = layer.name;
+    rec.blendKey        = keyForBlend(layer.blend);
+    rec.opacity         = opacityByte(layer.opacity);
+    rec.clipping        = layer.clipToBelow;
+    rec.visible         = layer.visible;
+    rec.preserveOpacity = layer.preserveOpacity;
+}
+
+/// The canvas rectangle a layer's painted tiles cover, clipped to the document.
+///
+/// Tile granularity rather than the exact painted bounds: a 256-pixel margin
+/// costs a little file size and saves scanning every pixel twice, and the
+/// alpha channel makes the margin invisible either way.
+void boundsOf(const Layer& layer, std::int32_t canvasW, std::int32_t canvasH,
+              OutRecord& rec) {
+    bool any = false;
+    for (const auto& [key, tile] : layer.tiles) {
+        if (tile.isFullyTransparent()) continue;
+        const std::int32_t x0 = std::max(0, key.first  * TILE_SIZE);
+        const std::int32_t y0 = std::max(0, key.second * TILE_SIZE);
+        const std::int32_t x1 = std::min(canvasW, (key.first  + 1) * TILE_SIZE);
+        const std::int32_t y1 = std::min(canvasH, (key.second + 1) * TILE_SIZE);
+        if (x0 >= x1 || y0 >= y1) continue;         // wholly outside the canvas
+
+        if (!any) { rec.left = x0; rec.top = y0; rec.right = x1; rec.bottom = y1; any = true; }
+        rec.left   = std::min(rec.left,   x0);
+        rec.top    = std::min(rec.top,    y0);
+        rec.right  = std::max(rec.right,  x1);
+        rec.bottom = std::max(rec.bottom, y1);
+    }
+    if (!any) rec.left = rec.top = rec.right = rec.bottom = 0;
+}
+
+/// Straight-alpha planes for a layer's rectangle, in PSD's channel order.
+///
+/// D-004 at the boundary again, in the other direction: the engine holds
+/// premultiplied pixels and PSD wants straight ones, so unpremultiply() is the
+/// only crossing.
+void encodeChannels(const Layer& layer, OutRecord& rec) {
+    const auto w = static_cast<std::size_t>(rec.right - rec.left);
+    const auto h = static_cast<std::size_t>(rec.bottom - rec.top);
+    if (w == 0 || h == 0) {
+        for (std::vector<std::uint8_t>& channel : rec.channels) channel = emptyChannel();
+        return;
+    }
+
+    // One buffer holding A, R, G, B back to back, which is the order PSD's
+    // channel list will name them in.
+    std::vector<std::uint8_t> planes(4 * w * h, 0);
+    for (std::size_t y = 0; y < h; ++y) {
+        const std::int32_t cy = rec.top + static_cast<std::int32_t>(y);
+        const std::int32_t ty = tileIndex(cy);
+        for (std::size_t x = 0; x < w; ++x) {
+            const std::int32_t cx = rec.left + static_cast<std::int32_t>(x);
+            const Tile* tile = layer.find(TileKey{tileIndex(cx), ty});
+            if (tile == nullptr) continue;
+
+            const StraightRgba8 c =
+                tile->pixel(cx - tileIndex(cx) * TILE_SIZE, cy - ty * TILE_SIZE)
+                    .unpremultiply();
+            const std::size_t i = y * w + x;
+            planes[i]                 = c.a;
+            planes[w * h + i]         = c.r;
+            planes[2 * w * h + i]     = c.g;
+            planes[3 * w * h + i]     = c.b;
+        }
+    }
+
+    for (std::size_t channel = 0; channel < 4; ++channel)
+        packChannel(rec.channels[channel], planes.data() + channel * w * h, w, h);
+}
+
+/// Walks one nesting level and appends its records bottom to top, which is the
+/// order PSD stores them in. A group becomes its closing marker, its children,
+/// then its header — the mirror of what readPsd() expects.
+void emitLevel(const Document& doc, std::optional<LayerId> parent, int depth,
+               std::vector<OutRecord>& out) {
+    if (depth > kMaxNesting) return;
+
+    for (const Layer& layer : doc.layers) {
+        if (layer.parent != parent) continue;
+
+        if (layer.kind == LayerKind::Folder) {
+            OutRecord divider;
+            divider.name    = "</Layer group>";
+            divider.section = 3;
+            for (std::vector<std::uint8_t>& channel : divider.channels)
+                channel = emptyChannel();
+            out.push_back(std::move(divider));
+
+            emitLevel(doc, layer.id, depth + 1, out);
+
+            OutRecord header;
+            fillCommon(header, layer);
+            header.section = 1;                      // an open folder
+            for (std::vector<std::uint8_t>& channel : header.channels)
+                channel = emptyChannel();
+            out.push_back(std::move(header));
+        } else {
+            OutRecord rec;
+            fillCommon(rec, layer);
+            boundsOf(layer, doc.width, doc.height, rec);
+            encodeChannels(layer, rec);
+            out.push_back(std::move(rec));
+        }
+    }
+}
+
+void writeRecord(Writer& w, const OutRecord& rec) {
+    w.i32(rec.top);
+    w.i32(rec.left);
+    w.i32(rec.bottom);
+    w.i32(rec.right);
+
+    static constexpr std::array<std::int16_t, 4> kIds{-1, 0, 1, 2};   // alpha, R, G, B
+    w.u16(4);
+    for (std::size_t i = 0; i < 4; ++i) {
+        w.u16(static_cast<std::uint16_t>(kIds[i]));
+        w.u32(static_cast<std::uint32_t>(rec.channels[i].size()));
+    }
+
+    w.text("8BIM");
+    w.text(rec.blendKey);
+    w.u8(rec.opacity);
+    w.u8(rec.clipping ? 1 : 0);
+    // Bit 3 says the flags come from Photoshop 5.0 or later; bit 1 set means
+    // hidden, which reads backwards but is what the format says.
+    w.u8(0x08u | (rec.visible ? 0u : 0x02u) | (rec.preserveOpacity ? 0x01u : 0u));
+    w.u8(0);                                          // filler
+
+    const std::size_t extraAt = w.reserveLength();
+    w.u32(0);                                         // layer mask data: none
+    w.u32(0);                                         // layer blending ranges: none
+
+    // The legacy Pascal name, padded so the field is a multiple of four. ASCII
+    // only by construction: 'luni' below carries the real one.
+    std::string legacy;
+    for (const char c : rec.name) {
+        if (legacy.size() == 255) break;
+        legacy += static_cast<unsigned char>(c) < 0x80 ? c : '?';
+    }
+    w.u8(static_cast<std::uint8_t>(legacy.size()));
+    w.text(legacy);
+    w.pad((4 - ((legacy.size() + 1) % 4)) % 4);
+
+    const std::vector<std::uint16_t> units = utf16From(rec.name);
+    w.text("8BIM");
+    w.text("luni");
+    w.u32(static_cast<std::uint32_t>(4 + 2 * units.size() + (units.size() % 2 ? 2 : 0)));
+    w.u32(static_cast<std::uint32_t>(units.size()));
+    for (const std::uint16_t unit : units) w.u16(unit);
+    if (units.size() % 2) w.pad(2);                   // keep the block on four
+
+    if (rec.section.has_value()) {
+        w.text("8BIM");
+        w.text("lsct");
+        w.u32(4);
+        w.u32(*rec.section);
+    }
+    w.fillLength(extraAt);
+}
+
+std::expected<void, Error> writeAll(const std::vector<unsigned char>& bytes,
+                                    const std::filesystem::path& path) {
+    FILE* out = std::fopen(path.string().c_str(), "wb");
+    if (out == nullptr)
+        return fail(ErrorKind::Permission, "could not create " + path.string());
+
+    const std::size_t written = std::fwrite(bytes.data(), 1, bytes.size(), out);
+    const bool closed = std::fclose(out) == 0;
+    if (written == bytes.size() && closed) return {};
+
+    // A half-written PSD in the artist's export folder is worse than none.
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    return fail(ErrorKind::Io, "could not write " + path.string());
+}
+
+}  // namespace
+
+std::expected<void, Error> writePsd(const Document& doc,
+                                    const std::filesystem::path& path) {
+    if (doc.width <= 0 || doc.height <= 0)
+        return fail(ErrorKind::Malformed, "canvas has no size");
+    if (doc.width > kMaxPsdDimension || doc.height > kMaxPsdDimension)
+        return fail(ErrorKind::Malformed,
+                    "PSD cannot hold a canvas larger than 30000 pixels on a side");
+
+    const auto w = static_cast<std::size_t>(doc.width);
+    const auto h = static_cast<std::size_t>(doc.height);
+
+    std::vector<OutRecord> records;
+    // PSD has no document background, so an opaque one has to become a layer or
+    // the file opens with the artwork floating on nothing everywhere the layers
+    // do not cover. Bottom-most, and named the way Photoshop names its own.
+    if (doc.background.a != 0) {
+        OutRecord bg;
+        bg.name   = "Background";
+        bg.right  = doc.width;
+        bg.bottom = doc.height;
+
+        const std::array<std::uint8_t, 4> value{doc.background.a, doc.background.r,
+                                                doc.background.g, doc.background.b};
+        for (std::size_t channel = 0; channel < 4; ++channel) {
+            const std::vector<std::uint8_t> flat(w * h, value[channel]);
+            packChannel(bg.channels[channel], flat.data(), w, h);
+        }
+        records.push_back(std::move(bg));
+    }
+    emitLevel(doc, std::nullopt, 0, records);
+
+    // PSD counts layers in a signed 16-bit field, so this is the format's limit
+    // rather than an arbitrary one.
+    if (records.size() > 32767)
+        return fail(ErrorKind::Malformed, "PSD cannot hold more than 32767 layers");
+
+    Writer out;
+    out.text("8BPS");
+    out.u16(1);                                       // PSD, not PSB
+    out.pad(6);                                       // reserved
+    out.u16(4);                                       // RGBA
+    out.i32(doc.height);
+    out.i32(doc.width);
+    out.u16(8);                                       // D-023: 8 bits, for now
+    out.u16(3);                                       // RGB
+    out.u32(0);                                       // colour mode data: none
+
+    // Image resources: only the resolution, so the artist's DPI survives the
+    // trip. Everything else in this section is Photoshop's own bookkeeping.
+    {
+        const std::size_t resourcesAt = out.reserveLength();
+        out.text("8BIM");
+        out.u16(1005);                                // ResolutionInfo
+        out.pad(2);                                   // empty Pascal name, padded
+        out.u32(16);
+        const std::uint32_t fixed = doc.dpi << 16;    // 16.16 fixed point
+        for (int i = 0; i < 2; ++i) {
+            out.u32(fixed);
+            out.u16(1);                               // display unit: inches
+            out.u16(1);
+        }
+        out.fillLength(resourcesAt);
+    }
+
+    // Layer and mask information.
+    {
+        const std::size_t sectionAt = out.reserveLength();
+        const std::size_t layerInfoAt = out.reserveLength();
+
+        // Negative: the merged image at the end carries alpha.
+        out.u16(static_cast<std::uint16_t>(-static_cast<std::int32_t>(records.size())));
+        for (const OutRecord& rec : records) writeRecord(out, rec);
+        for (const OutRecord& rec : records)
+            for (const std::vector<std::uint8_t>& channel : rec.channels) out.bytes(channel);
+        if (out.out.size() % 2 != 0) out.pad(1);      // the section is 2-aligned
+        out.fillLength(layerInfoAt);
+
+        out.u32(0);                                   // global layer mask info: none
+        out.fillLength(sectionAt);
+    }
+
+    // The merged composite. Many viewers read only this, so it is not optional
+    // — and flatten() is already exactly the buffer it wants (US-07.3).
+    {
+        const std::vector<StraightRgba8> flat = flatten(doc);
+        if (flat.size() != w * h)
+            return fail(ErrorKind::Malformed, "the canvas could not be flattened");
+
+        std::vector<std::uint8_t> planes(4 * w * h);
+        for (std::size_t i = 0; i < flat.size(); ++i) {
+            planes[i]             = flat[i].r;
+            planes[w * h + i]     = flat[i].g;
+            planes[2 * w * h + i] = flat[i].b;
+            planes[3 * w * h + i] = flat[i].a;
+        }
+        const Packed packed = packPlanes(planes.data(), w, h, 4);
+        out.u16(1);                                   // RLE
+        out.bytes(packed.counts);
+        out.bytes(packed.data);
+    }
+
+    return writeAll(out.out, path);
 }
 
 }  // namespace sbl
