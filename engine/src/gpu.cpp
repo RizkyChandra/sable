@@ -203,7 +203,7 @@ private:
     [[nodiscard]] bool uploadTiles();
     [[nodiscard]] bool downloadSlots(const std::vector<std::uint32_t>& slots,
                                      std::vector<PremulRgba8>& out);
-    void flushDabs();
+    void submitPending();
     [[nodiscard]] std::vector<PremulRgba8> cpuFallback(const Document& doc,
                                                        std::int32_t x, std::int32_t y,
                                                        std::int32_t w, std::int32_t h);
@@ -375,6 +375,12 @@ void GpuBackend::dropLayer(LayerId id) {
 
 bool GpuBackend::syncTiles(const std::vector<Behind>& work) {
     if (work.empty()) return true;
+    // A download only sees work the device has actually been given. Without
+    // this, the first touch of a tile part-way through a stroke reads the slot
+    // back before the stroke's own upload and dabs have been submitted, and
+    // what comes back is whatever the slot held last — which, once the arena
+    // has served an earlier document, is that document's pixels.
+    submitPending();
     slotScratch_.clear();
     for (const Behind& b : work) slotScratch_.push_back(b.entry->slot);
     if (!downloadSlots(slotScratch_, pixelScratch_)) return false;
@@ -491,15 +497,21 @@ bool GpuBackend::downloadSlots(const std::vector<std::uint32_t>& slots,
 
 // ----------------------------------------------------------------------- dabs
 
-void GpuBackend::flushDabs() {
+void GpuBackend::submitPending() {
+    // The uploads go first and unconditionally, even when there are no dabs to
+    // dispatch. `uploads_` and `batch_` are both queues that exist only on the
+    // host until this runs, and the device cannot see either of them — so
+    // ANYTHING that reads the arena or dispatches into it comes through here
+    // first. Leaving the upload queued and reading the slot anyway is how a
+    // tile came back holding the previous document's pixels.
+    if (!uploads_.empty() && !uploadTiles())
+        recordFailure(Error{ErrorKind::Io, "could not upload tiles to the GPU: " +
+                                               std::string(SDL_GetError())});
     if (batch_.dabs.empty() || batch_.tiles.empty()) {
         batch_.dabs.clear();
         batch_.tiles.clear();
         return;
     }
-    if (!uploadTiles())
-        recordFailure(Error{ErrorKind::Io, "could not upload tiles to the GPU: " +
-                                               std::string(SDL_GetError())});
 
     DabParams p{};
     p.head[0] = static_cast<std::uint32_t>(batch_.dabs.size());
@@ -564,7 +576,7 @@ void GpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
         batch_.preserveOpacity != t.layer.preserveOpacity ||
         !std::equal(clip, clip + 4, batch_.clip) ||
         batch_.dabs.size() >= kMaxDabs) {
-        flushDabs();
+        submitPending();
     }
     batch_.layer           = t.layer.id;
     batch_.preserveOpacity = t.layer.preserveOpacity;
@@ -610,7 +622,7 @@ void GpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
                 // there is nothing safe to evict. The CPU is the reference
                 // implementation and can finish the stroke; put the device's
                 // work back on the host first so the two do not fight.
-                flushDabs();
+                submitPending();
                 syncLayer(t.layer);
                 cpuBackend().applyDab(t, dab);
                 return;
@@ -638,7 +650,7 @@ std::vector<PremulRgba8> GpuBackend::compositeRect(const Document& doc, std::int
                                                    std::int32_t y, std::int32_t w,
                                                    std::int32_t h) {
     if (w <= 0 || h <= 0) return {};
-    flushDabs();
+    submitPending();
 
     program_.clear();
     if (!buildProgram(doc, std::nullopt, 0, program_))
@@ -770,7 +782,7 @@ StraightRgba8 GpuBackend::pickColour(const Document& doc, std::int32_t x,
 }
 
 std::expected<void, Error> GpuBackend::readback(const Document& doc) {
-    flushDabs();
+    submitPending();
     // const_cast: `PaintBackend::readback` takes a const Document precisely
     // because a backend writes tiles back through pointers of its own. The
     // tiles are not const, only this view of them is.
@@ -828,7 +840,7 @@ UndoRecord GpuBackend::transformRegion(Document& doc, LayerId target,
 }
 
 UndoRecord GpuBackend::clearLayer(Layer& layer) {
-    flushDabs();
+    submitPending();
     // The undo record has to hold what was painted, not what the host last saw.
     if (!syncLayer(layer))
         recordFailure(Error{ErrorKind::Io,

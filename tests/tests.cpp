@@ -41,10 +41,6 @@
 #include "miniz_zip.h"
 #include "nlohmann/json.hpp"
 
-#ifdef SABLE_HAVE_GPU
-#include <SDL3/SDL_init.h>
-#endif
-
 using namespace sbl;
 
 // US-02.9 asks for a counter or a profiler, not an eye. Replacing global
@@ -3930,24 +3926,51 @@ TEST_CASE("a document too big for the arena still composites correctly") {
     PaintBackend* gpu = gpuForTests();
     if (gpu == nullptr) return;
 
-    const auto rate = [gpu](std::int32_t size) {
+    // The stated exception to the one-level bound, and the reason it is not a
+    // widened bound: #14's harness holds the GPU to +-1 and it passes there,
+    // because no scenario in it stacks more than three blend levels. Twelve
+    // levels of dodge, burn and soft light do exceed one level, and that is
+    // ACCUMULATION, not a wrong formula:
+    //
+    //   * every mode on its own is within one level — asserted just above, in
+    //     "every blend mode agrees on its own";
+    //   * each level unpremultiplies to 8 bits, blends in float and rounds
+    //     back, so a one-level difference at the bottom is an *input* to the
+    //     next level, and Colour Dodge and Colour Burn amplify their inputs by
+    //     construction;
+    //   * the two float evaluations are independent by D-021's own design
+    //     ("two implementations of the same blend maths, which will drift"),
+    //     and GCC contracts the reference's three terms into FMAs while the
+    //     shader is `precise`, so the last bit cannot be made to agree.
+    //
+    // So the ceiling is named rather than removed, and it fails if it grows.
+    constexpr int kDeepStackCeiling = 8;
+
+    struct Result { double rate; int worst; };
+    const auto measure = [gpu](std::int32_t size) {
         Document doc = layeredDocument(size, 12);
         const Divergence d = compare(cpuBackend().compositeRect(doc, 0, 0, size, size),
                                      gpu->compositeRect(doc, 0, 0, size, size));
         MESSAGE("12 layers at " << size << "x" << size << ": max channel "
                 << d.maxChannel << ", " << d.pixels << " of "
                 << static_cast<std::size_t>(size) * size << " pixels differ");
-        return static_cast<double>(d.pixels) /
-               (static_cast<double>(size) * static_cast<double>(size));
+        return Result{static_cast<double>(d.pixels) /
+                          (static_cast<double>(size) * static_cast<double>(size)),
+                      d.maxChannel};
     };
 
-    const double fits = rate(1024);          // 192 tiles: inside the arena
-    const double spills = rate(2048);        // 768 tiles: eviction and re-upload
-    CHECK(fits < 0.001);
-    // The same picture at four times the area, so the same proportion of
-    // pixels should drift. A tile served from the wrong slot would not be
+    const Result fits = measure(1024);       // 192 tiles: inside the arena
+    const Result spills = measure(2048);     // 768 tiles: eviction and re-upload
+    CHECK(fits.worst <= kDeepStackCeiling);
+    CHECK(spills.worst <= kDeepStackCeiling);
+
+    // And the arena check proper. Getting eviction or the chunk sizing wrong
+    // puts a whole 65'536-pixel tile of the wrong layer on screen, so this is
+    // on the RATE: the same picture at four times the area should drift in the
+    // same proportion, and a tile served from the wrong slot would not be
     // subtle about it.
-    CHECK(spills < std::max(fits * 3.0, 0.001));
+    CHECK(fits.rate < 0.001);
+    CHECK(spills.rate < std::max(fits.rate * 3.0, 0.001));
 }
 
 TEST_CASE("the GPU composites an off-canvas rectangle the way the CPU does") {
@@ -4020,6 +4043,84 @@ TEST_CASE("a stroke painted on the GPU matches the same stroke on the CPU") {
         // other way. That is a fringe pixel of an anti-aliased edge.
         CHECK(d.maxChannel <= 2);
     }
+}
+
+TEST_CASE("a second stroke does not read the arena before the first is submitted") {
+    // Regression, #14's "eraser stroke" scenario. Uploads and dabs are queued
+    // on the host and only exist on the device once submitted, so the first
+    // touch of a tile in a SECOND stroke — which downloads the tile to snapshot
+    // it for undo — has to submit what is queued first. It did not, so it read
+    // the arena slot back in whatever state the last document to use it left
+    // it, and painted that document's pixels underneath the stroke.
+    //
+    // Invisible in a fresh process, which is why it survived: an untouched
+    // slot reads as zeroes, which is exactly what an empty tile should give.
+    // So this deliberately dirties the slot with a different document first.
+    PaintBackend* gpu = gpuForTests();
+    if (gpu == nullptr) return;
+    const WithBackend installed(gpu);
+
+    const auto stroke = [](Document& doc, PaintBackend* backend, const BrushPreset& p,
+                           StraightRgba8 colour, double y) {
+        Layer* layer = doc.active();
+        Stroke s;
+        std::vector<Dab> scratch;
+        beginStroke(s, p, colour, layer->id);
+        PaintTarget t{*layer, s.pending, s.touched, doc.width, doc.height,
+                      nullptr, backend};
+        for (int i = 0; i < 30; ++i) paintSample(s, t, at(20.0 + i * 3.0, y), scratch);
+        doc.undo.push(std::move(s.pending));
+    };
+
+    const auto twoStrokes = [&stroke](PaintBackend* backend) {
+        // A bright document through the same backend, then thrown away: its
+        // tiles land in the arena, and the next document's layer 1 tile (0, 0)
+        // is the same cache key, so it may well be handed the same slot.
+        {
+            Document loud = makeDocument(128, 128, StraightRgba8{255, 255, 255, 255});
+            BrushPreset fat = defaultOpaque();
+            fat.size = 90.0f;
+            stroke(loud, backend, fat, StraightRgba8{255, 0, 255, 255}, 64.0);
+            (void)backend->compositeRect(loud, 0, 0, 128, 128);
+            REQUIRE(backend->readback(loud).has_value());
+        }
+
+        Document doc = makeDocument(128, 128, StraightRgba8{255, 255, 255, 255});
+        BrushPreset ink = defaultOpaque();
+        ink.size     = 64.0f;
+        ink.hardness = 0.8f;
+        // No composite, no readback between the two: the only thing that
+        // brings the first stroke's pixels home is the second stroke's own
+        // first-touch snapshot, which is the path that was wrong.
+        stroke(doc, backend, ink, StraightRgba8{30, 60, 120, 255}, 64.0);
+
+        BrushPreset rubber = defaultEraser();
+        rubber.size     = 27.0f;
+        rubber.hardness = 0.3f;
+        stroke(doc, backend, rubber, StraightRgba8{0, 0, 0, 255}, 58.0);
+        return doc;
+    };
+
+    Document host = twoStrokes(&cpuBackend());
+    Document dev  = twoStrokes(gpu);
+    REQUIRE(gpu->readback(dev).has_value());
+    const Divergence d = compare(cpuBackend().compositeRect(host, 0, 0, 128, 128),
+                                 cpuBackend().compositeRect(dev, 0, 0, 128, 128));
+    MESSAGE("stroke over stroke, no sync between: max channel " << d.maxChannel
+            << ", " << d.pixels << " pixels differ");
+    CHECK(d.maxChannel <= 1);
+
+    // The snapshot the second stroke took has to be the canvas after the
+    // first, not before it and not somebody else's document: undo the eraser
+    // and the ink must still be there.
+    const std::size_t inked = dev.active()->tiles.size();
+    dev.undo.undo(dev);
+    REQUIRE(dev.active() != nullptr);
+    CHECK(dev.active()->tiles.size() == inked);
+    host.undo.undo(host);
+    CHECK(compare(cpuBackend().compositeRect(host, 0, 0, 128, 128),
+                  cpuBackend().compositeRect(dev, 0, 0, 128, 128))
+              .maxChannel <= 1);
 }
 
 TEST_CASE("erasing and preserve-opacity agree between the backends") {
@@ -4333,9 +4434,12 @@ int main(int argc, char** argv) {
     // Before LeakSanitizer's exit check. Everything the driver hangs off a GPU
     // device stays allocated until the device is destroyed, and a static
     // destructor runs too late to be seen as anything but a leak.
+    //
+    // No SDL_Quit() here. It measurably freed nothing, and it tore SDL down
+    // while differential.cpp's own backend was still alive in a static — which
+    // then destroyed a GPU device through a shut-down SDL and took the process
+    // with it. `makeGpuBackend` refcounts the video subsystem, so the last
+    // backend to be destroyed already quits it.
     g_gpu.reset();
-#ifdef SABLE_HAVE_GPU
-    SDL_Quit();      // the subsystem globals go here, not in QuitSubSystem
-#endif
     return failed;
 }

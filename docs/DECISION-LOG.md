@@ -864,6 +864,11 @@ Measured on radv, `engine_tests`:
 | a stroke: pencil, airbrush, opaque | ≤ 1 level, 1–8 pixels per stroke |
 | erase and preserve-opacity | 0 |
 | bucket fill | 0 |
+| #14's 32 scenarios, whole harness | ≤ 1 level, 5 pixels in 570'368 |
+
+The last row is the one that counts: `kColourTolerance` is 1 and
+`kAlphaTolerance` is 0 in `tests/differential.cpp`, and neither was touched to
+make this pass.
 
 **The deep-stack number is accumulation, not a wrong formula.** Each blend
 level unpremultiplies to 8-bit, blends in float and rounds back, so a one-level
@@ -877,6 +882,22 @@ Dabs cannot be exact and are not claimed to be: the CPU measures the distance
 from a dab's centre in `double` and the shader in `float`, so a pixel whose
 coverage lands within an ULP of a rounding boundary tips the other way. That is
 one fringe pixel of an anti-aliased edge.
+
+### One submission point, because a download cannot see a queue
+
+Uploads and dabs are both queued on the host and only reach the device when a
+command buffer is submitted. Everything that reads the arena or dispatches into
+it therefore goes through `submitPending()` first. This is not an optimisation
+detail: the first version let the undo snapshot at the start of a second stroke
+download a tile whose own upload was still sitting in the queue, so the slot
+read back in whatever state the *previous document* had left it, and that
+document's pixels ended up underneath the stroke.
+
+It was invisible in isolation — an untouched slot reads as zeroes, which is
+exactly what an empty tile should give — and only appeared once #14's harness
+ran thirty scenarios through one backend. Two lessons worth keeping: a device
+cache has to be tested across documents, not within one; and a harness that
+reuses one backend for a long sequence finds what a per-test fixture cannot.
 
 ### The ceiling, stated
 

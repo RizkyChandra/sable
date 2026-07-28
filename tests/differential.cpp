@@ -568,11 +568,25 @@ TEST_CASE("the reference and the candidate backend agree on every scenario") {
                                      ? std::string{}
                                      : ", worst in \"" + cases()[worstCase].name + "\""));
 
-    // Two CPU backends are the same code over the same integers. Anything but
-    // zero here means the harness itself is not deterministic, and every other
-    // number it reports is worthless.
-    CHECK(total.colour() == 0);
-    CHECK(total.alpha() == 0);
+    // The determinism check this file has always carried, updated for the
+    // candidate no longer being a second copy of the reference.
+    //
+    // It used to read `total.colour() == 0`, which was exact because the
+    // candidate WAS `cpuBackend()` — the same code over the same integers. A
+    // GPU candidate is allowed the one step `kColourTolerance` names, so that
+    // form now contradicts the tolerance twenty lines above rather than
+    // measuring anything. The property worth keeping is the one it was
+    // protecting: a harness whose numbers move between runs is a harness whose
+    // numbers are worthless. So the candidate is run against ITSELF, where the
+    // answer must still be exactly zero — and for a GPU that is the stronger
+    // check, because an uninitialised arena slot or a missing barrier shows up
+    // here and nowhere else.
+    for (const Case& c : cases()) {
+        std::int32_t width = 0;
+        const Deviation twice = differ(*subject, *subject, c, width);
+        CHECK_MESSAGE(twice.colour() == 0, c.name << ": " << describe(twice, width));
+        CHECK_MESSAGE(twice.alpha() == 0, c.name << ": " << describe(twice, width));
+    }
 }
 
 TEST_CASE("the harness catches a backend that composites two steps off") {
