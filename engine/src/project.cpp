@@ -156,6 +156,29 @@ std::expected<void, Error> saveProject(const Document& doc,
     manifest["active_layer"]   = doc.activeLayer;
     manifest["layers"]         = json::array();
 
+    // The selection travels with the document (#18). An artist who spent a
+    // minute lassoing a shape and then saved should not have to draw it again
+    // after lunch. Only the bounding box goes in the manifest; the coverage
+    // mask, when there is one, is a greyscale PNG beside the tiles — same
+    // container rule as everything else, and openable in any image viewer.
+    if (doc.selection.has_value() && !doc.selection->empty()) {
+        const Selection& sel = *doc.selection;
+        manifest["selection"] = {{"x", sel.x}, {"y", sel.y},
+                                 {"w", sel.w}, {"h", sel.h},
+                                 {"mask", !sel.mask.empty()}};
+        if (!sel.mask.empty()) {
+            std::vector<unsigned char> png;
+            lodepng::encode(png, sel.mask, static_cast<unsigned>(sel.w),
+                            static_cast<unsigned>(sel.h), LCT_GREY, 8);
+            if (png.empty())
+                return abort(ErrorKind::Io, "could not encode the selection mask");
+            if (!mz_zip_writer_add_mem(&zip, "selection.png", png.data(), png.size(),
+                                       MZ_NO_COMPRESSION))
+                return abort(ErrorKind::Io,
+                             "could not write the selection to " + path.string());
+        }
+    }
+
     // Written only when there are some, so a document with no perspective
     // guides still produces a manifest a v1 Sable would have written.
     if (!doc.vanishingPoints.empty()) {
@@ -280,6 +303,42 @@ std::expected<Document, Error> loadProject(const std::filesystem::path& path) {
         return fail(ErrorKind::Malformed, "the manifest has an implausible canvas size");
     doc.background = parseColour(manifest.value("background", std::string("#ffffffff")));
     doc.path = path;
+
+    // Absent before v3, and in any v3 document with nothing selected. A
+    // malformed one is dropped rather than repaired: a selection that is not
+    // the one the artist drew would send the next fill somewhere they did not
+    // ask for, and no selection at all is the honest answer.
+    if (manifest.contains("selection") && manifest["selection"].is_object()) {
+        const auto& node = manifest["selection"];
+        Selection sel;
+        sel.x = node.value("x", 0);
+        sel.y = node.value("y", 0);
+        sel.w = node.value("w", 0);
+        sel.h = node.value("h", 0);
+
+        const bool plausible = !sel.empty() && sel.w <= doc.width && sel.h <= doc.height;
+        bool usable = plausible;
+        if (plausible && node.value("mask", false)) {
+            usable = false;
+            std::size_t size = 0;
+            if (void* data = mz_zip_reader_extract_file_to_heap(&zip, "selection.png",
+                                                                &size, 0);
+                data != nullptr) {
+                std::vector<unsigned char> grey;
+                unsigned mw = 0, mh = 0;
+                const bool ok =
+                    lodepng::decode(grey, mw, mh, static_cast<const unsigned char*>(data),
+                                    size, LCT_GREY, 8) == 0;
+                mz_free(data);
+                if (ok && mw == static_cast<unsigned>(sel.w) &&
+                    mh == static_cast<unsigned>(sel.h)) {
+                    sel.mask = std::move(grey);
+                    usable = true;
+                }
+            }
+        }
+        if (usable) doc.selection = std::move(sel);
+    }
 
     // Absent in v1, and in any v2 document that has none — both mean "no
     // guides", which is why the version bump costs older files nothing.

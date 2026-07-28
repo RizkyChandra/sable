@@ -176,14 +176,50 @@ struct Layer {
 
 // ----------------------------------------------------------------- selection
 
-/// A rectangle is the whole of selection in v1 (Milestone 3). Ask it questions
-/// rather than reading its fields — freehand and masks arrive in Stage D.
+/// A bounding rectangle, optionally carrying a per-pixel coverage mask for the
+/// shapes a rectangle cannot say: lasso, magic wand, and whatever the
+/// add/subtract/intersect modifiers built out of them (#18).
+///
+/// Ask it questions rather than reading its fields. An EMPTY `mask` means "all
+/// of the rectangle, fully covered" — that is the fast path, and the reason a
+/// plain marquee still costs four comparisons per pixel instead of a megabyte
+/// of 255s and a cache miss.
+///
+/// See `sbl/select.hpp` for the things that build one.
 struct Selection {
     std::int32_t x = 0, y = 0, w = 0, h = 0;
+
+    /// Empty, or exactly w * h bytes, row-major from (x, y). Nothing else is a
+    /// valid state; `coverage()` would read past a short one.
+    ///
+    /// The `{}` is load-bearing: it keeps `Selection{x, y, w, h}` a warning-free
+    /// aggregate initialisation, which is how every existing call site and test
+    /// builds one.
+    std::vector<std::uint8_t> mask{};
+
     [[nodiscard]] bool empty() const noexcept { return w <= 0 || h <= 0; }
-    [[nodiscard]] bool contains(std::int32_t px, std::int32_t py) const noexcept {
-        return px >= x && py >= y && px < x + w && py < y + h;
+
+    /// 0 outside, 255 fully inside, and the values between are the
+    /// anti-aliased edge. Writers scale what they lay down by this rather than
+    /// treating the boundary as in-or-out, which is what stops a lasso fill
+    /// coming out with a staircase along its edge.
+    [[nodiscard]] std::uint8_t coverage(std::int32_t px,
+                                        std::int32_t py) const noexcept {
+        if (px < x || py < y || px >= x + w || py >= y + h) return 0;
+        if (mask.empty()) return 255;
+        return mask[static_cast<std::size_t>(py - y) * static_cast<std::size_t>(w) +
+                    static_cast<std::size_t>(px - x)];
     }
+
+    /// The yes-or-no question every caller already asks, and still the whole
+    /// interface for anything that cannot express a fraction. Half coverage
+    /// counts as inside, so a shape's edge pixels belong to it; for a
+    /// rectangle the answer is exactly what it always was.
+    [[nodiscard]] bool contains(std::int32_t px, std::int32_t py) const noexcept {
+        return coverage(px, py) >= 128;
+    }
+
+    friend bool operator==(const Selection&, const Selection&) = default;
 };
 
 // ---------------------------------------------------------------------- undo
