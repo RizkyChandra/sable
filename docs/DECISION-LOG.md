@@ -551,6 +551,36 @@ handling for the file dialogs — and D-002 chose SDL's *native* dialogs, which
 behave differently under a portal. That is a piece of work, not a line of
 YAML.
 
+## D-019 — File formats: one registry, extension first and content second
+
+**Status:** Decided
+**Affects:** `engine/include/sbl/format.hpp`, `engine/src/format.cpp`, the File menu
+
+Every reader and writer is a `Format` in one table
+(`builtinFormats()` in `engine/src/format.cpp`). The app never names a format:
+`importDocument()` and `exportDocument()` dispatch, and the file dialogs build
+their filters from `dialogFilters()`. Adding PSD, ORA or KRA is one entry plus
+the reader itself.
+
+**Extension first, content second.** `.sable`, `.ora` and `.kra` are all ZIP
+containers, so an extension is a hint, not an identification. A format may
+supply a `sniff`; when the extension matches but the content disagrees, the
+registry asks every format that can answer, and only then falls back to the
+reader the name promised — so the artist gets a specific complaint about the
+file rather than a generic one about its name.
+
+**`Document::path` belongs to the registry, not to importers.** `importDocument()`
+sets it for the native project format and clears it for everything else. This is
+not tidiness: Ctrl+S writes a `.sable` archive straight to `Document::path`, so
+an importer that left `painting.psd` there would destroy the artist's PSD on the
+next save. Closing the trap once, centrally, is the only version of this that
+stays closed as importers are added by different hands.
+
+**Rejected:** self-registering static initialisers (an importer that fails to
+link is then silently absent, and static-init order across translation units is
+not worth the convenience), and `std::function` members (every reader is a free
+function; plain function pointers keep the table allocation-free).
+
 ---
 
 ## Open decisions

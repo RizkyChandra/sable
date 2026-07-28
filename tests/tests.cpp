@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "sbl/canvas.hpp"
+#include "sbl/format.hpp"
 #include "sbl/io.hpp"
 #include "sbl/paint.hpp"
 #include "sbl/project.hpp"
@@ -1723,6 +1724,128 @@ TEST_CASE("a truncated manifest tile list still loads the surviving tiles") {
     REQUIRE(loaded.has_value());
     CHECK(hashCanvas(*loaded) == before);      // the pixels survived the bad manifest
     std::filesystem::remove(path);
+}
+
+// -------------------------------------------------------- the format registry
+
+namespace {
+
+/// Stands in for the importers still to come. It does what a careless one would
+/// do — sets Document::path — so the tests can prove the registry undoes it.
+std::expected<Document, Error> readPretend(const std::filesystem::path& path) {
+    Document doc = makeDocument(16, 16, StraightRgba8{255, 255, 255, 255});
+    doc.path = path;
+    return doc;
+}
+
+bool looksLikePretend(const std::filesystem::path& path) {
+    return readMagic(path, 7) == "PRETEND";
+}
+
+/// Idempotent: test cases must not depend on which of them ran first.
+void ensurePretendFormat() {
+    for (const Format& format : formats())
+        if (format.id == "pretend") return;
+    registerFormat(Format{.id = "pretend", .label = "Pretend image",
+                          .extensions = {"pretend"}, .nativeProject = false,
+                          .read = &readPretend, .write = nullptr,
+                          .sniff = &looksLikePretend});
+}
+
+std::filesystem::path writePretendFile(const char* name) {
+    const auto path = scratchFile(name);
+    FILE* out = std::fopen(path.string().c_str(), "wb");
+    REQUIRE(out != nullptr);
+    std::fwrite("PRETENDnot really an image", 1, 26, out);
+    std::fclose(out);
+    return path;
+}
+
+}  // namespace
+
+TEST_CASE("the registry opens .sable through the same call as any other format") {
+    const Document original = sampleDocument();
+    const auto path = scratchFile("registry_native.sable");
+    REQUIRE(exportDocument(original, path).has_value());
+
+    const auto loaded = importDocument(path);
+    REQUIRE(loaded.has_value());
+    CHECK(hashCanvas(*loaded) == hashCanvas(original));
+    // The native project format is the only one that owns its path.
+    CHECK(loaded->path == path);
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("an imported document has no path, so Ctrl+S cannot overwrite it") {
+    // The trap this registry exists to close: Ctrl+S writes a .sable archive
+    // straight to Document::path. If an import left the artist's own file there,
+    // saving would destroy it.
+    ensurePretendFormat();
+    const auto path = writePretendFile("registry_import.pretend");
+
+    const auto imported = importDocument(path);
+    REQUIRE(imported.has_value());
+    CHECK(imported->path.empty());
+    CHECK(imported->width == 16);
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("content decides when the extension lies") {
+    // .sable, .ora and .kra are all ZIPs, so a wrong extension is not exotic.
+    ensurePretendFormat();
+    const auto path = writePretendFile("registry_misnamed.sable");
+
+    const auto imported = importDocument(path);
+    REQUIRE(imported.has_value());
+    CHECK(imported->width == 16);        // read as a pretend file, not as .sable
+    CHECK(imported->path.empty());
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("an unrecognised file fails with a message naming what would work") {
+    const auto path = scratchFile("registry_mystery.xyz");
+    { FILE* out = std::fopen(path.string().c_str(), "wb");
+      REQUIRE(out != nullptr);
+      std::fwrite("nothing recognisable", 1, 20, out);
+      std::fclose(out); }
+
+    const auto imported = importDocument(path);
+    REQUIRE(!imported.has_value());
+    CHECK(imported.error().kind == ErrorKind::Malformed);
+    CHECK(imported.error().detail.find(".sable") != std::string::npos);
+
+    CHECK(!importDocument("/nowhere/at/all.sable").has_value());
+    CHECK(importDocument("/nowhere/at/all.sable").error().kind == ErrorKind::NotFound);
+
+    // Writing is extension-only: there is nothing to sniff in a file that does
+    // not exist yet, so an unknown one must fail rather than guess.
+    const auto out = scratchFile("registry_mystery_out.xyz");
+    const auto written = exportDocument(sampleDocument(), out);
+    REQUIRE(!written.has_value());
+    CHECK(!written.error().detail.empty());
+    CHECK(!std::filesystem::exists(out));
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("the dialog filters come from the registry") {
+    ensurePretendFormat();
+    const auto open = dialogFilters(FormatUse::Read, true);
+    REQUIRE(open.size() == 1);
+    CHECK(open[0].pattern == "sable");
+
+    const auto import = dialogFilters(FormatUse::Read, false);
+    CHECK(std::ranges::any_of(import, [](const DialogFilter& f) {
+        return f.pattern == "pretend";
+    }));
+
+    // Export offers what can be written and is not the project format itself.
+    const auto exportable = dialogFilters(FormatUse::Write, false);
+    CHECK(std::ranges::any_of(exportable, [](const DialogFilter& f) {
+        return f.pattern == "png";
+    }));
+    CHECK(std::ranges::none_of(exportable, [](const DialogFilter& f) {
+        return f.pattern == "sable";
+    }));
 }
 
 TEST_CASE("recovery never writes over the artist's own file") {
