@@ -1,0 +1,253 @@
+name: Release
+
+# Tagging is the trigger, so a release is always exactly one commit's worth of
+# code. `workflow_dispatch` builds the artefacts without publishing, which is
+# how to check a release before committing to a tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  SDL_VERSION: release-3.4.12
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-22.04     # oldest glibc we can get, for reach
+            artifact: sable-linux-x86_64
+          - name: Windows x86_64
+            runner: windows-latest
+            artifact: sable-windows-x86_64
+          - name: macOS arm64
+            runner: macos-14
+            artifact: sable-macos-arm64
+          - name: macOS x86_64
+            runner: macos-13
+            artifact: sable-macos-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- SDL3 is linked STATICALLY for releases, so a download is one file
+      # with nothing to install alongside it. SDL is zlib licensed, which
+      # permits that; it still dlopens X11/Wayland/Cocoa at runtime, so a
+      # static SDL does not pin the display server.
+      - name: Cache SDL3
+        id: sdl-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.sdl3
+          key: sdl3-static-${{ matrix.runner }}-${{ env.SDL_VERSION }}
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-12 \
+            libasound2-dev libpulse-dev libdbus-1-dev libudev-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev \
+            libxi-dev libxss-dev libxtst-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libdrm-dev libgbm-dev \
+            libgl1-mesa-dev libegl1-mesa-dev
+
+      - name: Install Ninja
+        if: runner.os != 'Linux'
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Build SDL3
+        if: steps.sdl-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          git clone --depth 1 --branch "$SDL_VERSION" \
+            https://github.com/libsdl-org/SDL.git "${RUNNER_TEMP}/SDL"
+          cmake -S "${RUNNER_TEMP}/SDL" -B "${RUNNER_TEMP}/SDL/build" \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/.sdl3" \
+                -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+                -DSDL_SHARED=OFF -DSDL_STATIC=ON \
+                -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_INSTALL_TESTS=OFF
+          cmake --build "${RUNNER_TEMP}/SDL/build" --config Release
+          cmake --install "${RUNNER_TEMP}/SDL/build" --config Release
+
+      # --- macOS wants an .icns; it is generated from the same PNG the Linux
+      # packaging uses, which Sable's own engine drew (D-010/D-018).
+      - name: Generate the macOS icon
+        if: runner.os == 'macOS'
+        run: |
+          set -eu
+          iconset=packaging/sable.iconset
+          mkdir -p "$iconset"
+          for size in 16 32 64 128 256 512; do
+            sips -z $size $size packaging/sable.png \
+                 --out "$iconset/icon_${size}x${size}.png" >/dev/null
+            sips -z $((size*2)) $((size*2)) packaging/sable.png \
+                 --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+          done
+          iconutil -c icns "$iconset" -o packaging/sable.icns
+          rm -rf "$iconset"
+
+      - name: Configure
+        shell: bash
+        run: |
+          extra=""
+          [ "${{ runner.os }}" = "Linux" ] && extra="-DCMAKE_CXX_COMPILER=g++-12"
+          cmake -S . -B build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_PREFIX_PATH="${{ github.workspace }}/.sdl3" \
+                -DSABLE_BUILD_TESTS=ON \
+                $extra
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -C Release
+
+      # The self-test is the only automated check of the SDL and ImGui wiring,
+      # and on Windows and macOS it is the ONLY evidence the application runs
+      # at all — neither platform has ever been exercised by hand (PRD §3
+      # lists them as v1 non-goals).
+      - name: Self-test
+        shell: bash
+        env:
+          SDL_VIDEODRIVER: ${{ runner.os == 'Linux' && 'offscreen' || '' }}
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            ./build/Sable.app/Contents/MacOS/Sable --selftest
+          elif [ "${{ runner.os }}" = "Windows" ]; then
+            ./build/sable.exe --selftest || exit 1
+          else
+            ./build/sable --selftest
+          fi
+
+      - name: Stage the package
+        shell: bash
+        run: |
+          set -eu
+          out="dist/${{ matrix.artifact }}"
+          mkdir -p "$out"
+          cp LICENSE README.md "$out/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp build/sable.exe "$out/"
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            cp -R build/Sable.app "$out/"
+          else
+            cp build/sable "$out/"
+            cp packaging/sable.desktop packaging/sable.png "$out/"
+          fi
+
+      - name: Archive
+        shell: bash
+        run: |
+          set -eu
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "${{ matrix.artifact }}.zip" "${{ matrix.artifact }}"
+          else
+            # Preserves the executable bit and, on macOS, the bundle layout.
+            zip -qry "${{ matrix.artifact }}.zip" "${{ matrix.artifact }}"
+            tar czf "${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}"
+          fi
+
+      - name: Build the AppImage
+        if: runner.os == 'Linux'
+        run: |
+          packaging/build-appimage.sh
+          mv Sable-x86_64.AppImage dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.AppImage
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Release notes
+        run: |
+          cat > notes.md <<'NOTES'
+          ## Downloads
+
+          | Platform | File |
+          |---|---|
+          | Linux (any distribution) | `Sable-x86_64.AppImage` — self-contained, `chmod +x` and run |
+          | Linux (archive) | `sable-linux-x86_64.tar.gz` |
+          | Windows 10/11 | `sable-windows-x86_64.zip` |
+          | macOS (Apple silicon) | `sable-macos-arm64.zip` |
+          | macOS (Intel) | `sable-macos-x86_64.zip` |
+
+          Verify a download against `SHA256SUMS`.
+
+          SDL3 is linked statically, so there is nothing to install alongside.
+
+          ## Please read before using this on Windows or macOS
+
+          Sable's specification lists Windows and macOS as **non-goals** for
+          version 1 (PRD §3). Those builds compile, pass the engine test suite,
+          and pass the headless self-test in CI — and that is the whole of the
+          evidence. Nobody has painted a stroke in them by hand.
+
+          Neither build is signed or notarised. macOS will refuse to open it
+          until you allow it in System Settings → Privacy & Security; Windows
+          SmartScreen will warn.
+
+          ## Please also read this about tablets
+
+          **The stylus spike (US-00) has never been run**, on any platform,
+          because no tablet was available during development. Pressure, tilt
+          and the sample rate are verified against synthetic input only. The
+          engine maths is well tested; the hardware path is not.
+
+          If your tablet does not work, that is a known unverified area rather
+          than a surprise — the fallback plan is recorded as D-002a in
+          `docs/DECISION-LOG.md`.
+
+          ## What is in it
+
+          Layers with blend modes, clipping and groups; pencil, opaque,
+          airbrush, marker, watercolour and smudge brushes; selection, bucket
+          fill and transform; pressure curves and a stabilizer; `.sable`
+          projects that are a plain ZIP of PNG tiles; crash recovery that never
+          overwrites your own files; dockable panels; and a reassignable key
+          for every action.
+          NOTES
+          cat notes.md
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body_path: notes.md
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true

@@ -12,6 +12,9 @@
 #include <filesystem>
 #include <cstring>
 #include <new>
+#ifdef _MSC_VER
+#include <malloc.h>
+#endif
 #include <vector>
 
 #include "sbl/canvas.hpp"
@@ -41,7 +44,13 @@ void* operator new[](std::size_t n) { return ::operator new(n); }
 void* operator new(std::size_t n, std::align_val_t a) {
     ++g_allocations;
     const std::size_t align = static_cast<std::size_t>(a);
+    // MSVC has no std::aligned_alloc; its aligned allocations must be freed
+    // with _aligned_free, so the matching deletes below branch as well.
+#ifdef _MSC_VER
+    if (void* p = _aligned_malloc(((n + align - 1) / align) * align, align)) return p;
+#else
     if (void* p = std::aligned_alloc(align, ((n + align - 1) / align) * align)) return p;
+#endif
     throw std::bad_alloc{};
 }
 void* operator new[](std::size_t n, std::align_val_t a) { return ::operator new(n, a); }
@@ -50,10 +59,17 @@ void operator delete(void* p) noexcept                    { std::free(p); }
 void operator delete[](void* p) noexcept                  { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept       { std::free(p); }
 void operator delete[](void* p, std::size_t) noexcept     { std::free(p); }
+#ifdef _MSC_VER
+void operator delete(void* p, std::align_val_t) noexcept  { _aligned_free(p); }
+void operator delete[](void* p, std::align_val_t) noexcept { _aligned_free(p); }
+void operator delete(void* p, std::size_t, std::align_val_t) noexcept   { _aligned_free(p); }
+void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { _aligned_free(p); }
+#else
 void operator delete(void* p, std::align_val_t) noexcept  { std::free(p); }
 void operator delete[](void* p, std::align_val_t) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t, std::align_val_t) noexcept   { std::free(p); }
 void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
+#endif
 
 namespace {
 

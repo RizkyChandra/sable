@@ -28,10 +28,18 @@ inline constexpr int SABLE_FORMAT_VERSION = 1;
 [[nodiscard]] std::expected<Document, Error> loadProject(
     const std::filesystem::path& path);
 
-/// Where recovery data goes (D-013). Under the XDG state directory, NEVER over
-/// the artist's own file — this is the one failure mode that destroys work
-/// permanently.
+/// Where recovery data goes (D-013). NEVER over the artist's own file — this
+/// is the one failure mode that destroys work permanently.
+///
+/// Defaults to the XDG state directory. The engine links no SDL (D-003), so it
+/// cannot ask the platform where user data belongs; on Windows and macOS the
+/// XDG guess is wrong and would land in a temporary directory that the system
+/// is free to erase. The application therefore supplies the real location at
+/// startup via setRecoveryDirectory().
 [[nodiscard]] std::filesystem::path recoveryDirectory();
+
+/// Overrides the location. Pass an empty path to return to the default.
+void setRecoveryDirectory(std::filesystem::path directory);
 
 /// Writes a recovery copy plus a small JSON note pointing at the original path.
 /// `originalPath` may be empty for a document that has never been saved.

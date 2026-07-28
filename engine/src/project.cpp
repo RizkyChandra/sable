@@ -334,7 +334,17 @@ std::expected<Document, Error> loadProject(const std::filesystem::path& path) {
 // D-013: recovery data goes to a separate path under the XDG state directory,
 // and restoring is an explicit user action. Never written over Document::path.
 
+namespace {
+std::filesystem::path g_recoveryOverride;
+}  // namespace
+
+void setRecoveryDirectory(std::filesystem::path directory) {
+    g_recoveryOverride = std::move(directory);
+}
+
 std::filesystem::path recoveryDirectory() {
+    if (!g_recoveryOverride.empty()) return g_recoveryOverride;
+
     std::filesystem::path base;
     if (const char* state = std::getenv("XDG_STATE_HOME"); state != nullptr && *state != '\0')
         base = state;

@@ -1872,6 +1872,14 @@ int main(int argc, char** argv) {
     CanvasView canvas(renderer);
     app.canvas = &canvas;
 
+    // The engine cannot ask the platform where user data lives (D-003), so
+    // tell it. Without this, recovery lands in a temporary directory on
+    // Windows and macOS — which is precisely what D-013 exists to prevent.
+    if (char* base = SDL_GetPrefPath("sable", "sable"); base != nullptr) {
+        sbl::setRecoveryDirectory(std::filesystem::path(base) / "recovery");
+        SDL_free(base);
+    }
+
     applySettings(app, loadSettings());
     syncHsvFromColour(app);
 

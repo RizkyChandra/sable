@@ -16,10 +16,27 @@ endif()
 option(SABLE_BUILD_APP   "Build the SDL3 + ImGui application" ON)
 option(SABLE_BUILD_TESTS "Build the engine unit tests"        ON)
 option(SABLE_ASAN        "Build with AddressSanitizer"        OFF)
+# Windows only: keep a console attached so SDL_Log output is visible. Off for
+# release builds, because an artist should not get a terminal window with
+# their paint program; on for CI, so a failing self-test says why.
+option(SABLE_CONSOLE     "Attach a console on Windows"        OFF)
+
+# Warning and sanitizer flags differ by compiler. Sable's own targets get
+# these; vendored third-party code does not, which is why they are per-target
+# rather than global.
+if(MSVC)
+  set(SABLE_WARNINGS /W4 /permissive- /utf-8)
+else()
+  set(SABLE_WARNINGS -Wall -Wextra -Wpedantic)
+endif()
 
 if(SABLE_ASAN)
-  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
-  add_link_options(-fsanitize=address,undefined)
+  if(MSVC)
+    add_compile_options(/fsanitize=address)
+  else()
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address,undefined)
+  endif()
 endif()
 
 include(FetchContent)
@@ -90,7 +107,7 @@ add_library(engine STATIC
   engine/src/project.cpp)
 target_include_directories(engine PUBLIC engine/include)
 target_link_libraries(engine PRIVATE lodepng miniz nlohmann_json)
-target_compile_options(engine PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(engine PRIVATE ${SABLE_WARNINGS})
 add_library(sable::engine ALIAS engine)
 
 # ------------------------------------------------------------------------ app
@@ -120,15 +137,45 @@ if(SABLE_BUILD_APP)
   add_executable(sable app/src/main.cpp app/src/canvas_view.cpp
                        app/src/widgets.cpp app/src/settings.cpp
                        app/src/shortcuts.cpp app/src/icons.cpp)
+
+  # A GUI application on Windows, and a real bundle on macOS — an unbundled
+  # binary there cannot take keyboard focus properly.
+  if(WIN32 AND NOT SABLE_CONSOLE)
+    set_target_properties(sable PROPERTIES WIN32_EXECUTABLE ON)
+  endif()
+  if(APPLE)
+    set_target_properties(sable PROPERTIES
+      MACOSX_BUNDLE ON
+      OUTPUT_NAME "Sable"
+      MACOSX_BUNDLE_BUNDLE_NAME "Sable"
+      MACOSX_BUNDLE_GUI_IDENTIFIER "org.sable.Sable"
+      MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+      MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+      MACOSX_BUNDLE_ICON_FILE "sable.icns")
+    # Only present when the release workflow has generated it; a source build
+    # simply ships without an icon rather than failing.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/packaging/sable.icns")
+      target_sources(sable PRIVATE packaging/sable.icns)
+      set_source_files_properties(packaging/sable.icns PROPERTIES
+        MACOSX_PACKAGE_LOCATION "Resources")
+    endif()
+  endif()
   target_include_directories(sable PRIVATE app/src)
   target_link_libraries(sable PRIVATE sable::engine imgui SDL3::SDL3)
-  target_compile_options(sable PRIVATE -Wall -Wextra -Wpedantic)
+  target_compile_options(sable PRIVATE ${SABLE_WARNINGS})
 
   # ------------------------------------------------------------- packaging
   # D-106. A normal FHS install, which is what a distro package needs and what
   # the AppImage script builds on top of — rather than two separate recipes
   # that drift apart.
   include(GNUInstallDirs)
+  if(WIN32)
+    install(TARGETS sable RUNTIME DESTINATION .)
+    install(FILES LICENSE README.md DESTINATION .)
+  elseif(APPLE)
+    install(TARGETS sable BUNDLE DESTINATION .)
+    install(FILES LICENSE README.md DESTINATION .)
+  else()
   install(TARGETS sable RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
   install(FILES packaging/sable.desktop
           DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/applications)
@@ -140,6 +187,7 @@ if(SABLE_BUILD_APP)
           DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/mime/packages)
   install(FILES LICENSE README.md
           DESTINATION ${CMAKE_INSTALL_DOCDIR})
+  endif()
 endif()
 
 # ---------------------------------------------------------------------- tests
@@ -159,8 +207,10 @@ if(SABLE_BUILD_TESTS)
   target_link_libraries(engine_tests PRIVATE sable::engine doctest miniz nlohmann_json)
   # The allocation counter (US-02.9) replaces global operator new/delete, which
   # both compilers misread as a malloc/delete mismatch. It is not one.
-  target_compile_options(engine_tests PRIVATE
-    -Wall -Wextra -Wpedantic -Wno-mismatched-new-delete)
+  target_compile_options(engine_tests PRIVATE ${SABLE_WARNINGS})
+  if(NOT MSVC)
+    target_compile_options(engine_tests PRIVATE -Wno-mismatched-new-delete)
+  endif()
 
   enable_testing()
   add_test(NAME engine_tests COMMAND engine_tests)
