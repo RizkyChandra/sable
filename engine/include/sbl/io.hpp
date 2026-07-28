@@ -12,6 +12,8 @@
 
 namespace sbl {
 
+class PaintBackend;      // sbl/backend.hpp; see flatten's second overload
+
 enum class ErrorKind { NotFound, Permission, Malformed, UnsupportedVersion, Io };
 
 struct Error {
@@ -27,6 +29,14 @@ struct Error {
 /// Straight alpha is the point: this is the PremulRgba8 -> StraightRgba8
 /// conversion, and getting it wrong greys every soft edge (US-07.3).
 [[nodiscard]] std::vector<StraightRgba8> flatten(const Document& doc);
+
+/// The same, through a named backend instead of the process default.
+///
+/// This exists for the one caller that must not take the default: the autosave
+/// worker composites its thumbnail on a thread with no device context, so it
+/// asks `cpuBackend()` by name. Everything else should use the overload above.
+[[nodiscard]] std::vector<StraightRgba8> flatten(const Document& doc,
+                                                 PaintBackend& backend);
 
 /// One rectangle of what flatten() produces, still premultiplied, w * h pixels
 /// with buffer pixel 0 at canvas pixel (x, y). Pixels outside the document are
@@ -49,7 +59,10 @@ struct Error {
 /// Composites one pixel rather than calling flatten() and indexing it — the
 /// colour picker runs on a click, and flattening 4000 x 4000 to read four
 /// bytes is the kind of thing that gets noticed on the target hardware.
+///
+/// Not `noexcept` for the same reason as `applyDab`: a backend that cannot
+/// read the pixel back has to be able to record why.
 [[nodiscard]] StraightRgba8 pickColour(const Document& doc,
-                                       std::int32_t x, std::int32_t y) noexcept;
+                                       std::int32_t x, std::int32_t y);
 
 }  // namespace sbl

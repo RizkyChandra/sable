@@ -222,15 +222,21 @@ struct PaintTarget {
     UndoRecord&   undo;
     TouchedTiles& touched;      // which tiles already hold a snapshot
     int32_t       width, height;  // canvas bounds; dabs clip to this
+    PaintBackend* backend;      // null = the process default (D-021)
 };
 
-void applyDab(PaintTarget& target, const Dab& dab) noexcept;
+void applyDab(PaintTarget& target, const Dab& dab);
 ```
 
 Not `applyDab(Document&, ...)`. This keeps the hot path free of lookups, makes
 every function unit-testable without constructing a document, and means the
 compositor can later run on a layer while the UI reads document metadata without
 anyone having to reason about aliasing.
+
+`backend` is where a GPU dispatch lives (D-021); null means `paintBackend()`,
+which is the CPU backend unless the app has installed another. The call is no
+longer `noexcept`, because a backend that fails needs to be able to say so —
+see `sbl/backend.hpp`.
 
 ---
 

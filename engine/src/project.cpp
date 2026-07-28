@@ -8,6 +8,8 @@
 #include <system_error>
 #include <vector>
 
+#include "sbl/backend.hpp"
+
 #include "lodepng.h"
 #include "miniz.h"
 #include "miniz_zip.h"
@@ -86,7 +88,9 @@ bool decodeTile(const unsigned char* data, std::size_t size, Tile& out) {
 /// 256 px preview, not an export.
 std::vector<unsigned char> encodeThumbnail(const Document& doc) {
     constexpr unsigned kMax = 256;
-    const std::vector<StraightRgba8> full = flatten(doc);
+    // The CPU backend by name: saving runs on the autosave worker, a thread
+    // with no device context, and the clone it was handed is host pixels.
+    const std::vector<StraightRgba8> full = flatten(doc, cpuBackend());
     if (full.empty()) return {};
 
     const auto srcW = static_cast<unsigned>(doc.width);

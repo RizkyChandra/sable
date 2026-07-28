@@ -334,6 +334,10 @@ struct Document {
 /// nothing that stops a worker reaching into the live document, so the
 /// discipline has to be explicit, and "copy it all" is the version that cannot
 /// be got subtly wrong under a deadline.
+///
+/// Copies host tiles, and only host tiles. Call `PaintBackend::readback` first
+/// if a backend may be holding pixels somewhere else — the worker thread has no
+/// device context and cannot fetch them itself.
 [[nodiscard]] Document cloneDocument(const Document& doc);
 
 // ----------------------------------------------------------- layer operations

@@ -103,8 +103,11 @@ target_include_directories(nlohmann_json SYSTEM INTERFACE
   ${nlohmann_json_SOURCE_DIR}/single_include)
 
 # --------------------------------------------------------------------- engine
-# D-003: links NO SDL, NO ImGui. A stray SDL include here fails to build.
+# D-022: the engine may link SDL3, but never ImGui, and nothing under engine/
+# may open a window, an event queue or an input device. The headless
+# engine_tests below are what enforces that now the link error no longer can.
 add_library(engine STATIC
+  engine/src/backend.cpp
   engine/src/canvas.cpp
   engine/src/input.cpp
   engine/src/paint.cpp

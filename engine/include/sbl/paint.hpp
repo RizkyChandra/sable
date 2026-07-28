@@ -13,6 +13,10 @@
 
 namespace sbl {
 
+/// Declared, not included: `sbl/backend.hpp` needs `Dab` and `PaintTarget`
+/// from this header, so the dependency only runs one way.
+class PaintBackend;
+
 // ------------------------------------------------------------------- brushes
 
 /// Round is the only shape in v1; the enum exists so the stamp path has
@@ -118,6 +122,10 @@ struct PaintTarget {
     /// When set, paint lands only inside it. Empty optional means the whole
     /// canvas, which is what "no selection" has to mean.
     const Selection* selection = nullptr;
+    /// Which backend paints this stroke; null means `paintBackend()`, the
+    /// process default. Per-stroke rather than only global so that a test can
+    /// drive two backends over one document and compare (D-021, #14).
+    PaintBackend* backend = nullptr;
 };
 
 void beginStroke(Stroke& s, const BrushPreset& preset, StraightRgba8 colour,
@@ -134,9 +142,17 @@ void appendSample(Stroke& s, const InputSample& sample, std::vector<Dab>& out);
 
 /// Snapshots each tile on first touch (D-006), then blends. Allocates only
 /// when a tile or a snapshot is created for the first time.
-void applyDab(PaintTarget& t, const Dab& dab) noexcept;
+///
+/// No longer `noexcept`: a backend that fails must be able to say so, and
+/// building the message may allocate. Nothing is returned — a failure is
+/// recorded on the backend and collected once per stroke with
+/// `PaintBackend::takeError()`. See `sbl/backend.hpp` for why that shape and
+/// not `std::expected` per dab.
+void applyDab(PaintTarget& t, const Dab& dab);
 
-/// Convenience for the whole segment: emit and apply. Returns the dab count.
+/// Convenience for the whole segment: emit and apply. Returns the dab count,
+/// which counts dabs emitted, not dabs a backend managed to draw — ask
+/// `PaintBackend::takeError()` about that when the stroke ends.
 std::size_t paintSample(Stroke& s, PaintTarget& t, const InputSample& sample,
                         std::vector<Dab>& scratch);
 
