@@ -162,7 +162,8 @@ is new enough that a bug is more likely than a design limitation.
 
 ## D-003 — Build: CMake + Ninja, `engine` and `app` targets
 
-**Status:** Decided
+**Status:** Decided; the "links NO SDL" and "resist adding more" rules are
+**Superseded by D-022**
 **Affects:** repo layout
 
 The original project scope asked for one reproducible build system to be chosen
@@ -205,7 +206,8 @@ a paint application's dependency list should be boring.
 
 ## D-004 — Colour depth: 8-bit RGBA, premultiplied alpha
 
-**Status:** Decided for v1
+**Status:** Decided; 8-bit-*only* is **Superseded by D-023** — 8-bit remains the
+default, and the type split below is what D-023 relies on
 **Affects:** tile format, compositing, file format, SDL blend mode
 
 **Why:** halves memory per tile (256 KB vs 512 KB) and keeps blend maths simple
@@ -242,7 +244,8 @@ snapshots are unaffordable; per-dab records are pointless.
 
 ## D-007 — Rendering: CPU compositing, GPU for display only
 
-**Status:** Decided
+**Status:** **Superseded by D-021** — the CPU path below is still the default
+and the reference implementation; "the GPU never paints" is what changed
 **Affects:** renderer, hardware requirements
 
 Dab rasterisation and layer compositing are plain C++ on the CPU. Composited
@@ -273,7 +276,8 @@ accumulate per-frame state assumptions.
 
 ## D-009 — Licence: MIT
 
-**Status:** Decided
+**Status:** **Superseded by D-020** — Sable is MIT today, but a permissive
+dependency is no longer a requirement
 
 Add `LICENSE` in the first commit, before any outside contribution arrives.
 
@@ -550,6 +554,195 @@ and software centres, but it needs a manifest, a runtime choice, and portal
 handling for the file dialogs — and D-002 chose SDL's *native* dialogs, which
 behave differently under a portal. That is a piece of work, not a line of
 YAML.
+
+## D-019 — The self-imposed constraints are released; the target is SAI 2
+
+**Status:** Decided
+**Affects:** PRD §3, PRD §4, and every entry named below
+**Superseded by this entry:** D-003's engine and dependency rules (see D-022),
+D-004's 8-bit-only stance (D-023), D-007 (D-021), D-009 (D-020), PRD §3's
+non-goals and PRD §4's fourth principle
+
+Sable's constraints were chosen for a different product. The brief was a small
+Linux sketching tool that starts fast on an old laptop, and D-003, D-004, D-007
+and PRD §3 all follow from it. Each was right for that brief.
+
+The brief has changed. Sable is now meant to be the application an artist
+leaves PaintTool SAI 2 for, and that is a different bar. SAI 2 runs on Windows,
+paints in 16 bits per channel, uses the GPU when asked, and reads and writes
+PSD. A Linux-only, 8-bit, CPU-only program that cannot open the artist's
+existing files does not compete with it however good its brush feels — the
+artist does not get as far as the brush.
+
+**What is released, and where each is answered:**
+
+| Constraint | Came from | Now |
+|---|---|---|
+| Windows and macOS are not targets | PRD §3 | Goals. The build already produces both; this entry stops the document contradicting the code |
+| The GPU never paints | D-007, PRD §3 | An opt-in GPU compositing backend — D-021 |
+| The engine links no SDL | D-003 | Released — D-022 |
+| Resist adding dependencies | D-003 | Released. The licence rule in D-020 is the filter now |
+| 8-bit only | D-004 | Released — D-023 |
+| No format compatibility | PRD §3 | PSD, ORA and KRA import and export are goals. `.sable` stays the working format (D-011) |
+
+**Principle 4 restated, honestly.** "Modest hardware is the target, not the
+fallback" is kept, but it no longer means the weakest machine sets the ceiling
+for everyone. What preserves it is that each capability added under this entry
+is a **runtime** switch and never a build-time one: CPU compositing stays the
+default and the reference (D-021), 8-bit stays the default depth (D-023). The
+student on the old laptop runs the same binary as everyone else and leaves the
+switches alone. So the principle reads: *Sable must stay usable on modest
+hardware at its default settings.* Test on the old laptop with the defaults;
+test the switches on the machine that has the hardware.
+
+**Cost accepted, and it is the real one:** the constraints were also a scope
+fence. PRD §17 lists "scope creep toward Krita" as a risk and names the §3
+non-goals as the response — that argument-ender is now gone, and what is left
+in its place is milestone ordering and D-020's licence rule, which are weaker
+fences. Expect to have to say "not yet" in review where the document used to
+say "never", and expect that to be argued with.
+
+**Alternative rejected:** keep the constraints and compete on feel alone. It is
+a coherent product, and it is the product Sable already is. It has no answer
+for an artist with three years of PSD files and a Windows desktop.
+
+## D-020 — Any open source licence; `LICENSE` follows the code, in the same commit
+
+**Status:** Decided
+**Affects:** every dependency choice, `LICENSE`, release
+**Supersedes:** D-009
+
+**The rule, in full:** any open source licence may be used. If copyleft code
+lands in the tree, Sable's `LICENSE` changes to match it, in the same commit.
+
+**Why the same commit, and not "before the release":** GPL code inside a binary
+distributed under MIT is not untidiness, it is copyright infringement. The MIT
+text grants recipients sublicensing and proprietary-relicensing rights that the
+GPL never gave us to grant, so the moment the code is in the tree the LICENSE
+file is making a claim we have no right to make. The commit that creates the
+false claim is the commit that has to fix it — anything later means every clone
+taken in between carries it.
+
+**And enforcement is real, not theoretical.** Copyleft violations have been
+litigated to judgment and settled repeatedly; the standard remedy is an
+injunction against further distribution, which arrives at precisely the moment
+a project has enough users to be noticed. Treat a licence mismatch as a defect
+of the same severity as data loss, because it can end the project just as
+finally.
+
+**What this releases:** D-009 required every dependency to be MIT, zlib or
+public-domain-equivalent, and D-002 rejected JUCE on AGPLv3 alone. That
+automatic filter is gone. If the best answer to a problem is GPL — a
+colour-management library, a PSD reader, a brush engine — take it, and change
+`LICENSE` with it.
+
+**Cost accepted, and it is not small:** relicensing is one-way in practice.
+Once Sable ships copyleft it cannot come back without every contributor's
+agreement, and downstream users who could have embedded an MIT Sable no longer
+can. So check the licence *before* adding the dependency and price "this pulls
+the whole project to GPL" into the trade as a real cost. Rejecting JUCE would
+still be a reasonable call today; the difference is that it would be a call,
+made on merits and price, rather than an automatic no.
+
+**Forbidden regardless of any licence, and not a trade:**
+
+- `.sai2` support, in either direction.
+- Any PaintTool SAI source, asset, icon, brush texture or interface artwork.
+
+Neither is an open source licensing question at all. Those things are
+proprietary — no licence we adopt makes them available to us — and SAI's EULA
+almost certainly forbids the reverse engineering that reading `.sai2` would
+require. D-010 stands unchanged and this entry does not touch it: studying
+SAI's publicly visible workflow is still fine, and always was.
+
+## D-021 — Compositing: an opt-in GPU backend, CPU stays the reference
+
+**Status:** Decided
+**Affects:** renderer, D-002's rendering-backend note, hardware requirements
+**Supersedes:** D-007
+
+D-007 said dab rasterisation and layer compositing are plain CPU C++ and the
+GPU never paints. A GPU compositing backend may now be added. It is selected at
+runtime and it defaults to off.
+
+**The CPU path stays, and stays the reference implementation.** It is what the
+headless engine tests composite with, it is what defines the correct answer
+when the two disagree, and it is what runs when there is no usable GPU or the
+driver is one of the ones that is wrong. A GPU backend that is merely faster is
+worth having; a GPU backend that became the only implementation would put
+D-019's modest-hardware promise behind a driver.
+
+**Why the runtime switch is the load-bearing part:** a build-time option means
+two binaries, and the bug report you cannot reproduce because the reporter has
+the other one. One binary with a toggle also gives a free bisect — every
+"the colours are wrong" report is one switch away from saying which side is
+wrong.
+
+**Cost accepted:** two implementations of the same blend maths, which will
+drift. The mitigation is that the CPU path is what the blend-mode tests assert
+against, and any GPU path is checked against it pixel-for-pixel rather than by
+eye. A one-level fringe is invisible on screen and obvious in a diff, which is
+the wrong way round for a mistake to behave.
+
+**Alternative rejected:** GPU by default with a CPU fallback. The default is
+the path that gets tested, and the fallback is the path that quietly rots until
+someone without a GPU tries to draw with it.
+
+## D-022 — The engine may link SDL3; the boundary becomes a rule, not a link error
+
+**Status:** Decided
+**Affects:** repo layout, D-003
+**Supersedes:** D-003's "links NO SDL" rule and its "resist adding more"
+dependency rule
+
+D-003 enforced the engine/app split by simply not linking SDL into `engine`, so
+a stray `#include <SDL3/SDL.h>` failed to build. That was cheap and it worked.
+It also blocks what D-021 needs: `SDL_GPU`, and SDL's threading and timing
+primitives, all of which belong under the compositor rather than beside it.
+
+`engine` may link SDL3. It still must not link Dear ImGui — that half of the
+boundary is the one that matters and it costs nothing to keep, because ImGui is
+the interface and interface code inside the engine is what makes an engine
+impossible to test.
+
+**What replaces the link failure:** the engine tests. They are headless, they
+link `engine` with no window, no renderer and no display server, and they must
+stay that way in CI. Engine code that needs a window or an event loop fails
+there instead of at the link step. The rule, stated so a reviewer can apply it:
+**the engine may call SDL, but nothing under `engine/` may create a window,
+open an event queue, or read an input device.** Those stay in `app/`.
+
+**Cost accepted:** this is a weaker fence, and it will be climbed. A compile
+error is not arguable; a rule has to be noticed by a human at review time, and
+sooner or later it will not be. Accepted because the alternative is a GPU
+backend living in `app/` and reaching back into engine internals to composite,
+which does not remove the boundary problem — it moves it somewhere worse.
+
+## D-023 — Colour depth: 16-bit per channel as an option, 8-bit still the default
+
+**Status:** Decided
+**Affects:** tile format, compositing, `.sable` manifest, memory, undo budget
+**Supersedes:** D-004's 8-bit-only stance ("Decided for v1")
+
+D-004 chose 8-bit premultiplied RGBA and accepted visible banding when many
+low-opacity airbrush passes stack. That banding is exactly what an artist
+arriving from SAI 2 — which paints in 16 bits — will notice first, and it
+appears in the soft rendering work Sable is meant to be good at. A 16-bit tile
+format may now be added, chosen per document. 8-bit remains the default.
+
+**D-004's enforcement is what makes this affordable, and it stays.**
+`PremulRgba8` and `StraightRgba8` are distinct types precisely so the compiler
+finds every conversion site when a wider type arrives. D-004 said "when a
+16-bit type is added later"; this is later. Add the 16-bit types the same way,
+and do not reach for a template over the channel type until there are two
+working implementations to generalise from — one of them is not a pattern.
+
+**Cost accepted:** double the memory per tile, 512 KB against 256 KB, and
+double the cost of every undo snapshot against D-017's budget, which means a
+16-bit document holds roughly half the history at the same setting. That is
+exactly why the default does not change: an artist who does not need 16 bits
+should not pay for it, and on D-019's modest hardware the difference is between
+comfortable and swapping.
 
 ---
 

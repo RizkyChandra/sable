@@ -17,9 +17,10 @@ PaintTool SAI is the reference for the opposite feel — it starts quickly, does
 focused set of things, and its brush response is immediate. It is Windows-only,
 proprietary, and paid.
 
-**Sable** is a lightweight open-source raster painting application for
-Linux, aimed at that gap: fast pen response and a small interface, on ordinary
-hardware.
+**Sable** is a lightweight open-source raster painting application, aimed at
+that gap: fast pen response and a small interface, on ordinary hardware. Linux
+is where it started and where it is developed; Windows and macOS are supported
+targets rather than someday-maybe (§3, D-019).
 
 ## 2. Who it is for
 
@@ -39,20 +40,32 @@ them would cost the thing that makes this worth building.
 
 1. Pen input feels immediate — the mark appears where and when the hand expects.
 2. An artist can start drawing within seconds of launching, with no setup.
-3. It runs well on ordinary Linux hardware with no discrete GPU.
+3. It runs well **at its default settings** on ordinary hardware with no
+   discrete GPU. Anything that needs more is a runtime switch (§4, D-019).
 4. It works offline, with no account and no telemetry.
 5. Pressure curves, brush settings, panels, and shortcuts are the artist's to
    adjust.
 6. Core drawing work is complete before any advanced simulation is attempted.
+7. It runs on Linux, Windows, and macOS.
+8. It opens the artist's existing work: PSD, ORA, and KRA import and export.
 
-**Non-goals for v1**
+**No longer non-goals** — D-019 released these, and records what it cost:
 
-- Windows and macOS support. SDL3 makes them plausible later and the input layer
-  is isolated, but neither is a v1 target.
-- GPU-accelerated painting. The GPU displays finished pixels; it never becomes a
-  requirement for producing them.
+- Windows and macOS support (goal 7). The build already produces both.
+- GPU-accelerated painting — now an opt-in compositing backend, off by default,
+  with the CPU path as the reference implementation (D-021).
+- Reading and writing `.psd`, `.ora`, and `.kra` (goal 8).
+- 8-bit-only colour — 16-bit is optional per document, 8-bit stays the default
+  (D-023).
+
+**Non-goals**
+
+- `.sai2` in either direction, and any SAI source, asset, icon, brush texture,
+  or interface artwork. This is a legal boundary, not a scope one, and no
+  licence change reaches it — see §7, D-010 and D-020.
+- `.psd` or `.kra` as the *working* format. They are import and export targets;
+  `.sable` is what Sable saves (D-011).
 - Physically simulated water, bristles, or particles.
-- Compatibility with `.sai2`, `.psd`, or `.kra` as a working format.
 - Plugins, scripting, cloud, or collaboration.
 
 ## 4. Product principles
@@ -65,8 +78,11 @@ These decide arguments later, so they are ranked.
    beats one that feels laggy with sixty.
 3. **Useful before complex.** Ship the whole ordinary workflow before any unusual
    capability.
-4. **Modest hardware is the target, not the fallback.** Test on an old laptop,
-   not only on the developer's machine.
+4. **Modest hardware is the target at the default settings.** Sable must stay
+   usable on an old laptop with nothing switched on — CPU compositing, 8-bit
+   colour. Capabilities that need more hardware are runtime switches, never
+   build-time ones, so there is one binary and the artist chooses. Test on the
+   old laptop with the defaults, not only on the developer's machine (D-019).
 5. **The artist controls the response.** Hardware and drivers supply raw data;
    the artist decides what it means.
 
@@ -78,9 +94,10 @@ These decide arguments later, so they are ranked.
 | Window, input, rendering | SDL3 | D-002 |
 | UI | Dear ImGui over `imgui_impl_sdl3` + `imgui_impl_sdlrenderer3` | D-002 |
 | Build | CMake + Ninja; `engine` and `app` targets | D-003 |
-| Rendering | CPU compositing; GPU blits finished tiles | D-007 |
+| Rendering | CPU compositing by default and as the reference; opt-in GPU backend | D-007 → D-021 |
+| Colour depth | 8-bit default, 16-bit optional per document | D-004 → D-023 |
 | Main loop | Event-driven, not a spin loop | D-008 |
-| Licence | MIT, and every dependency permissive | D-009 |
+| Licence | Any open source licence; `LICENSE` changes with the code, in the same commit | D-009 → D-020 |
 | Originality | No SAI code, assets, icons, or file internals | D-010 |
 
 **Why SDL3 and not Qt or GTK:** the choice was made on one criterion — which
@@ -116,6 +133,11 @@ screen-reader accessible.
 Sable may study PaintTool SAI's publicly visible workflow and feature
 categories. It must not reuse SAI's source, icons, brush textures, bundled
 assets, interface artwork, or project-format internals.
+
+This boundary is unaffected by D-020, which allows Sable to adopt any open
+source licence: SAI's code and assets are proprietary and no licence we adopt
+makes them available, and SAI's EULA almost certainly forbids the reverse
+engineering that `.sai2` support would need.
 
 The SAI observation notes this project started from were competitor research for
 feature planning, not a specification — and one of them recorded a single
@@ -202,7 +224,8 @@ flowchart LR
 - Premultiplied alpha internally, straight alpha at every boundary, and
   `SDL_BLENDMODE_BLEND_PREMULTIPLIED` when drawing canvas textures.
 - Undo stores changed tile regions, never full-canvas copies.
-- CPU compositing. The GPU displays composited tiles; it does not paint them.
+- CPU compositing by default, and the CPU path stays the reference the GPU
+  backend is checked against (D-021).
 - The full SDL event queue is drained every iteration — every queued motion event
   becomes a sample. Keeping only the newest visibly degrades stroke quality.
 
@@ -250,6 +273,7 @@ Mouse input must remain a first-class path. Everything works without a tablet.
 | Working file | `.sable` — ZIP with a JSON manifest and PNG tiles (D-011) |
 | First export | PNG |
 | Later exports | JPEG, WebP |
+| Interchange | PSD, ORA, and KRA import and export (§3 goal 8) |
 | Reliability | Recovery data never overwrites the artist's file (D-013) |
 
 ## 15. Milestones
@@ -290,7 +314,8 @@ Per-story acceptance criteria for M1 and M2 are in `USER-STORIES.md`.
 | Accessibility gap draws criticism | Reputational, and real for affected users | Documented in §6 up front; keyboard operability delivered as compensation |
 | Data race in the background save | Corrupted project files | Snapshot-and-hand-off discipline in `DATA-MODEL.md`; run the save path under ThreadSanitizer in CI |
 | CPU compositing too slow on large canvases | Missed performance goal | Dirty-tile discipline first; threading only if profiling demands it |
-| Scope creep toward Krita | Never ships | Non-goals in §3 are the argument-ender |
+| Scope creep toward Krita | Never ships | D-019 removed the non-goals that used to end this argument. Milestone ordering and principle 3 are what is left — a weaker fence, recorded as such |
+| Copyleft dependency shipped under the wrong `LICENSE` | Infringement; injunction against distribution | D-020: `LICENSE` changes in the same commit as the code, and the licence is checked before the dependency is added |
 | Solo-maintainer burnout | Project dies | Milestones are independently useful; M1 alone is a working toy |
 
 ## 18. Open questions
