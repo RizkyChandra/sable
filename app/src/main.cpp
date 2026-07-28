@@ -162,6 +162,9 @@ struct App {
 
     NewCanvasForm form;
     Pending       pending       = Pending::None;
+    /// A Pending::Open that already knows its file — a dropped path. Empty
+    /// means the artist still has to choose one in the dialog.
+    std::string   pendingOpenPath;
     bool          openNew       = false;
     bool          openDiscard   = false;
     bool          openOverwrite = false;
@@ -665,6 +668,16 @@ void askForOpenPath(App& app) {
     SDL_ShowOpenFileDialog(onSaveChosen, &app, app.window, filters, 1, nullptr, false);
 }
 
+/// Carries out a Pending::Open once nothing stands in its way. A path that
+/// arrived from outside the application — a drop, a command-line argument —
+/// opens straight away; without one the artist picks the file.
+void openPending(App& app) {
+    if (app.pendingOpenPath.empty()) { askForOpenPath(app); return; }
+    const std::filesystem::path path = std::move(app.pendingOpenPath);
+    app.pendingOpenPath.clear();
+    doOpenProject(app, path);
+}
+
 /// Ctrl+S: straight to the known path, or the dialog if there is not one yet.
 void doSave(App& app) {
     if (app.doc.path.empty()) askForSavePath(app);
@@ -703,11 +716,16 @@ void pumpDialog(App& app) {
 }
 
 /// Requests an action that would lose unsaved work, prompting first (US-01.3).
-void requestPending(App& app, Pending what) {
+///
+/// `path` belongs to Pending::Open and names a file chosen outside the
+/// application. Defaulting it also clears any stale one, so a drop the artist
+/// cancelled cannot be opened later by an unrelated Ctrl+O.
+void requestPending(App& app, Pending what, std::string path = {}) {
     app.pending = what;
+    app.pendingOpenPath = std::move(path);
     if (app.doc.dirty) { app.openDiscard = true; return; }
     if (what == Pending::NewCanvas)   app.openNew = true;
-    else if (what == Pending::Open)   askForOpenPath(app);
+    else if (what == Pending::Open)   openPending(app);
     else                              app.running = false;
     app.pending = Pending::None;
 }
@@ -811,6 +829,15 @@ void handleEvent(App& app, const SDL_Event& e) {
         case SDL_EVENT_KEY_DOWN:
         case SDL_EVENT_KEY_UP:
             if (!io.WantCaptureKeyboard) handleKey(app, e.key);
+            break;
+
+        case SDL_EVENT_DROP_FILE:
+            // A drop is an open like any other, so it goes through the same
+            // unsaved-work prompt. SDL owns e.drop.data only for this event,
+            // hence the copy — the path may sit in `pending` for many frames
+            // while the artist decides.
+            if (e.drop.data != nullptr)
+                requestPending(app, Pending::Open, e.drop.data);
             break;
 
         // ------------------------------------------------------------- pen
@@ -1652,15 +1679,20 @@ void drawModals(App& app) {
         if (ImGui::Button("Discard", ImVec2(110, 0))) {
             const Pending what = app.pending;
             app.pending = Pending::None;
-            app.doc.dirty = false;
+            // The flag is NOT cleared here. Whatever replaces the document
+            // brings its own (both makeDocument and loadProject start clean),
+            // so clearing it early only mattered when the follow-up never
+            // happened — a cancelled dialog or a path that would not load
+            // would leave real unsaved strokes marked as saved.
             ImGui::CloseCurrentPopup();
             if (what == Pending::NewCanvas) app.openNew = true;
-            else if (what == Pending::Open) askForOpenPath(app);
+            else if (what == Pending::Open) openPending(app);
             else if (what == Pending::Quit) app.running = false;
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel", ImVec2(110, 0))) {
             app.pending = Pending::None;
+            app.pendingOpenPath.clear();   // the drop was refused, not deferred
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
@@ -1899,6 +1931,13 @@ int main(int argc, char** argv) {
     applyUndoBudget(app);
     zoomToActualSize(app.view, app.doc, app.viewport);
 
+    // `Exec=sable %f` in the .desktop file promises a path argument opens that
+    // document, which is what double-clicking a .sable does. A path that will
+    // not load leaves the blank canvas above in place and shows the error
+    // modal — refusing to start is never the right answer to a bad argument
+    // (D-012).
+    if (!selfTest && argc > 1) doOpenProject(app, std::filesystem::path(argv[1]));
+
     if (selfTest) {
         // Paint a pressure-varying stroke through the real app path, then
         // export it, so a broken engine/app boundary fails here rather than in
@@ -1945,6 +1984,30 @@ int main(int argc, char** argv) {
         SDL_Log("selftest: project round trip ok, %zu layers, %zu bytes",
                 reloaded->layers.size(),
                 static_cast<std::size_t>(std::filesystem::file_size(project)));
+
+        // The argument and drag-and-drop entry points, which have no unit test
+        // because they live above the engine boundary. A path that cannot be
+        // loaded must leave the document exactly as it was, and a drop onto a
+        // dirty canvas must prompt rather than discard the artist's strokes.
+        doOpenProject(app, std::filesystem::path("/sable-selftest/no-such.sable"));
+        if (!app.openError || app.doc.layers.size() != 2) {
+            SDL_Log("selftest FAILED: a bad path did not fall back to the error modal");
+            return 1;
+        }
+        app.openError = false;
+        app.errorMessage.clear();
+
+        app.doc.dirty = true;
+        requestPending(app, Pending::Open, "/sable-selftest/dropped.sable");
+        if (!app.openDiscard || app.pendingOpenPath.empty()) {
+            SDL_Log("selftest FAILED: a drop over unsaved work did not prompt");
+            return 1;
+        }
+        app.openDiscard = false;
+        app.pending     = Pending::None;
+        app.pendingOpenPath.clear();
+        app.doc.dirty   = false;
+        SDL_Log("selftest: bad path recovers, drop over unsaved work prompts");
 
         // Drive one background recovery to completion. This is the only path
         // that hands document data to another thread, so it is the only thing
