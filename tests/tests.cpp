@@ -2765,6 +2765,63 @@ TEST_CASE("a PSD flattens to the composite the file itself carries") {
     CHECK(worst <= 2);
 }
 
+TEST_CASE("a PSD's layer masks reach the canvas (#35)") {
+    // The bug was silence: the pixels arrived and the mask that hid half of
+    // them did not, so the import showed content the file does not. Sable has
+    // no mask of its own, so the importer multiplies it into the alpha — what
+    // is lost is the ability to edit the mask, not the artist's picture.
+    //
+    // masked_flat.psd carries the same artwork composited in floating point by
+    // the fixture script, so this compares against another implementation of
+    // the masking rules rather than against Sable's.
+    const auto masked = importDocument(testData("masked.psd"));
+    const auto truth  = importDocument(testData("masked_flat.psd"));
+    REQUIRE(masked.has_value());
+    REQUIRE(truth.has_value());
+    REQUIRE(masked->layers.size() == 4);
+
+    const std::vector<StraightRgba8> ours   = flatten(*masked);
+    const std::vector<StraightRgba8> theirs = flatten(*truth);
+    REQUIRE(ours.size() == theirs.size());
+
+    int worst = 0;
+    for (std::size_t i = 0; i < ours.size(); ++i) {
+        worst = std::max({worst,
+            std::abs(ours[i].r - theirs[i].r), std::abs(ours[i].g - theirs[i].g),
+            std::abs(ours[i].b - theirs[i].b), std::abs(ours[i].a - theirs[i].a)});
+    }
+    CHECK(worst <= 2);
+
+    // The layer whose mask rectangle is smaller than the layer: everything
+    // outside it takes the mask's default colour, which is zero here.
+    const Layer* patch = layerNamed(*masked, "Patch");
+    REQUIRE(patch != nullptr);
+    CHECK(pickColour(*masked, 10, 10).a == 255);      // inside the mask rectangle
+    CHECK(patch->find(TileKey{0, 0}) != nullptr);
+    for (const auto& [key, tile] : patch->tiles)
+        for (int y = 0; y < TILE_SIZE; ++y)
+            for (int x = 0; x < TILE_SIZE; ++x) {
+                const std::int32_t cx = key.first  * TILE_SIZE + x;
+                const std::int32_t cy = key.second * TILE_SIZE + y;
+                const bool masked_off = cx >= 32 || cy >= 24 || cx < 8 || cy < 8;
+                if (masked_off) REQUIRE(tile.pixel(x, y).a == 0);
+            }
+
+    // A disabled mask is not a mask. This one is all zeroes, so applying it
+    // anyway would delete the layer outright.
+    const Layer* unmasked = layerNamed(*masked, "Unmasked");
+    REQUIRE(unmasked != nullptr);
+    CHECK(!unmasked->tiles.empty());
+    CHECK(pickColour(*masked, 50, 40) == StraightRgba8{255, 255, 0, 255});
+
+    // The drawing is right, so the warning (#40) is not about the picture — it
+    // is that the masks are no longer editable. Once for the file: a PSD from
+    // real work can carry forty of them, and forty lines of the same sentence
+    // is a channel nobody reads.
+    REQUIRE(masked->warnings.size() == 1);
+    CHECK(masked->warnings[0].find("2 layer masks") != std::string::npos);
+}
+
 TEST_CASE("an imported PSD round-trips through .sable") {
     const auto imported = importDocument(testData("layered.psd"));
     REQUIRE(imported.has_value());

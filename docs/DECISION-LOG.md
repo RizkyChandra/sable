@@ -995,6 +995,46 @@ transform mode of their own.
 
 ---
 
+## D-027 — PSD layer masks are multiplied into the pixels on import
+
+**Status:** Decided
+**Affects:** `engine/src/psd.cpp`, `tests/data/make_psd_fixtures.py`, #35
+
+A PSD layer mask is read and multiplied into the layer's alpha as the pixels are
+written. Sable's `Layer` grows no mask field, the `.sable` format does not
+change, and the compositor is untouched.
+
+**Why:** the bug was that the import showed content the file hides — the pixels
+arrived and the mask that hid half of them did not. A mask is exactly an alpha
+multiplier, so folding it in at the boundary makes the import faithful with no
+new document state, no format version, and no second compositor path to keep in
+step with `compositeRect` on the GPU.
+
+**What it costs the artist, stated plainly:** the mask is no longer editable
+after the import. What was a mask is now the shape of the layer's alpha, and
+re-exporting to PSD writes it that way. That is a lost *capability*; dropping
+the mask was a lost *drawing*, which is the worse of the two.
+
+**Alternative rejected — `Layer` grows a mask.** The substantial fix, and the
+one that unblocks masks as a Sable feature. It is not this issue: it needs a
+format version, `cloneDocument`, PSD export, and — the part that makes it large
+rather than merely long — the GPU compositor, or the two backends diverge and
+#1 comes back through the other door. Worth doing on its own terms, as a
+feature, not as the fix for a file that opens wrong today.
+
+**Alternative rejected — detect masks and warn.** The interim the issue offered,
+and what #40 shipped first. It leaves the drawing wrong and asks the artist to
+know what to do about it. Baking is not harder and leaves nothing to explain, so
+that warning is replaced rather than kept: the file now looks right, and what
+the artist is told instead is that the masks are no longer editable — once for
+the file, because a PSD from real work can carry forty of them.
+
+**Not covered:** a mask on a *group*, which would have to apply to the folder's
+composited result and cannot be baked into any one child. Those are still
+dropped, and #40's channel says so per group, naming it. Mask density and
+feathering are likewise ignored — the mask is used at the coverage the file
+stores.
+
 ## D-028 — Linework: curves rasterised into an ordinary layer, kept beside it
 
 **Status:** Decided
