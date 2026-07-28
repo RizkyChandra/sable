@@ -46,10 +46,15 @@ include(FetchContent)
 # SOURCE_SUBDIR points at a directory that does not exist, which is the
 # supported way to fetch a repo without running its own CMakeLists.
 
+# lodepng has never cut a release tag, so a commit SHA is the only way to make
+# a build reproducible. Every export, every tile in a .sable and every recovery
+# snapshot goes through this codec — two builds of one Sable commit must not
+# embed two different versions of it. Pinned 2026-07-28 to the then-current
+# master (authored 2026-05-28). No GIT_SHALLOW: a shallow fetch of an arbitrary
+# SHA is not portable, same reason imgui below omits it.
 FetchContent_Declare(lodepng
   GIT_REPOSITORY https://github.com/lvandeve/lodepng.git
-  GIT_TAG        master
-  GIT_SHALLOW    TRUE
+  GIT_TAG        ed6fe5825c6a4fbb7f58ab35a4231c7543cd452a
   SOURCE_SUBDIR  do-not-configure)
 FetchContent_MakeAvailable(lodepng)
 

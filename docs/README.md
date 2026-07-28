@@ -1,8 +1,9 @@
 # Sable — Developer Documentation
 
-A lightweight open-source raster painting application for Linux.
-C++23 · SDL3 · Dear ImGui · MIT. Inspired by PaintTool SAI's feel, built from
-original code.
+A lightweight open-source raster painting application for Linux, Windows, and
+macOS. C++23 · SDL3 · Dear ImGui · MIT today, but see D-020 — any open source
+licence may be used, and `LICENSE` changes with the code. Inspired by PaintTool
+SAI's feel, built from original code.
 
 ## Read in this order
 
@@ -24,6 +25,13 @@ per-device pen key, so there is one calibration profile). **D-016** answers the
 long-open D-104 by tracking ImGui's docking branch at a pinned commit —
 docking is still not in ImGui master, checked at v1.92.9.
 
+**D-019 to D-023 release the original constraints**, because the target is now
+PaintTool SAI 2 rather than a small Linux sketching tool. Read D-019 first: it
+lists what each of D-003, D-004, D-007, D-009 and PRD §3 gave up and what that
+cost. **D-020 is the one live constraint left** — any open source licence, and
+`LICENSE` changes in the same commit as any copyleft code. What stays forbidden
+regardless is `.sai2` and anything of SAI's (D-010, D-020).
+
 **US-00 has still never been run**, because no tablet was available at any
 point. It is the one v1 requirement outstanding. Everything downstream of it —
 the pressure curve, the per-axis handling, the stabilizer — is built and unit
@@ -32,8 +40,9 @@ the hardware. Run it before promising anyone that the pen works.
 
 ## The short version
 
-- **C++23** (floor GCC 14 / Clang 18), CMake + Ninja. Two targets: `engine`
-  (links no SDL, no ImGui) and `app`. Engine APIs return
+- **C++23** (floor GCC 14 / Clang 18), CMake + Ninja. Two targets: `engine` and
+  `app`. The engine links no ImGui and creates no window, event queue, or input
+  device — it may call SDL (D-022). Engine APIs return
   `std::expected<T, sbl::Error>`; nothing on a file or device path may terminate
   the process.
 - **SDL3** for window, input, and rendering — chosen over Qt, GTK4, FLTK,
@@ -43,8 +52,8 @@ the hardware. Run it before promising anyone that the pen works.
 - **Dear ImGui** for the interface, over `imgui_impl_sdl3` +
   `imgui_impl_sdlrenderer3`. Native file dialogs come from SDL3, not ImGui.
 - **CPU-first tiled renderer**, 256 × 256 sparse tiles, premultiplied RGBA8, one
-  streaming texture per visible tile. The GPU blits finished pixels; it never
-  paints them.
+  streaming texture per visible tile. CPU compositing is the default and the
+  reference; a GPU backend is opt-in at runtime (D-021).
 - **Event-driven loop**, not a game loop. Near-zero CPU when nobody is drawing.
 - **Milestone 1** is a window, a canvas, a brush, undo, and PNG export. Nothing
   else.

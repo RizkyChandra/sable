@@ -28,6 +28,17 @@ struct Error {
 /// conversion, and getting it wrong greys every soft edge (US-07.3).
 [[nodiscard]] std::vector<StraightRgba8> flatten(const Document& doc);
 
+/// One rectangle of what flatten() produces, still premultiplied, w * h pixels
+/// with buffer pixel 0 at canvas pixel (x, y). Pixels outside the document are
+/// transparent; inside, the background is already underneath.
+///
+/// The canvas view composites a tile at a time through this, so screen and
+/// export cannot disagree about blend modes, clipping or groups (#1). Keep it
+/// the only implementation of the compositing rules — a second one drifts.
+[[nodiscard]] std::vector<PremulRgba8> compositeRect(const Document& doc,
+                                                    std::int32_t x, std::int32_t y,
+                                                    std::int32_t w, std::int32_t h);
+
 /// Never modifies the document, and never clears the dirty flag (US-07.5).
 [[nodiscard]] std::expected<void, Error> exportPng(
     const Document& doc, const std::filesystem::path& path);

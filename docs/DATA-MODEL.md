@@ -138,7 +138,14 @@ struct TileKeyHash {
     }
 };
 
-enum class BlendMode { Normal, Multiply, Screen, Add, Overlay };
+// Separable modes only — the non-separable HSL ones (Hue, Saturation, Colour,
+// Luminosity) are not per-channel and are not here. Append only: the order is
+// what the layer panel's dropdown indexes into.
+enum class BlendMode {
+    Normal, Multiply, Screen, Add, Overlay,
+    Darken, Lighten, ColourDodge, ColourBurn, HardLight, SoftLight,
+    Difference, Exclusion,
+};
 enum class LayerKind { Raster, Folder };
 
 using LayerId = uint32_t;                      // stable; never reused in a document
@@ -570,6 +577,11 @@ Rules:
 - If the manifest's `tiles` list disagrees with the ZIP entries, trust the ZIP and
   repair the manifest. A half-written file should open with whatever survived,
   not refuse to open at all.
+- `blend` is the lower-case mode name: `normal`, `multiply`, `screen`, `add`,
+  `overlay`, `darken`, `lighten`, `colour-dodge`, `colour-burn`, `hard-light`,
+  `soft-light`, `difference`, `exclusion`. An unrecognised name loads as
+  `normal` — a file from a later version opens with one wrong layer rather than
+  not opening.
 - Undo history is **not** saved.
 
 ### Background saving — the place C++ costs us
