@@ -108,7 +108,7 @@ struct TextLayout {
 /// The old tiles are MOVED into the record rather than copied, so re-drawing on
 /// every keystroke costs no allocation beyond the new glyphs. A caller that
 /// wants one undo step for a whole editing session keeps the first record and
-/// merges later ones into it — see `mergeTextRecord`.
+/// merges later ones into it — see `mergeTileRecord` in sbl/canvas.hpp.
 ///
 /// Writes host tiles directly rather than going through PaintBackend: the
 /// result is a layer full of freshly created tiles, which is the same state a
@@ -118,13 +118,6 @@ struct TextLayout {
 [[nodiscard]] UndoRecord drawTextLayer(Layer& layer, const TextContent& content,
                                        const FontFace& face,
                                        std::int32_t docWidth, std::int32_t docHeight);
-
-/// Folds `next` into `into` so the pair undoes as one step.
-///
-/// Only tiles `into` has not already recorded are taken, because the state
-/// `into` holds is the one from before the session started — which is exactly
-/// what "undo the whole text edit" has to restore.
-void mergeTextRecord(UndoRecord& into, UndoRecord&& next);
 
 /// A font file found on this machine.
 struct FontEntry {

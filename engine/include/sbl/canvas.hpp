@@ -261,7 +261,7 @@ enum class BlendMode : std::uint8_t {
     Darken, Lighten, ColourDodge, ColourBurn, HardLight, SoftLight,
     Difference, Exclusion,
 };
-enum class LayerKind : std::uint8_t { Raster, Folder, Text };
+enum class LayerKind : std::uint8_t { Raster, Folder, Text, Linework };
 
 // ---------------------------------------------------------------------- text
 // Issue #20. A Text layer holds ordinary tiles like any other, rasterised from
@@ -292,6 +292,47 @@ struct TextContent {
     StraightRgba8 colour{0, 0, 0, 255};
 
     friend bool operator==(const TextContent&, const TextContent&) = default;
+};
+
+// ------------------------------------------------------------------ linework
+// Issue #17, and the same bargain D-026 struck for text: a Linework layer holds
+// ordinary tiles, rasterised from the curves below, and the curves are kept
+// beside them so they can be re-shaped afterwards. The PIXELS are what renders,
+// on screen and in every export alike — which is why `compositeRect` needed no
+// new case and there is no second, screen-only path for #1 to come back through.
+//
+// Here rather than in sbl/linework.hpp for the same reason as TextContent: this
+// is document data, and the rasteriser depends on the document, so the document
+// must not depend on the rasteriser.
+
+/// One control point. Pressure is the artist's, recorded at the moment the
+/// point was laid down and editable afterwards like the position — that is the
+/// whole difference between linework and a stroke of paint.
+struct LinePoint {
+    double x = 0.0, y = 0.0;      // canvas pixels
+    float  pressure = 1.0f;       // 0..1, scales the width at this point
+
+    friend bool operator==(const LinePoint&, const LinePoint&) = default;
+};
+
+/// One editable curve.
+///
+/// The curve passes THROUGH its control points (a centripetal Catmull-Rom
+/// spline), so there are no off-curve handles to store, to draw, or to explain.
+/// An artist drags the point they can see and the line goes there.
+struct LineStroke {
+    std::vector<LinePoint> points;
+    StraightRgba8 colour{0, 0, 0, 255};
+    float width         = 4.0f;    // diameter in canvas pixels at full pressure
+    float minWidthRatio = 0.15f;   // width at zero pressure, as a fraction of it
+
+    friend bool operator==(const LineStroke&, const LineStroke&) = default;
+};
+
+struct LineworkContent {
+    std::vector<LineStroke> strokes;
+
+    friend bool operator==(const LineworkContent&, const LineworkContent&) = default;
 };
 
 /// Every mode, in enum order. One list so a new mode cannot be added to the
@@ -352,6 +393,10 @@ struct Layer {
     /// generated from this, so painting on such a layer is refused rather than
     /// silently thrown away by the next keystroke.
     std::optional<TextContent> text;
+    /// Set on a LayerKind::Linework layer, and on nothing else. Same bargain as
+    /// `text` above: the tiles are generated from these curves, so paint on such
+    /// a layer is refused rather than lost the next time one is dragged.
+    std::optional<LineworkContent> linework;
     // Draw order is the Document's vector order, not a field here.
 
     /// Null when the tile has never been painted. Do not cache the result
@@ -437,6 +482,9 @@ struct LayerProps {
     /// means one text edit is ONE undo step covering both the words and the
     /// glyphs they were drawn as, through the machinery that already exists.
     std::optional<TextContent> text;
+    /// The curves, for the same reason: dragging a control point is one undo
+    /// step covering both the geometry and the line it was drawn as.
+    std::optional<LineworkContent> linework;
 };
 
 [[nodiscard]] LayerProps propsOf(const Layer&);
@@ -472,6 +520,16 @@ struct UndoRecord {
     }
     [[nodiscard]] std::size_t memoryBytes() const noexcept;
 };
+
+/// Folds `next`'s tile snapshots into `into`, so a run of redraws undoes as one
+/// step.
+///
+/// Only tiles `into` has not already recorded are taken, because the state
+/// `into` holds is the one from before the session started — which is exactly
+/// what "undo the whole edit" has to restore. What both the text tool and the
+/// linework tool build a session out of: they redraw their layer on every
+/// keystroke or every pixel of a drag, and one undo step has to cover the lot.
+void mergeTileRecord(UndoRecord& into, UndoRecord&& next);
 
 struct Document;
 

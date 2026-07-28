@@ -203,7 +203,7 @@ enum class BlendMode {
     Darken, Lighten, ColourDodge, ColourBurn, HardLight, SoftLight,
     Difference, Exclusion,
 };
-enum class LayerKind { Raster, Folder, Text };
+enum class LayerKind { Raster, Folder, Text, Linework };
 
 using LayerId = uint32_t;                      // stable; never reused in a document
 inline constexpr LayerId NO_LAYER = 0;
@@ -226,6 +226,9 @@ struct Layer {
     /// Set on a Text layer and on nothing else (D-026). Its tiles are
     /// rasterised from this, so paint on such a layer is refused.
     std::optional<TextContent> text;
+    /// Set on a Linework layer and on nothing else (D-028), on the same
+    /// terms: the tiles are rasterised from these curves.
+    std::optional<LineworkContent> linework;
     // Draw order is the Document's vector order, not a field here.
 };
 
@@ -237,6 +240,25 @@ struct TextContent {
     TextAlign align = TextAlign::Left;
     double x = 0.0, y = 0.0;           // canvas anchor of the FIRST baseline
     StraightRgba8 colour{0, 0, 0, 255};
+};
+
+// D-028, the same bargain for curves. The line is the pixels; these are what
+// re-shape it. The curve passes THROUGH its control points (centripetal
+// Catmull-Rom), so there are no off-curve handles to store or to explain.
+struct LinePoint {
+    double x = 0.0, y = 0.0;           // canvas pixels
+    float  pressure = 1.0f;            // 0..1, scales the width here
+};
+
+struct LineStroke {
+    std::vector<LinePoint> points;
+    StraightRgba8 colour{0, 0, 0, 255};
+    float width = 4.0f;                // diameter at full pressure
+    float minWidthRatio = 0.15f;       // width at zero pressure, as a fraction
+};
+
+struct LineworkContent {
+    std::vector<LineStroke> strokes;
 };
 ```
 
@@ -677,7 +699,15 @@ layers/<layerId>/tiles/<tx>_<ty>.png   one PNG per non-empty tile, straight alph
                 "font_name": "Noto Sans CJK JP", "size": 48.0,
                 "line_spacing": 1.2, "align": "left",
                 "x": 60.0, "y": 900.0, "colour": "#141414ff" },
-      "tiles": [[0, 3]] }
+      "tiles": [[0, 3]] },
+    { "id": 3, "kind": "linework", "name": "Ink",
+      "opacity": 1.0, "blend": "normal", "visible": true,
+      "locked": false, "preserve_opacity": false, "clip_to_below": false,
+      "parent": null,
+      "linework": { "strokes": [
+        { "colour": "#141414ff", "width": 4.0, "min_width": 0.15,
+          "points": [[120.0, 300.0, 0.4], [180.5, 260.0, 1.0]] } ] },
+      "tiles": [[0, 1]] }
   ],
   "active_layer": 1,
   "vanishing_points": [ { "x": -320.5, "y": 512.0, "enabled": true } ],
@@ -690,12 +720,13 @@ Rules:
 - `format_version` is checked on load. Refuse a higher version with a clear
   message rather than reading it wrong. Version 2 added `vanishing_points`,
   version 3 `selection`, version 4 `"kind": "text"` and the `text` object
-  beside it, version 5 16-bit colour. Everything each adds is optional, so v1,
-  v2 and v3 files still load unchanged.
-- **Version 5 is written only by a 16-bit document.** Every earlier bump was
+  beside it, version 5 `"kind": "linework"` and the `linework` object beside
+  it, version 6 16-bit colour. Everything each adds is optional, so v1 to v5
+  files still load unchanged.
+- **Version 6 is written only by a 16-bit document.** Every earlier bump was
   unconditional because each added something an ordinary document might
   contain; depth is a per-document choice most documents never make. An 8-bit
-  document keeps declaring 4, so saving from a build that has 16-bit does not
+  document keeps declaring 5, so saving from a build that has 16-bit does not
   lock an ordinary painting out of an older Sable in exchange for nothing —
   and a 16-bit file, which an older Sable genuinely would misread, is still
   refused by name.
@@ -708,7 +739,11 @@ Rules:
   bigger selection than the artist drew would send the next fill somewhere they
   did not ask for.
 - A text layer's **tiles are still the picture**. `text` is what makes it
-  editable again; a reader that ignores it sees the finished words anyway.
+  editable again; a reader that ignores it sees the finished words anyway. A
+  linework layer's `linework` object is the same arrangement: the pixels are
+  the line, the strokes are what re-shape it. Each control point is
+  `[x, y, pressure]` — three numbers on one line, so a manifest with a few
+  hundred of them stays readable, which is the whole reason it is JSON.
 - Tile PNGs are **straight alpha** so external tools can open them. Convert on
   save and on load; test the round-trip for drift (D-004).
 - If the manifest's `tiles` list disagrees with the ZIP entries, trust the ZIP and
@@ -750,8 +785,8 @@ at the original path. Never written over `Document::path`.
 
 ## What is deliberately not modelled yet
 
-Layer masks, and linework and vector layers. They belong to Stage D of the PRD.
-Adding their fields now would be guessing at shapes we cannot test. Two cheap
-hooks keep them affordable later: `LayerKind` and `format_version` — which is
-exactly what perspective rulers (version 2), selection masks (version 3) and
-text (`LayerKind::Text`, version 4) went on to use.
+Layer masks. They belong to Stage D of the PRD. Adding their fields now would
+be guessing at a shape we cannot test. Two cheap hooks keep them affordable
+later: `LayerKind` and `format_version` — which is exactly what perspective
+rulers (version 2), selection masks (version 3), text (`LayerKind::Text`,
+version 4) and linework (`LayerKind::Linework`, version 5) went on to use.

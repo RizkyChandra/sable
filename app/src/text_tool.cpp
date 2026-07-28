@@ -121,7 +121,7 @@ void TextTool::redraw(sbl::Document& doc) {
 
     // The committed string only. The preedit is on screen, never in the file.
     layer->text = content_;
-    sbl::mergeTextRecord(session_, std::move(rec));
+    sbl::mergeTileRecord(session_, std::move(rec));
     doc.dirty = true;
 }
 

@@ -44,6 +44,7 @@
 #include "sbl/select.hpp"
 #include "settings.hpp"
 #include "shortcuts.hpp"
+#include "linework_tool.hpp"
 #include "text_tool.hpp"
 #include "widgets.hpp"
 
@@ -58,7 +59,7 @@ constexpr float kDegToRad      = 3.14159265358979323846f / 180.0f;
 /// What to do once the artist answers the "discard unsaved work?" prompt.
 enum class Pending { None, NewCanvas, Quit, Open, Import };
 
-enum class Tool { Brush, Eraser, Fill, Select, Lasso, Wand, Transform, Text };
+enum class Tool { Brush, Eraser, Fill, Select, Lasso, Wand, Transform, Text, Linework };
 
 /// True for the three tools that build a selection, which share the modifier
 /// keys, the mode setting, and the rule that a click with no drag deselects.
@@ -150,6 +151,7 @@ struct App {
     bool painting = false;
 
     TextTool text;
+    LineworkTool linework;
 
     // --- tablet
     std::unordered_map<SDL_PenID, PenAxisState> penAxes;
@@ -276,6 +278,7 @@ struct App {
         case Tool::Wand:   return "wand";
         case Tool::Transform: return "transform";
         case Tool::Text:   return "text";
+        case Tool::Linework: return "linework";
     }
     return "brush";
 }
@@ -985,6 +988,52 @@ void placeText(App& app, double sx, double sy) {
                    toCanvasY(app.view, sx, sy), app.foreground);
 }
 
+
+// ------------------------------------------------------------------ linework
+// #17. Everything about where a curve goes and which point is under the cursor
+// belongs to the engine; what is left here is what the modifier keys mean and
+// where the pointer is in canvas coordinates.
+
+/// How close counts as "on" a control point, in CANVAS pixels.
+///
+/// Divided by the zoom so the target stays the same size under the artist's
+/// hand however far in they are — a fixed canvas distance would be untouchable
+/// at 10% and would swallow the whole line at 800%.
+[[nodiscard]] double lineworkGrab(const App& app) {
+    return 9.0 * static_cast<double>(app.uiScale) /
+           std::max(static_cast<double>(app.view.zoom), 0.01);
+}
+
+/// Ctrl adds a control point on the curve, Shift takes one away, and a plain
+/// press draws or drags. Alt is left alone: it is the colour picker everywhere
+/// else, and a tool that redefines it is a tool that surprises people.
+[[nodiscard]] LineworkAction lineworkAction() {
+    const SDL_Keymod mods = SDL_GetModState();
+    if ((mods & SDL_KMOD_CTRL)  != 0) return LineworkAction::Insert;
+    if ((mods & SDL_KMOD_SHIFT) != 0) return LineworkAction::Erase;
+    return LineworkAction::Draw;
+}
+
+void lineworkPress(App& app, double sx, double sy, float pressure) {
+    app.linework.colour = app.foreground;
+    app.linework.press(app.doc, toCanvasX(app.view, sx, sy),
+                       toCanvasY(app.view, sx, sy), pressure, lineworkAction(),
+                       lineworkGrab(app));
+    syncTextures(app, app.linework.takeChanged());
+}
+
+void lineworkDrag(App& app, double sx, double sy, float pressure) {
+    if (!app.linework.busy()) return;
+    app.linework.drag(app.doc, toCanvasX(app.view, sx, sy),
+                      toCanvasY(app.view, sx, sy), pressure);
+    syncTextures(app, app.linework.takeChanged());
+}
+
+void lineworkRelease(App& app) {
+    app.linework.release(app.doc);
+    syncTextures(app, app.linework.takeChanged());
+}
+
 /// Selects the text tool, resuming the active layer's text if it has any.
 void chooseTextTool(App& app) {
     app.tool = Tool::Text;
@@ -1240,6 +1289,10 @@ void handleKey(App& app, const SDL_KeyboardEvent& key) {
             app.tool = Tool::Transform;
             break;
         case Action::ToolText: chooseTextTool(app); break;
+        case Action::ToolLinework:
+            app.text.finish(app.window, app.doc);
+            app.tool = Tool::Linework;
+            break;
 
         case Action::SizeDown: stepSizePreset(app, -1); break;
         case Action::SizeUp:   stepSizePreset(app, +1); break;
@@ -1354,6 +1407,12 @@ void handleEvent(App& app, const SDL_Event& e) {
                 syncTextures(app, app.text.takeChanged());
                 break;
             }
+            if (app.tool == Tool::Linework) {
+                lineworkPress(app, e.ptouch.x, e.ptouch.y,
+                              penSample(app, e.ptouch.which,
+                                        e.ptouch.x, e.ptouch.y).pressure);
+                break;
+            }
             if (app.tool == Tool::Wand) {
                 wandAt(app, e.ptouch.x, e.ptouch.y);
                 break;
@@ -1375,6 +1434,10 @@ void handleEvent(App& app, const SDL_Event& e) {
                 moveGuide(app, e.pmotion.x, e.pmotion.y);
             else if (app.selecting)
                 dragSelection(app, e.pmotion.x, e.pmotion.y);
+            else if (app.linework.busy())
+                lineworkDrag(app, e.pmotion.x, e.pmotion.y,
+                             penSample(app, e.pmotion.which,
+                                       e.pmotion.x, e.pmotion.y).pressure);
             else if (app.painting)
                 paintWith(app, penSample(app, e.pmotion.which, e.pmotion.x, e.pmotion.y));
             break;
@@ -1382,6 +1445,7 @@ void handleEvent(App& app, const SDL_Event& e) {
         case SDL_EVENT_PEN_UP:
             app.draggingGuide = kNoGuide;
             endSelectDrag(app, e.ptouch.x, e.ptouch.y);
+            lineworkRelease(app);
             endPaint(app);
             break;
 
@@ -1413,6 +1477,8 @@ void handleEvent(App& app, const SDL_Event& e) {
                 } else if (app.tool == Tool::Text) {
                     placeText(app, e.button.x, e.button.y);
                     syncTextures(app, app.text.takeChanged());
+                } else if (app.tool == Tool::Linework) {
+                    lineworkPress(app, e.button.x, e.button.y, 1.0f);
                 } else if (app.tool == Tool::Wand) {
                     wandAt(app, e.button.x, e.button.y);
                 } else if (selectsRegion(app.tool)) {
@@ -1435,6 +1501,8 @@ void handleEvent(App& app, const SDL_Event& e) {
                 moveGuide(app, e.motion.x, e.motion.y);
             } else if (app.selecting) {
                 dragSelection(app, e.motion.x, e.motion.y);
+            } else if (app.linework.busy()) {
+                lineworkDrag(app, e.motion.x, e.motion.y, 1.0f);
             } else if (app.painting) {
                 paintWith(app, mouseSample(app, e.motion.x, e.motion.y));
             }
@@ -1447,6 +1515,7 @@ void handleEvent(App& app, const SDL_Event& e) {
             if (e.button.button == SDL_BUTTON_LEFT) {
                 app.draggingGuide = kNoGuide;
                 endSelectDrag(app, e.button.x, e.button.y);
+                lineworkRelease(app);
                 endPaint(app);
             }
             break;
@@ -1624,10 +1693,27 @@ void drawToolPanel(App& app) {
         toolRow(Icon::Wand,      "Magic wand", Tool::Wand,     Action::ToolWand);
         toolRow(Icon::Transform, "Transform", Tool::Transform, Action::ToolTransform);
         toolRow(Icon::Text,      "Text",      Tool::Text,      Action::ToolText);
+        toolRow(Icon::Linework,  "Linework",  Tool::Linework,  Action::ToolLinework);
 
         if (app.tool == Tool::Text) {
             app.text.drawPanel(app.doc);
             syncTextures(app, app.text.takeChanged());
+        }
+
+        if (app.tool == Tool::Linework) {
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::SliderFloat("##linewidth", &app.linework.width, 0.5f, 64.0f,
+                               "%.1f px");
+            ImGui::TextDisabled("line width");
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::SliderFloat("##linetaper", &app.linework.minWidthRatio, 0.0f, 1.0f,
+                               "%.2f");
+            ImGui::TextDisabled("width at no pressure");
+            // The one thing that is not discoverable by trying it. Three
+            // gestures on one button is a lot to remember and nothing to guess.
+            ImGui::TextDisabled("drag: draw or move a point");
+            ImGui::TextDisabled("ctrl+click: add a point");
+            ImGui::TextDisabled("shift+click: remove one");
         }
 
         if (app.tool == Tool::Transform) {
@@ -1901,8 +1987,9 @@ void drawLayerPanel(App& app) {
             if (layer.parent.has_value()) ImGui::Indent(16.0f);
             char label[160];
             std::snprintf(label, sizeof label, "%s%s%s",
-                          layer.kind == sbl::LayerKind::Folder ? "[group] "
-                          : layer.kind == sbl::LayerKind::Text ? "[text] " : "",
+                          layer.kind == sbl::LayerKind::Folder   ? "[group] "
+                          : layer.kind == sbl::LayerKind::Text   ? "[text] "
+                          : layer.kind == sbl::LayerKind::Linework ? "[line] " : "",
                           layer.name.c_str(), layer.locked ? "  [locked]" : "");
             if (ImGui::Selectable(label, active)) app.doc.activeLayer = layer.id;
 
@@ -1974,6 +2061,16 @@ void drawLayerPanel(App& app) {
                     app.text.finish(app.window, app.doc);
                     edited = sbl::propsOf(layer);
                     edited.text.reset();
+                    propsFor = layer.id;
+                }
+                // The same way out of a linework layer, for the same reason:
+                // give up the curves, keep the line, and get the paint tools
+                // back. #17's last acceptance criterion.
+                if (layer.kind == sbl::LayerKind::Linework &&
+                    ImGui::SmallButton("Rasterise linework")) {
+                    app.linework.release(app.doc);
+                    edited = sbl::propsOf(layer);
+                    edited.linework.reset();
                     propsFor = layer.id;
                 }
                 ImGui::Unindent(12.0f);
@@ -2517,6 +2614,36 @@ void drawLassoInProgress(const App& app) {
     }
 }
 
+/// The control points of the active linework layer.
+///
+/// An overlay, like the selection outline and for the same reason: the handles
+/// are how the curve is edited, not part of the picture, and nothing here may
+/// ever reach the export. The line itself is in the layer's tiles, drawn by the
+/// one compositor (#1).
+void drawLineworkHandles(const App& app) {
+    if (app.tool != Tool::Linework) return;
+    const sbl::LineworkContent* content = LineworkTool::contentOf(app.doc);
+    if (content == nullptr) return;
+
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    const std::optional<sbl::PointRef> held = app.linework.held();
+    const float r = 4.0f * app.uiScale;
+
+    for (std::size_t s = 0; s < content->strokes.size(); ++s) {
+        for (std::size_t i = 0; i < content->strokes[s].points.size(); ++i) {
+            const sbl::LinePoint& p = content->strokes[s].points[i];
+            const ImVec2 at(static_cast<float>(toScreenX(app.view, p.x, p.y)),
+                            static_cast<float>(toScreenY(app.view, p.x, p.y)));
+            const bool grabbed = held.has_value() && held->stroke == s && held->point == i;
+            // Two-tone like every other overlay, so a handle stays visible on
+            // both the white of a fresh canvas and the black of the line.
+            draw->AddCircleFilled(at, r + 1.0f, IM_COL32(0, 0, 0, 160));
+            draw->AddCircleFilled(at, r, grabbed ? IM_COL32(120, 220, 255, 255)
+                                                 : IM_COL32(255, 255, 255, 230));
+        }
+    }
+}
+
 /// The ruler guides.
 ///
 /// Everything here is in CANVAS space and goes through toScreenX/Y, the same
@@ -2686,6 +2813,7 @@ void renderFrame(App& app) {
     drawRulerGuides(app);
     drawSelectionOutline(app);
     drawLassoInProgress(app);
+    drawLineworkHandles(app);
     drawBrushCursor(app);
     // Recolouring text is the colour panel, not a control of its own: while a
     // session is live the text simply IS the foreground colour.
@@ -3236,6 +3364,83 @@ int main(int argc, char** argv) {
             SDL_Log("selftest: no fonts on this machine, text tool not exercised");
         }
 
+        // --- linework (#17). Driven through the tool rather than through
+        // synthetic pen events: where the pointer is belongs to SDL, but what a
+        // press MEANS is the tool's, and that is the half worth checking.
+        {
+            const std::size_t layersBefore = app.doc.layers.size();
+            const std::size_t undoBefore   = app.doc.undo.size();
+            // The linework layer's OWN pixels, not the composite: the canvas
+            // already carries the strokes and the fill this self-test painted
+            // earlier, and a probe that could be answered by those would prove
+            // nothing about the line.
+            const auto inkAt = [&](std::int32_t x, std::int32_t y) {
+                const sbl::Layer* on = app.doc.active();
+                if (on == nullptr) return false;
+                const sbl::TileKey key{sbl::tileIndex(x), sbl::tileIndex(y)};
+                const sbl::Tile* tile = on->find(key);
+                return tile != nullptr &&
+                       tile->pixel(x - key.first * sbl::TILE_SIZE,
+                                   y - key.second * sbl::TILE_SIZE).a > 0;
+            };
+
+            app.tool = Tool::Linework;
+            app.foreground = sbl::StraightRgba8{0, 0, 0, 255};
+            app.linework.width = 8.0f;
+            app.linework.colour = app.foreground;
+            app.linework.press(app.doc, 100.0, 500.0, 1.0f, LineworkAction::Draw, 9.0);
+            for (double x = 120.0; x <= 400.0; x += 20.0)
+                app.linework.drag(app.doc, x, 500.0, 1.0f);
+            app.linework.release(app.doc);
+            syncTextures(app, app.linework.takeChanged());
+
+            if (!inkAt(300, 500)) {
+                SDL_Log("selftest FAILED: a linework stroke drew nothing");
+                return 1;
+            }
+            // One layer, and two steps: the layer, then the whole gesture.
+            if (app.doc.layers.size() != layersBefore + 1 ||
+                app.doc.undo.size() != undoBefore + 2) {
+                SDL_Log("selftest FAILED: linework left %zu layers and %zu steps",
+                        app.doc.layers.size() - layersBefore,
+                        app.doc.undo.size() - undoBefore);
+                return 1;
+            }
+
+            // Re-shaping: grab the far end and drag it away. The line has to
+            // follow, and leave where it was.
+            app.linework.press(app.doc, 400.0, 500.0, 1.0f, LineworkAction::Draw, 12.0);
+            if (!app.linework.busy()) {
+                SDL_Log("selftest FAILED: no control point where one was drawn");
+                return 1;
+            }
+            app.linework.drag(app.doc, 400.0, 640.0, 1.0f);
+            app.linework.release(app.doc);
+            syncTextures(app, app.linework.takeChanged());
+            if (!inkAt(398, 640) || inkAt(400, 500)) {
+                SDL_Log("selftest FAILED: the line did not follow its control point");
+                return 1;
+            }
+
+            // And the whole re-shape undoes as one step, back to the line the
+            // first gesture drew.
+            doUndo(app);
+            if (!inkAt(300, 500) || inkAt(398, 640)) {
+                SDL_Log("selftest FAILED: undoing the drag left the wrong line");
+                return 1;
+            }
+            doRedo(app);
+
+            const sbl::Layer* line = app.doc.active();
+            if (line == nullptr || !line->linework.has_value() ||
+                line->linework->strokes.size() != 1) {
+                SDL_Log("selftest FAILED: the curves did not survive the gesture");
+                return 1;
+            }
+            SDL_Log("selftest: linework draws, re-shapes and undoes as one step "
+                    "(%zu control points)", line->linework->strokes[0].points.size());
+        }
+
         // Drive one background recovery to completion. This is the only path
         // that hands document data to another thread, so it is the only thing
         // ThreadSanitizer has to look at — and it is worth nothing to CI unless
@@ -3270,8 +3475,10 @@ int main(int argc, char** argv) {
         // Stroke, new layer, fill, and the mirrored stroke — each exactly one
         // undoable step, however many dabs it took. Plus the text layer and its
         // one text step, on a machine that has a font to draw them with.
-        const std::size_t expectedUndo   = textTested ? 6u : 4u;
-        const std::size_t expectedLayers = textTested ? 3u : 2u;
+        // Plus the linework layer and its three steps — the layer, the stroke,
+        // and the re-shape — which need no font and so are not conditional.
+        const std::size_t expectedUndo   = (textTested ? 6u : 4u) + 3u;
+        const std::size_t expectedLayers = (textTested ? 3u : 2u) + 1u;
         if (!result.has_value() || app.doc.undo.size() != expectedUndo ||
             app.doc.layers.size() != expectedLayers ||
             app.doc.active()->tiles.empty()) {

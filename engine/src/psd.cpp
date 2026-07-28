@@ -228,6 +228,39 @@ bool readPlanes(Cursor& in, std::uint16_t compression, std::size_t planes,
 
 // ------------------------------------------------------------ layer records
 
+/// A PSD layer mask: a greyscale plane that multiplies the layer's alpha.
+///
+/// Sable has no mask of its own — DATA-MODEL.md still lists them under "what is
+/// deliberately not modelled yet" — so the importer bakes one into the pixels.
+/// Skipping it was #35: the import then showed content the file itself hides.
+struct MaskPlane {
+    std::int32_t top = 0, left = 0, bottom = 0, right = 0;
+    /// PSD's "default colour": what the mask reads as beyond its own rectangle.
+    std::uint8_t outside = 0;
+    bool present = false;                  // a mask block was read
+    bool enabled = true;                   // PSD's "layer mask disabled" flag
+    std::vector<std::uint8_t> plane;       // width() * height() bytes, once read
+
+    [[nodiscard]] std::size_t width()  const noexcept {
+        return static_cast<std::size_t>(right - left);
+    }
+    [[nodiscard]] std::size_t height() const noexcept {
+        return static_cast<std::size_t>(bottom - top);
+    }
+    /// A mask with no pixel data cannot say anything about the layer, and
+    /// applying its default colour alone could blank a layer outright on a file
+    /// that only meant to say "there is a mask here".
+    [[nodiscard]] bool usable() const noexcept {
+        return present && enabled && !plane.empty();
+    }
+    /// The mask's value at a canvas pixel.
+    [[nodiscard]] std::uint8_t at(std::int32_t cx, std::int32_t cy) const noexcept {
+        if (cx < left || cy < top || cx >= right || cy >= bottom) return outside;
+        return plane[static_cast<std::size_t>(cy - top) * width() +
+                     static_cast<std::size_t>(cx - left)];
+    }
+};
+
 /// One PSD layer record, before it becomes a Sable Layer. Groups arrive as
 /// records too — see `section`.
 struct Record {
@@ -246,10 +279,8 @@ struct Record {
     /// children, then 1 or 2.
     std::uint32_t section = 0;
 
-    /// The layer carried a mask, which Sable has no home for yet (#35). The
-    /// pixels arrive unmasked, so the artist has to be told (#40) — a mask is
-    /// often the only thing making half a layer invisible.
-    bool hadMask = false;
+    MaskPlane mask;       // channel -2, the mask the artist painted
+    MaskPlane realMask;   // channel -3, the one Photoshop renders from a path
 
     [[nodiscard]] std::size_t width()  const noexcept {
         return static_cast<std::size_t>(right - left);
@@ -259,14 +290,61 @@ struct Record {
     }
 };
 
+/// A rectangle from an untrusted file, held to the same bounds as a layer's.
+bool plausibleRect(const MaskPlane& m) noexcept {
+    for (const std::int32_t edge : {m.top, m.left, m.bottom, m.right})
+        if (edge < -kMaxDimension || edge > kMaxDimension) return false;
+    if (m.bottom < m.top || m.right < m.left) return false;
+    return m.width() * m.height() <= kMaxPlanePixels;
+}
+
+/// The layer mask / adjustment layer data block: 0, 20 or 36 bytes of it.
+///
+/// The 36-byte form describes a second mask as well — the one Photoshop renders
+/// from a vector path, which arrives as channel -3 and supersedes the painted
+/// one when both are there.
+bool readMaskBlock(Cursor& in, Record& rec) {
+    const std::uint32_t length = in.u32();
+    if (!in.ok() || length > in.remaining()) return false;
+    const std::size_t end = in.pos() + length;
+
+    // 18 = rectangle, default colour, flags. The 20-byte form pads to four.
+    if (length >= 18) {
+        rec.mask.top    = in.i32();
+        rec.mask.left   = in.i32();
+        rec.mask.bottom = in.i32();
+        rec.mask.right  = in.i32();
+        rec.mask.outside = in.u8();
+        const std::uint8_t flags = in.u8();
+        rec.mask.enabled = (flags & 0x02) == 0;
+        rec.mask.present = in.ok() && plausibleRect(rec.mask);
+
+        // Bit 4 says variable-length mask parameters follow, which would move
+        // everything after them. Rather than guess at the offsets, keep the
+        // painted mask and leave the vector one — the layer is still masked,
+        // just by the half of the pair this reader is sure of.
+        if (length >= 36 && (flags & 0x10) == 0) {
+            const std::uint8_t realFlags = in.u8();
+            rec.realMask.enabled = (realFlags & 0x02) == 0;
+            rec.realMask.outside = in.u8();
+            rec.realMask.top     = in.i32();
+            rec.realMask.left    = in.i32();
+            rec.realMask.bottom  = in.i32();
+            rec.realMask.right   = in.i32();
+            rec.realMask.present = in.ok() && plausibleRect(rec.realMask);
+        }
+    }
+
+    in.seek(end);
+    return in.ok();
+}
+
 bool readExtraData(Cursor& in, Record& rec) {
     const std::uint32_t extraLength = in.u32();
     if (!in.ok() || extraLength > in.remaining()) return false;
     const std::size_t extraEnd = in.pos() + extraLength;
 
-    const std::uint32_t maskLength = in.u32();     // layer mask: unsupported
-    rec.hadMask = maskLength > 0;
-    in.skip(maskLength);
+    if (!readMaskBlock(in, rec)) return false;
     in.skip(in.u32());                             // layer blending ranges
     if (!in.ok()) return false;
 
@@ -519,6 +597,7 @@ std::expected<Document, Error> readPsd(const std::filesystem::path& path) {
     };
 
     std::vector<std::uint8_t> plane;
+    std::size_t bakedMasks = 0;
     for (Record& rec : records) {
         if (rec.section == 3) {                    // the group ends here, going up
             openGroups.push_back(OpenGroup{doc.nextLayerId++, doc.layers.size()});
@@ -529,10 +608,6 @@ std::expected<Document, Error> readPsd(const std::filesystem::path& path) {
 
         Layer layer;
         layer.name    = rec.name.empty() ? "Layer" : rec.name;
-        if (rec.hadMask)
-            doc.warnings.push_back("layer \"" + layer.name + "\" arrives without its "
-                                   "mask — Sable does not read layer masks yet, so "
-                                   "what the mask hid is visible here");
         layer.opacity = static_cast<float>(rec.opacity) / 255.0f;
         layer.blend   = blendFromKey(rec.blendKey);
         layer.visible = !rec.hidden;
@@ -541,6 +616,14 @@ std::expected<Document, Error> readPsd(const std::filesystem::path& path) {
 
         if (rec.section == 1 || rec.section == 2) {
             layer.kind = LayerKind::Folder;
+            // The one mask that still cannot be honoured: a group's applies to
+            // the folder's composited result, so there is no single child's
+            // alpha to fold it into. Say so rather than open silently (#40).
+            if (rec.mask.present || rec.realMask.present)
+                doc.warnings.push_back(
+                    "the group \"" + layer.name + "\" arrives without its mask — a "
+                    "mask on a group applies to everything inside it, which Sable "
+                    "cannot yet hold, so what the mask hid is visible here");
             if (openGroups.empty())
                 return fail(ErrorKind::Malformed,
                             path.string() + " has an unbalanced layer group");
@@ -569,27 +652,56 @@ std::expected<Document, Error> readPsd(const std::filesystem::path& path) {
                             path.string() + " has a truncated layer channel");
             const std::size_t blockEnd = blockStart + static_cast<std::size_t>(length);
 
-            // 0..2 are R, G, B and -1 is alpha. -2 and -3 are masks, which
-            // Sable has no home for yet, so they are skipped rather than
-            // silently multiplied into the pixels.
+            // 0..2 are R, G, B and -1 is alpha. -2 is the mask the artist
+            // painted and -3 the one Photoshop renders from a vector path;
+            // both carry their own rectangle, from the mask block above.
             const int slot = id >= 0 && id <= 2 ? id : (id == -1 ? 3 : -1);
-            if (slot >= 0 && w > 0 && h > 0) {
+            MaskPlane* mask = id == -2 ? &rec.mask
+                            : id == -3 ? &rec.realMask
+                                       : nullptr;
+            if (mask != nullptr && !mask->present) mask = nullptr;
+
+            const std::size_t pw = mask != nullptr ? mask->width()  : w;
+            const std::size_t ph = mask != nullptr ? mask->height() : h;
+            if ((slot >= 0 || mask != nullptr) && pw > 0 && ph > 0) {
                 const std::uint16_t compression = in.u16();
                 if (compression > 1)
                     return fail(ErrorKind::UnsupportedVersion,
                                 path.string() + " uses ZIP-compressed layer data, "
                                 "which Sable cannot read yet.");
-                if (!readPlanes(in, compression, 1, w, h, blockEnd, plane))
+                if (!readPlanes(in, compression, 1, pw, ph, blockEnd, plane))
                     return fail(ErrorKind::Malformed,
                                 path.string() + ": layer \"" + layer.name +
                                 "\" has unreadable pixel data");
-                rgba[static_cast<std::size_t>(slot)] = std::move(plane);
+                if (mask != nullptr) mask->plane = std::move(plane);
+                else rgba[static_cast<std::size_t>(slot)] = std::move(plane);
                 plane.clear();
             }
             in.seek(blockEnd);
             if (!in.ok())
                 return fail(ErrorKind::Malformed,
                             path.string() + " has a truncated layer channel");
+        }
+
+        // #35: a mask multiplies the layer's alpha, and Sable has nowhere to
+        // keep one, so it is baked into the pixels here. That costs the artist
+        // the ability to edit the mask afterwards; dropping it cost them a
+        // drawing that showed what the file hides, which is the worse trade.
+        // The vector-derived mask wins when both are present — Photoshop writes
+        // channel -3 as the combination of the two.
+        if (const MaskPlane& m = rec.realMask.usable() ? rec.realMask : rec.mask;
+            m.usable() && w > 0 && h > 0 && !rgba[0].empty()) {
+            ++bakedMasks;
+            if (rgba[3].empty()) rgba[3].assign(w * h, 255);
+            for (std::size_t y = 0; y < h; ++y)
+                for (std::size_t x = 0; x < w; ++x) {
+                    const std::size_t i = y * w + x;
+                    const std::uint32_t coverage =
+                        m.at(rec.left + static_cast<std::int32_t>(x),
+                             rec.top  + static_cast<std::int32_t>(y));
+                    rgba[3][i] = static_cast<std::uint8_t>(
+                        (rgba[3][i] * coverage + 127) / 255);
+                }
         }
 
         if (w > 0 && h > 0 && !rgba[0].empty() && !rgba[1].empty() && !rgba[2].empty())
@@ -599,6 +711,16 @@ std::expected<Document, Error> readPsd(const std::filesystem::path& path) {
 
         doc.layers.push_back(std::move(layer));
     }
+
+    // The drawing is right — that was the bug (#35). What the artist has lost
+    // is the ability to change the mask, so say it once for the file rather
+    // than once per layer: a PSD from real work can have forty of them.
+    if (bakedMasks > 0)
+        doc.warnings.push_back(
+            std::to_string(bakedMasks) +
+            (bakedMasks == 1 ? " layer mask was" : " layer masks were") +
+            " applied to the pixels on import. The artwork matches the file; the "
+            "masks themselves can no longer be edited or exported as masks.");
 
     // An unbalanced file would otherwise leave children pointing at a folder
     // that was never created, and levelOf() would never composite them.
