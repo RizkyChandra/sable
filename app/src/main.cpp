@@ -527,8 +527,8 @@ void paintWith(App& app, sbl::InputSample sample) {
 
 sbl::InputSample mouseSample(App& app, double sx, double sy) {
     sbl::InputSample sample;
-    sample.x = toCanvasX(app.view, sx);
-    sample.y = toCanvasY(app.view, sy);
+    sample.x = toCanvasX(app.view, sx, sy);
+    sample.y = toCanvasY(app.view, sx, sy);
     sample.pressure    = 1.0f;          // mouse: full pressure, synthetic
     sample.fromMouse   = true;
     sample.timestampMs = SDL_GetTicks();
@@ -543,8 +543,8 @@ sbl::InputSample penSample(App& app, SDL_PenID which, float sx, float sy) {
     const PenAxisState& axes = app.penAxes[which];
 
     sbl::InputSample sample;
-    sample.x = toCanvasX(app.view, sx);
-    sample.y = toCanvasY(app.view, sy);
+    sample.x = toCanvasX(app.view, sx, sy);
+    sample.y = toCanvasY(app.view, sx, sy);
     // The fixed normalisation order lives in the engine, not here: deadzone,
     // rescale, smoothing, then the artist's curve (US-09.7).
     sample.pressure = app.pressureFilter.apply(app.profile, axes.pressure);
@@ -596,8 +596,8 @@ void endPaint(App& app) {
 }
 
 void doFill(App& app, double sx, double sy) {
-    const auto x = static_cast<std::int32_t>(std::floor(toCanvasX(app.view, sx)));
-    const auto y = static_cast<std::int32_t>(std::floor(toCanvasY(app.view, sy)));
+    const auto x = static_cast<std::int32_t>(std::floor(toCanvasX(app.view, sx, sy)));
+    const auto y = static_cast<std::int32_t>(std::floor(toCanvasY(app.view, sx, sy)));
 
     sbl::UndoRecord rec =
         sbl::bucketFill(app.doc, app.doc.activeLayer, x, y, app.foreground,
@@ -610,8 +610,8 @@ void doFill(App& app, double sx, double sy) {
 }
 
 void updateSelection(App& app, double sx, double sy) {
-    const double cx = toCanvasX(app.view, sx);
-    const double cy = toCanvasY(app.view, sy);
+    const double cx = toCanvasX(app.view, sx, sy);
+    const double cy = toCanvasY(app.view, sx, sy);
 
     sbl::Selection selection;
     selection.x = static_cast<std::int32_t>(std::floor(std::min(app.selectAnchorX, cx)));
@@ -631,8 +631,8 @@ void updateSelection(App& app, double sx, double sy) {
 }
 
 void pickColourAt(App& app, double sx, double sy) {
-    const auto x = static_cast<std::int32_t>(std::floor(toCanvasX(app.view, sx)));
-    const auto y = static_cast<std::int32_t>(std::floor(toCanvasY(app.view, sy)));
+    const auto x = static_cast<std::int32_t>(std::floor(toCanvasX(app.view, sx, sy)));
+    const auto y = static_cast<std::int32_t>(std::floor(toCanvasY(app.view, sx, sy)));
     if (x < 0 || y < 0 || x >= app.doc.width || y >= app.doc.height) return;
 
     const sbl::StraightRgba8 picked = sbl::pickColour(app.doc, x, y);
@@ -798,6 +798,13 @@ bool overCanvas(const App& app, float x, float y) {
            x < app.viewport.x + app.viewport.w && y < app.viewport.y + app.viewport.h;
 }
 
+/// Rotation changes the mapping only — no dirty flag, no undo entry, no tile
+/// upload, the same guarantee US-05.5 makes for pan and zoom.
+void rotateView(App& app, double delta) {
+    rotateAbout(app.view, app.viewport.x + app.viewport.w * 0.5,
+                app.viewport.y + app.viewport.h * 0.5, delta);
+}
+
 void handleKey(App& app, const SDL_KeyboardEvent& key) {
     if (key.key == SDLK_SPACE) { app.spaceHeld = key.down; return; }
     if (!key.down) return;
@@ -848,6 +855,11 @@ void handleKey(App& app, const SDL_KeyboardEvent& key) {
                       app.viewport.y + app.viewport.h * 0.5f, factor);
             break;
         }
+        // Turning about the middle of the viewport, not the canvas origin:
+        // whatever the artist is looking at stays where they are looking.
+        case Action::RotateLeft:  rotateView(app, -kRotateStep); break;
+        case Action::RotateRight: rotateView(app, +kRotateStep); break;
+        case Action::ResetRotation: rotateView(app, -app.view.rotation); break;
 
         case Action::ToolBrush:  app.tool = Tool::Brush;  break;
         case Action::ToolEraser: app.tool = Tool::Eraser; break;
@@ -958,6 +970,9 @@ void handleEvent(App& app, const SDL_Event& e) {
             if (e.button.button == SDL_BUTTON_MIDDLE ||
                 (e.button.button == SDL_BUTTON_LEFT && app.spaceHeld)) {
                 app.panning    = true;
+                // Screen space on both sides, so this stays right at any
+                // rotation: pan translates the whole mapping, it does not
+                // travel along the canvas axes.
                 app.panAnchorX = e.button.x - app.view.panX;
                 app.panAnchorY = e.button.y - app.view.panY;
             } else if (e.button.button == SDL_BUTTON_LEFT) {
@@ -967,8 +982,8 @@ void handleEvent(App& app, const SDL_Event& e) {
                     doFill(app, e.button.x, e.button.y);
                 } else if (app.tool == Tool::Select) {
                     app.selecting = true;
-                    app.selectAnchorX = toCanvasX(app.view, e.button.x);
-                    app.selectAnchorY = toCanvasY(app.view, e.button.y);
+                    app.selectAnchorX = toCanvasX(app.view, e.button.x, e.button.y);
+                    app.selectAnchorY = toCanvasY(app.view, e.button.x, e.button.y);
                 } else {
                     beginPaint(app);
                     paintWith(app, mouseSample(app, e.button.x, e.button.y));
@@ -1121,6 +1136,13 @@ void drawMenuBar(App& app, float& menuHeight) {
             fitToViewport(app.view, app.doc, app.viewport);
         if (ImGui::MenuItem("Actual size", app.shortcuts.get(Action::ActualSize).label().c_str()))
             zoomToActualSize(app.view, app.doc, app.viewport);
+        if (ImGui::MenuItem("Rotate left", app.shortcuts.get(Action::RotateLeft).label().c_str()))
+            rotateView(app, -kRotateStep);
+        if (ImGui::MenuItem("Rotate right", app.shortcuts.get(Action::RotateRight).label().c_str()))
+            rotateView(app, +kRotateStep);
+        if (ImGui::MenuItem("Reset rotation", app.shortcuts.get(Action::ResetRotation).label().c_str(),
+                            false, app.view.rotation != 0.0))
+            rotateView(app, -app.view.rotation);
         ImGui::Separator();
         ImGui::MenuItem("Pressure calibration", nullptr, &app.showCalibration);
         ImGui::MenuItem("Tablet test pad", nullptr, &app.showTestPad);
@@ -1653,8 +1675,9 @@ void drawStatusBar(const App& app, float windowW, float windowH, float height) {
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     if (ImGui::Begin("##status", nullptr, kStatusFlags)) {
-        ImGui::Text("%d%%   %d x %d%s",
+        ImGui::Text("%d%%   %ld deg   %d x %d%s",
                     static_cast<int>(std::lround(app.view.zoom * 100.0f)),
+                    std::lround(rotationDegrees(app.view)),
                     app.doc.width, app.doc.height, app.doc.dirty ? "   *" : "");
         ImGui::SameLine();
         ImGui::SameLine();
@@ -1817,14 +1840,21 @@ void drawSelectionOutline(const App& app) {
     if (!app.doc.selection.has_value() || app.doc.selection->empty()) return;
     const sbl::Selection& s = *app.doc.selection;
 
-    const ImVec2 lo(static_cast<float>(app.view.panX + s.x * app.view.zoom),
-                    static_cast<float>(app.view.panY + s.y * app.view.zoom));
-    const ImVec2 hi(static_cast<float>(app.view.panX + (s.x + s.w) * app.view.zoom),
-                    static_cast<float>(app.view.panY + (s.y + s.h) * app.view.zoom));
+    // Four corners through the view transform, not a screen-space rectangle:
+    // the selection is axis-aligned on the canvas, so it leans when the canvas
+    // is turned and an upright box would sit over the wrong pixels.
+    const auto at = [&](double cx, double cy) {
+        return ImVec2(static_cast<float>(toScreenX(app.view, cx, cy)),
+                      static_cast<float>(toScreenY(app.view, cx, cy)));
+    };
+    const ImVec2 a = at(s.x, s.y);
+    const ImVec2 b = at(s.x + s.w, s.y);
+    const ImVec2 c = at(s.x + s.w, s.y + s.h);
+    const ImVec2 d = at(s.x, s.y + s.h);
 
     ImDrawList* draw = ImGui::GetForegroundDrawList();
-    draw->AddRect(lo, hi, IM_COL32(0, 0, 0, 200), 0.0f, 0, 3.0f);
-    draw->AddRect(lo, hi, IM_COL32(255, 255, 255, 230), 0.0f, 0, 1.0f);
+    draw->AddQuad(a, b, c, d, IM_COL32(0, 0, 0, 200), 3.0f);
+    draw->AddQuad(a, b, c, d, IM_COL32(255, 255, 255, 230), 1.0f);
 }
 
 void drawBrushCursor(const App& app) {
@@ -1834,6 +1864,9 @@ void drawBrushCursor(const App& app) {
     if (!overCanvas(app, mx, my)) return;
 
     if (!paintingTool(app)) return;
+    // Zoom only: the cursor is a circle about the pointer, and a circle is the
+    // one shape rotation leaves alone. It follows the view because the pointer
+    // does.
     const float radius =
         activeBrush(const_cast<App&>(app)).size * 0.5f * app.view.zoom;
     if (radius < 1.0f) return;
@@ -2031,9 +2064,11 @@ int main(int argc, char** argv) {
         app.showShortcuts   = true;
         beginPaint(app);
         for (double t = 0.0; t <= 1.0; t += 0.02) {
+            const double cx = 100.0 + t * 400.0;
+            const double cy = 100.0 + t * 250.0;
             sbl::InputSample sample =
-                mouseSample(app, app.view.panX + 100.0 + t * 400.0,
-                                 app.view.panY + 100.0 + t * 250.0);
+                mouseSample(app, toScreenX(app.view, cx, cy),
+                                 toScreenY(app.view, cx, cy));
             sample.fromMouse = false;
             sample.pressure = static_cast<float>(1.0 - std::abs(0.5 - t) * 2.0);
             paintWith(app, sample);
@@ -2046,10 +2081,78 @@ int main(int argc, char** argv) {
         app.doc.layerById(app.doc.activeLayer)->blend = sbl::BlendMode::Multiply;
         app.foreground = sbl::StraightRgba8{60, 120, 220, 255};
         app.doc.selection = sbl::Selection{200, 200, 300, 300};
-        doFill(app, app.view.panX + 300.0, app.view.panY + 300.0);
+        doFill(app, toScreenX(app.view, 300.0, 300.0),
+                    toScreenY(app.view, 300.0, 300.0));
         app.doc.selection.reset();
 
+        // Rotation, checked where a unit test cannot reach: turning the view
+        // must move no pixels (US-05.5's guarantee, extended to rotate), and
+        // the app's own screen->canvas path must still land on the pixel the
+        // artist is pointing at. Left turned on, so the frames below also
+        // exercise the rotated blit and the turned outline.
+        {
+            const bool dirtyBefore = app.doc.dirty;
+            const std::size_t undoBefore    = app.doc.undo.size();
+            const std::size_t uploadsBefore = app.canvas->uploadCount();
+            rotateView(app, kRotateStep * 2.0);
+            if (app.doc.dirty != dirtyBefore ||
+                app.doc.undo.size() != undoBefore ||
+                app.canvas->uploadCount() != uploadsBefore) {
+                SDL_Log("selftest FAILED: rotating the view altered the document");
+                return 1;
+            }
+            const sbl::InputSample probe =
+                mouseSample(app, toScreenX(app.view, 400.0, 250.0),
+                                 toScreenY(app.view, 400.0, 250.0));
+            if (std::abs(probe.x - 400.0) > 1e-6 || std::abs(probe.y - 250.0) > 1e-6) {
+                SDL_Log("selftest FAILED: rotated screen->canvas lands at %.6f, %.6f",
+                        probe.x, probe.y);
+                return 1;
+            }
+            SDL_Log("selftest: rotation at %ld deg alters no pixels",
+                    std::lround(rotationDegrees(app.view)));
+        }
+
         for (int frame = 0; frame < 3; ++frame) renderFrame(app);
+
+        // The blit has to agree with the transform. SDL turns each tile about
+        // its own corner, and a sign error there would put the picture
+        // somewhere the screen->canvas maths says it is not — with every unit
+        // test still green. One pixel read back off the rotated frame catches
+        // it: the probe is off-centre and inside the filled region, so the
+        // mirrored point it would land on is a different colour.
+        {
+            SDL_SetRenderDrawColor(app.renderer, 0, 0, 0, 255);
+            SDL_RenderClear(app.renderer);
+            app.canvas->render(app.doc, app.view, app.viewport);
+
+            constexpr int probe = 350;
+            const double centreX = probe + 0.5, centreY = probe + 0.5;
+            const SDL_Rect one{
+                static_cast<int>(std::lround(toScreenX(app.view, centreX, centreY))),
+                static_cast<int>(std::lround(toScreenY(app.view, centreX, centreY))),
+                1, 1};
+            SDL_Surface* shot = SDL_RenderReadPixels(app.renderer, &one);
+            Uint8 r = 0, g = 0, b = 0, a = 0;
+            // A renderer that cannot read back says nothing either way, so it
+            // is not a failure — but a mismatch is.
+            if (shot != nullptr && SDL_ReadSurfacePixel(shot, 0, 0, &r, &g, &b, &a)) {
+                const std::vector<sbl::PremulRgba8> want =
+                    sbl::compositeRect(app.doc, probe, probe, 1, 1);
+                const int dr = std::abs(int{r} - int{want[0].r});
+                const int dg = std::abs(int{g} - int{want[0].g});
+                const int db = std::abs(int{b} - int{want[0].b});
+                if (dr > 8 || dg > 8 || db > 8) {
+                    SDL_Log("selftest FAILED: rotated blit shows %d,%d,%d where the "
+                            "transform says %d,%d,%d", r, g, b,
+                            want[0].r, want[0].g, want[0].b);
+                    SDL_DestroySurface(shot);
+                    return 1;
+                }
+                SDL_Log("selftest: rotated blit lands on the pixel the transform names");
+            }
+            SDL_DestroySurface(shot);
+        }
 
         const auto project = std::filesystem::temp_directory_path() / "sable_selftest.sable";
         std::error_code ec;

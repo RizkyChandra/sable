@@ -226,6 +226,10 @@ if(SABLE_BUILD_TESTS)
   # Headless by design (D-003) — these run in CI with no display server.
   add_executable(engine_tests tests/tests.cpp)
   target_link_libraries(engine_tests PRIVATE sable::engine doctest miniz nlohmann_json)
+  # app/src for view_transform.hpp only — the screen<->canvas maths is app-side
+  # but SDL-free, and a rotation dropped on one path is not something to check
+  # by eye. Nothing else from app/ may be included here (D-003).
+  target_include_directories(engine_tests PRIVATE app/src)
   # The allocation counter (US-02.9) replaces global operator new/delete, which
   # both compilers misread as a malloc/delete mismatch. It is not one.
   target_compile_options(engine_tests PRIVATE ${SABLE_WARNINGS})

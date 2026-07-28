@@ -147,10 +147,10 @@ As an artist, I want to take back mistakes, so that I can experiment freely.
    rather than zeroing it — assert the map size returns to its prior value, and
    that any cached `SDL_Texture` for it is released.
 
-### US-05 — Pan and zoom the view — P0
+### US-05 — Pan, zoom and rotate the view — P0
 
-As an artist, I want to move and magnify the canvas, so that I can work on detail
-and still see the whole piece.
+As an artist, I want to move, magnify and turn the canvas, so that I can work on
+detail, still see the whole piece, and draw every stroke at a comfortable angle.
 
 1. Holding `Space` and dragging pans; the cursor shows it.
 2. The scroll wheel zooms about the cursor position, not the window centre.
@@ -163,6 +163,12 @@ and still see the whole piece.
    layer before the `InputSample` is built.
 7. At 100%, canvas pixels map 1:1 to screen pixels with no resampling blur —
    check the texture scale mode is nearest at 100% and above.
+8. Bound keys turn the view left and right in 15° steps about the middle of the
+   viewport, and reset it; the angle shows in the status line beside the zoom.
+   Rotation obeys point 5 as well — it alters no pixels.
+9. **Test:** screen → canvas → screen is the identity at several angles,
+   including negative ones and past a half turn. A conversion that drops the
+   rotation paints in the wrong place and still looks nearly right at 10°.
 
 ### US-06 — Clear the canvas — P1
 
@@ -347,7 +353,7 @@ Each step is demonstrable on its own.
 2. US-01 canvas + US-14 event loop → US-02 mouse stroke → US-03 interpolation —
    the engine core, with the loop shape correct from the start
 3. US-04 undo → US-07 export — now it is a usable toy
-4. US-05 pan/zoom → US-06 clear — **Milestone 1 complete**
+4. US-05 pan/zoom/rotate → US-06 clear — **Milestone 1 complete**
 5. US-08 pressure → US-09 calibration → US-11 stabilizer — M2 core
 6. US-12 size → US-13 colour → US-10 test pad — **Milestone 2 complete**
 

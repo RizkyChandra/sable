@@ -13,21 +13,7 @@
 #include <unordered_set>
 
 #include "sbl/canvas.hpp"
-
-/// Pan is the screen position of canvas pixel (0, 0). Zoom scales from there,
-/// so screen-to-canvas is one subtract and one divide.
-struct View {
-    double panX = 0.0;
-    double panY = 0.0;
-    float  zoom = 1.0f;
-};
-
-[[nodiscard]] inline double toCanvasX(const View& v, double sx) noexcept {
-    return (sx - v.panX) / v.zoom;
-}
-[[nodiscard]] inline double toCanvasY(const View& v, double sy) noexcept {
-    return (sy - v.panY) / v.zoom;
-}
+#include "view_transform.hpp"   // View, and the screen <-> canvas maths
 
 /// Fits the document inside `viewport` and centres it.
 void fitToViewport(View& v, const sbl::Document& doc, const SDL_FRect& viewport);
@@ -35,6 +21,9 @@ void fitToViewport(View& v, const sbl::Document& doc, const SDL_FRect& viewport)
 void zoomToActualSize(View& v, const sbl::Document& doc, const SDL_FRect& viewport);
 /// Zooms about a screen point, so the canvas pixel under the cursor stays put.
 void zoomAbout(View& v, double sx, double sy, float factor);
+/// One rotation step, in radians. 15 degrees: fine enough to square up a
+/// wobbly horizon, coarse enough that 24 presses go all the way round.
+inline constexpr double kRotateStep = 3.14159265358979323846 / 12.0;
 
 class CanvasView {
 public:
