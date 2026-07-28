@@ -1,5 +1,6 @@
 #include "icons.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 namespace {

@@ -3,6 +3,8 @@
 #include <SDL3/SDL.h>
 
 #include <charconv>
+#include <cstdlib>
+#include <string>
 #include <cstdio>
 #include <sstream>
 #include <string_view>
@@ -21,10 +23,14 @@ std::string settingsPath() {
 }
 
 float parseFloat(std::string_view text, float fallback) {
-    float value = fallback;
-    const auto* first = text.data();
-    const auto* last = text.data() + text.size();
-    if (std::from_chars(first, last, value).ec != std::errc{}) return fallback;
+    // std::from_chars for FLOATING-POINT types is still unimplemented in
+    // libc++, so it does not compile on macOS. strtof is the portable answer;
+    // the string is copied because strtof needs a terminator.
+    if (text.empty()) return fallback;
+    const std::string owned(text);
+    char* end = nullptr;
+    const float value = std::strtof(owned.c_str(), &end);
+    if (end == owned.c_str()) return fallback;      // nothing was parsed
     return value;
 }
 

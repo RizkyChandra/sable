@@ -1,5 +1,6 @@
 #include "sbl/input.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 namespace sbl {

@@ -64,20 +64,29 @@ jobs:
         if: runner.os != 'Linux'
         uses: seanmiddleditch/gha-setup-ninja@v5
 
+      # SDL3 and Sable MUST be built by the same toolchain. The first attempt
+      # left SDL on the default generator, which is Visual Studio on Windows,
+      # while Sable used -G Ninja and picked MinGW's g++ off PATH — the link
+      # then failed on MSVC runtime symbols (__security_cookie and friends).
+      # Both now use Ninja, and Windows is pinned to GCC, which is the compiler
+      # family the rest of this project is known to build with.
       - name: Build SDL3
         if: steps.sdl-cache.outputs.cache-hit != 'true'
         shell: bash
+        env:
+          CC: ${{ runner.os == 'Windows' && 'gcc' || '' }}
+          CXX: ${{ runner.os == 'Windows' && 'g++' || '' }}
         run: |
           git clone --depth 1 --branch "$SDL_VERSION" \
             https://github.com/libsdl-org/SDL.git "${RUNNER_TEMP}/SDL"
-          cmake -S "${RUNNER_TEMP}/SDL" -B "${RUNNER_TEMP}/SDL/build" \
+          cmake -S "${RUNNER_TEMP}/SDL" -B "${RUNNER_TEMP}/SDL/build" -G Ninja \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/.sdl3" \
                 -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
                 -DSDL_SHARED=OFF -DSDL_STATIC=ON \
                 -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_INSTALL_TESTS=OFF
-          cmake --build "${RUNNER_TEMP}/SDL/build" --config Release
-          cmake --install "${RUNNER_TEMP}/SDL/build" --config Release
+          cmake --build "${RUNNER_TEMP}/SDL/build"
+          cmake --install "${RUNNER_TEMP}/SDL/build"
 
       # --- macOS wants an .icns; it is generated from the same PNG the Linux
       # packaging uses, which Sable's own engine drew (D-010/D-018).
@@ -100,7 +109,11 @@ jobs:
         shell: bash
         run: |
           extra=""
-          [ "${{ runner.os }}" = "Linux" ] && extra="-DCMAKE_CXX_COMPILER=g++-12"
+          [ "${{ runner.os }}" = "Linux" ]   && extra="-DCMAKE_CXX_COMPILER=g++-12"
+          # Console on, so a failing self-test can say why. Release archives
+          # are staged from this same build; the window is a fair trade for
+          # having any diagnostics at all on a platform nobody has run by hand.
+          [ "${{ runner.os }}" = "Windows" ] && extra="-DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER=gcc -DSABLE_CONSOLE=ON"
           cmake -S . -B build -G Ninja \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_PREFIX_PATH="${{ github.workspace }}/.sdl3" \
@@ -161,6 +174,9 @@ jobs:
 
       - name: Build the AppImage
         if: runner.os == 'Linux'
+        env:
+          CMAKE_PREFIX_PATH: ${{ github.workspace }}/.sdl3
+          CXX: g++-12
         run: |
           packaging/build-appimage.sh
           mv Sable-x86_64.AppImage dist/

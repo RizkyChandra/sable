@@ -18,9 +18,12 @@ arch="$(uname -m)"
 cd "$root"
 
 echo "==> Configuring a release build"
+# CMAKE_PREFIX_PATH is passed through so a locally built SDL3 is found — the
+# release workflow builds one rather than using a system package.
 cmake -S . -B "$build" -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
       -DSABLE_BUILD_TESTS=OFF \
+      -DCMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}" \
       -DCMAKE_INSTALL_PREFIX=/usr
 
 echo "==> Building"
@@ -56,7 +59,9 @@ if [ -n "${sdl:-}" ] && [ -f "$sdl" ]; then
     cp -L "$sdl" "$appdir/usr/lib/"
     echo "    bundled $(basename "$sdl")"
 else
-    echo "    WARNING: libSDL3 not found; the AppImage will need it on the host" >&2
+    # Nothing to bundle is the normal case for a release build, which links
+    # SDL3 statically. Only a dynamically linked build needs the copy above.
+    echo "    no libSDL3 to bundle (statically linked, or already absent)"
 fi
 
 tool="$build/appimagetool-$arch.AppImage"
