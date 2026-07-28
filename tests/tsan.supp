@@ -1,0 +1,20 @@
+# ThreadSanitizer suppressions — third-party only.
+#
+# This job exists to check ONE thing: the background recovery, which is the
+# only place Sable hands document data across a thread boundary. Nothing here
+# may suppress a report whose stack touches Sable's own code.
+#
+# Each entry names a library and the report kind, so a genuine race in the save
+# path can never be hidden by a rule aimed at somebody else's locking.
+
+# libdbus takes two of its own mutexes in opposite orders on different paths.
+# TSan reports it as a POTENTIAL deadlock; the stack contains only
+# libdbus-1.so.3 and libc.so.6, no Sable frames. Reached because SDL probes for
+# a GPU device at startup, which brings in desktop integration the self-test
+# did not previously touch. Not ours to fix, and not something we can avoid
+# without giving up the device probe.
+deadlock:libdbus-1
+
+# SDL's own initialisation and teardown of desktop-integration threads.
+race:libSDL3
+deadlock:libSDL3
