@@ -14,6 +14,10 @@
 #include <utility>
 #include <vector>
 
+// For VanishingPoint. The input boundary depends on nothing, so this is a
+// one-way edge, not a tangle.
+#include "sbl/input.hpp"
+
 namespace sbl {
 
 // ------------------------------------------------------------------- colour
@@ -315,6 +319,11 @@ struct Document {
     std::optional<Selection> selection;    // Milestone 3; empty = whole canvas
     std::filesystem::path path;            // empty until first save
     bool dirty = false;
+
+    /// Perspective guides, in canvas pixels. Document state, unlike the ruler
+    /// that uses them: a scene's horizon is part of the drawing and has to come
+    /// back with it, while "is the ruler on" is a preference.
+    std::vector<VanishingPoint> vanishingPoints;
 
     [[nodiscard]] Layer*       layerById(LayerId id) noexcept;
     [[nodiscard]] const Layer* layerById(LayerId id) const noexcept;

@@ -25,6 +25,7 @@ enum class Action {
     RotateLeft, RotateRight, ResetRotation,
     ToolBrush, ToolEraser, ToolFill, ToolSelect, ToolTransform,
     SizeDown, SizeUp, SwapColours, ResetColours,
+    ToggleSymmetry, TogglePerspective,
     Count,
 };
 

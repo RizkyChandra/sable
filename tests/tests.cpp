@@ -1358,6 +1358,236 @@ TEST_CASE("the stabilizer holds a sharp corner") {
     CHECK(out.y > 100.0);
 }
 
+// --------------------------------------------------------------- rulers (M5)
+
+TEST_CASE("a symmetry ruler that is off produces the sample and nothing else") {
+    SymmetryRuler ruler;
+    ruler.vertical = true;                 // configured, but not switched on
+    std::vector<SymmetryImage> images;
+    ruler.map(30.0, 40.0, 0.0f, images);
+    REQUIRE(images.size() == 1);
+    CHECK(images[0].x == doctest::Approx(30.0));
+    CHECK(images[0].y == doctest::Approx(40.0));
+}
+
+TEST_CASE("a vertical axis mirrors x about the centre and leaves y alone") {
+    SymmetryRuler ruler;
+    ruler.enabled = true;
+    ruler.vertical = true;
+    ruler.centreX = 100.0;
+    ruler.centreY = 50.0;
+
+    std::vector<SymmetryImage> images;
+    ruler.map(130.0, 20.0, 0.0f, images);
+    REQUIRE(images.size() == 2);
+    // The original comes first, so a caller can skip what it has already painted.
+    CHECK(images[0].x == doctest::Approx(130.0));
+    CHECK(images[0].y == doctest::Approx(20.0));
+    CHECK(images[1].x == doctest::Approx(70.0));
+    CHECK(images[1].y == doctest::Approx(20.0));
+
+    ruler.vertical = false;
+    ruler.horizontal = true;
+    ruler.map(130.0, 20.0, 0.0f, images);
+    REQUIRE(images.size() == 2);
+    CHECK(images[1].x == doctest::Approx(130.0));
+    CHECK(images[1].y == doctest::Approx(80.0));
+
+    ruler.vertical = true;                 // both axes: four quadrants
+    ruler.map(130.0, 20.0, 0.0f, images);
+    CHECK(images.size() == 4);
+}
+
+TEST_CASE("radial symmetry spaces its copies evenly at one radius") {
+    SymmetryRuler ruler;
+    ruler.enabled = true;
+    ruler.radial  = 6;
+    ruler.centreX = 200.0;
+    ruler.centreY = 200.0;
+
+    std::vector<SymmetryImage> images;
+    ruler.map(240.0, 200.0, 0.0f, images);        // 40 px out along +x
+    REQUIRE(images.size() == 6);
+    for (const SymmetryImage& image : images) {
+        const double dx = image.x - 200.0, dy = image.y - 200.0;
+        CHECK(std::sqrt(dx * dx + dy * dy) == doctest::Approx(40.0));
+    }
+
+    // No two copies land on the same spot. A doubled dab is not a subtle
+    // failure — it paints twice and shows as a dark blotch on the seam.
+    for (std::size_t i = 0; i < images.size(); ++i)
+        for (std::size_t j = i + 1; j < images.size(); ++j)
+            CHECK(std::hypot(images[i].x - images[j].x,
+                             images[i].y - images[j].y) > 1.0);
+}
+
+TEST_CASE("radial symmetry with an axis is dihedral, and still has no duplicates") {
+    SymmetryRuler ruler;
+    ruler.enabled  = true;
+    ruler.radial   = 4;            // even: the case where a naive transform
+    ruler.vertical = true;         // list produces the half turn twice
+    ruler.centreX = 0.0;
+    ruler.centreY = 0.0;
+
+    std::vector<SymmetryImage> images;
+    ruler.map(10.0, 3.0, 0.0f, images);
+    REQUIRE(images.size() == 8);
+    for (std::size_t i = 0; i < images.size(); ++i)
+        for (std::size_t j = i + 1; j < images.size(); ++j)
+            CHECK(std::hypot(images[i].x - images[j].x,
+                             images[i].y - images[j].y) > 1e-6);
+}
+
+TEST_CASE("radial copies are capped rather than trusted") {
+    SymmetryRuler ruler;
+    ruler.enabled = true;
+    ruler.radial  = 100000;        // a slider dragged, or a settings file edited
+    std::vector<SymmetryImage> images;
+    ruler.map(10.0, 0.0, 0.0f, images);
+    CHECK(images.size() == static_cast<std::size_t>(SymmetryRuler::kMaxRadial));
+}
+
+TEST_CASE("a perspective ruler with no usable point changes nothing") {
+    PerspectiveRuler ruler;
+    ruler.points.push_back(VanishingPoint{500.0, 100.0, false});   // disabled
+    ruler.enabled = true;
+    CHECK(!ruler.usable());
+    for (int i = 0; i < 20; ++i) {
+        const InputSample in = at(i * 9.0, i * 4.0);
+        const InputSample out = ruler.apply(in);
+        CHECK(out.x == doctest::Approx(in.x));
+        CHECK(out.y == doctest::Approx(in.y));
+    }
+}
+
+TEST_CASE("a perspective stroke lands on the line through its start and the point") {
+    PerspectiveRuler ruler;
+    ruler.enabled = true;
+    ruler.points.push_back(VanishingPoint{400.0, 0.0, true});
+
+    const double startX = 0.0, startY = 100.0;
+    (void)ruler.apply(at(startX, startY));
+
+    // A drifting hand: the y wanders 30 px off the guide.
+    double worst = 0.0;
+    for (int i = 1; i <= 60; ++i) {
+        const double x = i * 5.0;
+        const InputSample out = ruler.apply(at(x, startY + (i % 2 == 0 ? 30.0 : -30.0)));
+        // The guide runs from (0, 100) to (400, 0): y = 100 - x / 4.
+        const double onGuide = startY - out.x * 0.25;
+        worst = std::max(worst, std::abs(out.y - onGuide));
+    }
+    CHECK(worst < 1e-9);
+    CHECK(ruler.chosen() == 0);
+
+    // Pressure is the artist's, not the ruler's (the same rule as US-11.6).
+    InputSample sample = at(200.0, 50.0);
+    sample.pressure = 0.42f;
+    CHECK(ruler.apply(sample).pressure == doctest::Approx(0.42f));
+}
+
+TEST_CASE("perspective picks the point the stroke is heading towards") {
+    // Two-point perspective: which guide is meant is in the opening direction,
+    // so the artist never has to say which one out loud.
+    PerspectiveRuler ruler;
+    ruler.enabled = true;
+    ruler.points.push_back(VanishingPoint{-1000.0, 0.0, true});    // away left
+    ruler.points.push_back(VanishingPoint{1000.0, 0.0, true});     // away right
+
+    ruler.reset();
+    (void)ruler.apply(at(500.0, 500.0));
+    (void)ruler.apply(at(520.0, 490.0));       // heading up and to the right
+    CHECK(ruler.chosen() == 1);
+
+    ruler.reset();
+    (void)ruler.apply(at(500.0, 500.0));
+    (void)ruler.apply(at(480.0, 490.0));       // heading up and to the left
+    CHECK(ruler.chosen() == 0);
+
+    // A single sample commits to nothing: the first pixel of a stroke is
+    // tremor, and a guide chosen from tremor cannot be corrected mid-stroke.
+    ruler.reset();
+    (void)ruler.apply(at(500.0, 500.0));
+    (void)ruler.apply(at(500.5, 500.2));
+    CHECK(ruler.chosen() == -1);
+}
+
+TEST_CASE("symmetry composes with the stabilizer instead of fighting it") {
+    // The mirror must be of the SMOOTHED stroke. Mirroring the raw input and
+    // smoothing only the original gives two strokes of different shapes, which
+    // is what "the rulers fight the stabilizer" would look like on screen.
+    Document doc = makeDocument(256, 256, StraightRgba8{0, 0, 0, 0});
+    Layer& layer = doc.layers.front();
+
+    SymmetryRuler ruler;
+    ruler.enabled  = true;
+    ruler.vertical = true;
+    ruler.centreX  = 128.0;
+    ruler.centreY  = 128.0;
+
+    Stabilizer stabilizer;
+    stabilizer.setLevel(3);
+
+    BrushPreset brush = defaultPencil();
+    brush.size = 6.0f;
+    Stroke stroke;
+    beginStroke(stroke, brush, StraightRgba8{0, 0, 0, 255}, layer.id);
+    PaintTarget target{layer, stroke.pending, stroke.touched, doc.width, doc.height};
+
+    std::vector<Dab> scratch;
+    std::vector<SymmetryImage> images;
+    double worstRaw = 0.0, worstPainted = 0.0;
+    double lastX = 0.0, lastMirrorX = 0.0, lastY = 0.0;
+
+    for (int i = 0; i < 160; ++i) {
+        const double x = 20.0 + i * 0.5;
+        const double y = 40.0 + (i % 2 == 0 ? 5.0 : -5.0);      // a shaky line
+        // Past the first samples, where the string is still being taken up:
+        // that is latency, not wobble, and D-103 says not to confuse the two.
+        const bool settled = i >= 10;
+        if (settled) worstRaw = std::max(worstRaw, std::abs(y - 40.0));
+
+        const InputSample smoothed = stabilizer.apply(at(x, y));
+        paintSample(stroke, target, smoothed, scratch);
+        for (const Dab& dab : scratch) {
+            if (settled) worstPainted = std::max(worstPainted, std::abs(dab.y - 40.0));
+            ruler.map(dab.x, dab.y, dab.angle, images);
+            REQUIRE(images.size() == 2);
+            // The image is the mirror of what the STABILIZER produced, not of
+            // the raw sample: the ruler sits downstream of the smoothing.
+            CHECK(images[1].x == doctest::Approx(256.0 - dab.x));
+            CHECK(images[1].y == doctest::Approx(dab.y));
+
+            Dab mirrored = dab;
+            mirrored.x = images[1].x;
+            mirrored.y = images[1].y;
+            applyDab(target, mirrored);
+
+            lastX = dab.x;
+            lastMirrorX = mirrored.x;
+            lastY = dab.y;
+        }
+    }
+
+    CHECK(worstPainted < worstRaw);          // the smoothing survived the mirror
+
+    const auto opaque = [&](double x, double y) {
+        return pickColour(doc, static_cast<std::int32_t>(std::lround(x)),
+                          static_cast<std::int32_t>(std::lround(y))).a > 0;
+    };
+    CHECK(opaque(lastX, lastY));
+    CHECK(opaque(lastMirrorX, lastY));
+
+    // One stroke is ONE undo step however many dabs symmetry multiplied it
+    // into — and undoing it has to clear both sides, which it only does if the
+    // images went into the same record.
+    doc.undo.push(std::move(stroke.pending));
+    CHECK(doc.undo.size() == 1);
+    (void)doc.undo.undo(doc);
+    CHECK(!opaque(lastX, lastY));
+    CHECK(!opaque(lastMirrorX, lastY));
+}
+
 // ----------------------------------------------------- brushes (M3/M4)
 
 TEST_CASE("every built-in brush has a distinct id and a sane configuration") {
@@ -1788,38 +2018,84 @@ TEST_CASE("undo history is not saved") {
     std::filesystem::remove(path);
 }
 
+/// Rewrites the manifest's format_version in place, leaving everything else.
+/// Used to fake both a future file and an older one.
+namespace {
+void rewriteFormatVersion(const std::filesystem::path& path, int version) {
+    mz_zip_archive in{};
+    REQUIRE(mz_zip_reader_init_file(&in, path.string().c_str(), 0));
+    std::size_t size = 0;
+    void* data = mz_zip_reader_extract_file_to_heap(&in, "document.json", &size, 0);
+    REQUIRE(data != nullptr);
+    std::string text(static_cast<const char*>(data), size);
+    mz_free(data);
+    mz_zip_reader_end(&in);
+
+    const std::string key = "\"format_version\": ";
+    const auto at = text.find(key);
+    REQUIRE(at != std::string::npos);
+    const auto end = text.find_first_not_of("0123456789", at + key.size());
+    REQUIRE(end != std::string::npos);
+    text.replace(at, end - at, key + std::to_string(version));
+
+    mz_zip_archive out{};
+    REQUIRE(mz_zip_writer_init_file(&out, path.string().c_str(), 0));
+    mz_zip_writer_add_mem(&out, "document.json", text.data(), text.size(),
+                          MZ_DEFAULT_COMPRESSION);
+    mz_zip_writer_finalize_archive(&out);
+    mz_zip_writer_end(&out);
+}
+}  // namespace
+
 TEST_CASE("a newer format version is refused rather than read wrong") {
     Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
     const auto path = scratchFile("sable_future.sable");
     REQUIRE(saveProject(doc, path).has_value());
-
-    // Rewrite the manifest claiming a far future version.
-    {
-        mz_zip_archive in{};
-        REQUIRE(mz_zip_reader_init_file(&in, path.string().c_str(), 0));
-        std::size_t size = 0;
-        void* data = mz_zip_reader_extract_file_to_heap(&in, "document.json", &size, 0);
-        REQUIRE(data != nullptr);
-        std::string text(static_cast<const char*>(data), size);
-        mz_free(data);
-        mz_zip_reader_end(&in);
-
-        const auto at = text.find("\"format_version\": 1");
-        REQUIRE(at != std::string::npos);
-        text.replace(at, 19, "\"format_version\": 9");
-
-        mz_zip_archive out{};
-        REQUIRE(mz_zip_writer_init_file(&out, path.string().c_str(), 0));
-        mz_zip_writer_add_mem(&out, "document.json", text.data(), text.size(),
-                              MZ_DEFAULT_COMPRESSION);
-        mz_zip_writer_finalize_archive(&out);
-        mz_zip_writer_end(&out);
-    }
+    rewriteFormatVersion(path, 999);
 
     const auto loaded = loadProject(path);
     REQUIRE(!loaded.has_value());
     CHECK(loaded.error().kind == ErrorKind::UnsupportedVersion);
     CHECK(loaded.error().detail.find("newer version") != std::string::npos);
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("vanishing points survive a save and load") {
+    Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+    doc.vanishingPoints.push_back(VanishingPoint{-320.5, 40.25, true});
+    doc.vanishingPoints.push_back(VanishingPoint{900.0, 40.25, false});
+
+    const auto path = scratchFile("sable_vanishing.sable");
+    REQUIRE(saveProject(doc, path).has_value());
+    const auto loaded = loadProject(path);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->vanishingPoints.size() == 2);
+    CHECK(loaded->vanishingPoints[0].x == doctest::Approx(-320.5));
+    CHECK(loaded->vanishingPoints[0].y == doctest::Approx(40.25));
+    CHECK(loaded->vanishingPoints[0].enabled);
+    CHECK(loaded->vanishingPoints[1].x == doctest::Approx(900.0));
+    // Off is a position worth keeping, not a reason to drop the point.
+    CHECK(!loaded->vanishingPoints[1].enabled);
+
+    // The clone the background save hands to its worker has to carry them too,
+    // or a recovered file comes back without its perspective (D-013).
+    CHECK(cloneDocument(*loaded).vanishingPoints.size() == 2);
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("a file from before the version bump still opens") {
+    // A v1 document is exactly a v2 one with no vanishing_points, so nothing
+    // about the bump may cost an existing file its contents.
+    Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+    const auto path = scratchFile("sable_v1.sable");
+    REQUIRE(saveProject(doc, path).has_value());
+    rewriteFormatVersion(path, 1);
+
+    const auto loaded = loadProject(path);
+    REQUIRE(loaded.has_value());
+    CHECK(loaded->width == 64);
+    CHECK(loaded->layers.size() == 1);
+    CHECK(loaded->vanishingPoints.empty());
     std::filesystem::remove(path);
 }
 
