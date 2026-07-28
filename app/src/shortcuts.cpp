@@ -57,6 +57,10 @@ constexpr std::array<Entry, static_cast<std::size_t>(Action::Count)> kDefaults{{
     {Action::SizeUp,        "Larger brush",   SDLK_RIGHTBRACKET, SDL_KMOD_NONE},
     {Action::SwapColours,   "Swap colours",   SDLK_X, SDL_KMOD_NONE},
     {Action::ResetColours,  "Reset colours",  SDLK_C, SDL_KMOD_NONE},
+    // Unmodified S and P: both letters were free, and a ruler is toggled
+    // mid-drawing often enough that a modifier would be in the way.
+    {Action::ToggleSymmetry,    "Symmetry ruler",    SDLK_S, SDL_KMOD_NONE},
+    {Action::TogglePerspective, "Perspective ruler", SDLK_P, SDL_KMOD_NONE},
 }};
 
 std::string settingKey(Action action) {

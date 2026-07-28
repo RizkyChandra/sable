@@ -209,6 +209,10 @@ struct Document {
     std::optional<Selection> selection;     // Milestone 3; empty = whole canvas
     std::filesystem::path path;             // empty until first save
     bool dirty = false;
+
+    // Perspective guides (D-025). The ruler that uses them is view state; the
+    // points are part of the drawing and are saved with it.
+    std::vector<VanishingPoint> vanishingPoints;
 };
 ```
 
@@ -551,7 +555,7 @@ layers/<layerId>/tiles/<tx>_<ty>.png   one PNG per non-empty tile, straight alph
 
 ```jsonc
 {
-  "format_version": 1,
+  "format_version": 2,
   "app": "Sable 0.1.0",
   "width": 1024, "height": 1024, "dpi": 72,
   "background": "#ffffff",
@@ -564,14 +568,16 @@ layers/<layerId>/tiles/<tx>_<ty>.png   one PNG per non-empty tile, straight alph
       "parent": null,
       "tiles": [[0, 0], [0, 1], [1, 0]] }
   ],
-  "active_layer": 1
+  "active_layer": 1,
+  "vanishing_points": [ { "x": -320.5, "y": 512.0, "enabled": true } ]
 }
 ```
 
 Rules:
 
 - `format_version` is checked on load. Refuse a higher version with a clear
-  message rather than reading it wrong.
+  message rather than reading it wrong. Version 2 added `vanishing_points`;
+  everything it adds is optional, so a v1 file still loads unchanged.
 - Tile PNGs are **straight alpha** so external tools can open them. Convert on
   save and on load; test the round-trip for drift (D-004).
 - If the manifest's `tiles` list disagrees with the ZIP entries, trust the ZIP and
