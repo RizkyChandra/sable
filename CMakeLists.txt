@@ -148,7 +148,8 @@ add_library(engine STATIC
   engine/src/openraster.cpp
   engine/src/xml.cpp
   engine/src/psd.cpp
-  engine/src/text.cpp)
+  engine/src/text.cpp
+  engine/src/linework.cpp)
 target_include_directories(engine PUBLIC engine/include)
 target_link_libraries(engine PRIVATE lodepng miniz nlohmann_json stb_truetype)
 target_compile_options(engine PRIVATE ${SABLE_WARNINGS})

@@ -30,6 +30,7 @@
 #include "sbl/format.hpp"
 #include "sbl/gpu.hpp"
 #include "sbl/io.hpp"
+#include "sbl/linework.hpp"
 #include "sbl/paint.hpp"
 #include "sbl/project.hpp"
 #include "sbl/select.hpp"
@@ -2419,7 +2420,7 @@ TEST_CASE("files from before the version bumps still open") {
     // A v1 document is a v2 one with no vanishing_points, and a v2 one is a v3
     // with no selection. Everything each bump added is optional, so no bump may
     // cost an existing file its contents.
-    for (const int version : {1, 2}) {
+    for (const int version : {1, 2, 3, 4}) {
         Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
         const auto path = scratchFile("sable_old.sable");
         REQUIRE(saveProject(doc, path).has_value());
@@ -4800,4 +4801,320 @@ TEST_CASE("a CJK glyph rasterises, where the machine has a font carrying one") {
         return;
     }
     MESSAGE("no font here carries CJK; rasterising not exercised");
+}
+
+// ----------------------------------------------------------------------------
+// Linework (#17)
+//
+// The same bargain D-026 struck for text, and for the same reason: the curves
+// rasterise into ordinary tiles, so `compositeRect` gained no case and there is
+// no second, screen-only path for #1 to come back through. Everything here is
+// checkable without a font or a window, which is why none of it is conditional.
+
+namespace {
+
+/// A straight two-point stroke across the middle of a 128 px canvas.
+LineStroke horizontalStroke(float pressureA = 1.0f, float pressureB = 1.0f) {
+    LineStroke stroke;
+    stroke.width         = 12.0f;
+    stroke.minWidthRatio = 0.2f;
+    stroke.colour        = StraightRgba8{0, 0, 0, 255};
+    stroke.points.push_back(LinePoint{16.0, 64.0, pressureA});
+    stroke.points.push_back(LinePoint{112.0, 64.0, pressureB});
+    return stroke;
+}
+
+/// How many pixels of one column are inked — the line's thickness there.
+int columnThickness(const Layer& layer, std::int32_t x, std::int32_t height) {
+    int n = 0;
+    for (std::int32_t y = 0; y < height; ++y) {
+        const TileKey key{tileIndex(x), tileIndex(y)};
+        const Tile* tile = layer.find(key);
+        if (tile == nullptr) continue;
+        if (tile->pixel(x - key.first * TILE_SIZE, y - key.second * TILE_SIZE).a > 0) ++n;
+    }
+    return n;
+}
+
+Document lineworkDocument(const LineworkContent& content) {
+    Document doc = makeDocument(128, 128, StraightRgba8{0, 0, 0, 0});
+    doc.layers[0].linework = content;
+    doc.layers[0].kind     = LayerKind::Linework;
+    return doc;
+}
+
+}  // namespace
+
+TEST_CASE("a linework curve rasterises into ordinary tiles") {
+    LineworkContent content;
+    content.strokes.push_back(horizontalStroke());
+    Document doc = lineworkDocument(content);
+
+    UndoRecord rec = drawLineworkLayer(doc.layers[0], content, doc.width, doc.height);
+    CHECK(!doc.layers[0].tiles.empty());
+    CHECK(inkedPixels(doc) > 0);
+
+    // On the line, and off it. A 6 px half-width at full pressure puts the edge
+    // well clear of both.
+    CHECK(pickColour(doc, 64, 64).a == 255);
+    CHECK(pickColour(doc, 64, 20).a == 0);
+
+    // Undo takes every pixel back, including the tiles that did not exist
+    // before — the record has to carry those as "was absent", or a redrawn
+    // layer accumulates tiles nothing ever removes.
+    doc.undo.push(std::move(rec));
+    doc.undo.undo(doc);
+    CHECK(inkedPixels(doc) == 0);
+    CHECK(doc.layers[0].tiles.empty());
+}
+
+TEST_CASE("pressure varies the line's width along the curve") {
+    // A linework layer is only worth having if the line tapers. Full pressure
+    // at the left end, none at the right.
+    LineworkContent content;
+    content.strokes.push_back(horizontalStroke(1.0f, 0.0f));
+    Document doc = lineworkDocument(content);
+    (void)drawLineworkLayer(doc.layers[0], content, doc.width, doc.height);
+
+    const int thick = columnThickness(doc.layers[0], 24, doc.height);
+    const int thin  = columnThickness(doc.layers[0], 104, doc.height);
+    CHECK(thick > thin);
+    // minWidthRatio 0.2 of a 12 px width is 2.4 px against 12 at the other end
+    // — a taper, not a rounding difference.
+    CHECK(thick >= 10);
+    CHECK(thin  <= 6);
+
+    // And it is the pressure doing it, not the position: the same stroke at one
+    // pressure throughout is the same width at both ends.
+    LineworkContent even;
+    even.strokes.push_back(horizontalStroke(1.0f, 1.0f));
+    Document flat = lineworkDocument(even);
+    (void)drawLineworkLayer(flat.layers[0], even, flat.width, flat.height);
+    CHECK(columnThickness(flat.layers[0], 24, flat.height) ==
+          columnThickness(flat.layers[0], 104, flat.height));
+}
+
+TEST_CASE("a control point moves, and the line moves with it") {
+    LineworkContent content;
+    content.strokes.push_back(horizontalStroke());
+    Document doc = lineworkDocument(content);
+    (void)drawLineworkLayer(doc.layers[0], content, doc.width, doc.height);
+    CHECK(pickColour(doc, 100, 64).a == 255);
+    CHECK(pickColour(doc, 100, 100).a == 0);
+
+    // The point the artist would have grabbed, then dragged.
+    const std::optional<PointRef> grabbed = nearestPoint(content, 110.0, 66.0, 8.0);
+    REQUIRE(grabbed.has_value());
+    CHECK(grabbed->point == 1);
+    content.strokes[grabbed->stroke].points[grabbed->point].y = 100.0;
+
+    (void)drawLineworkLayer(doc.layers[0], content, doc.width, doc.height);
+    CHECK(pickColour(doc, 100, 100).a > 0);
+    CHECK(pickColour(doc, 100, 64).a == 0);
+
+    // Nothing within reach is nothing, not the nearest point on the canvas.
+    CHECK(!nearestPoint(content, 5.0, 5.0, 8.0).has_value());
+}
+
+TEST_CASE("a control point is added on the curve and deleted off it") {
+    LineworkContent content;
+    content.strokes.push_back(horizontalStroke());
+
+    // Added ON the line, not at the click: a new point that moved the curve
+    // before it had been dragged would be one the artist has to undo.
+    const std::optional<PointRef> added = insertPoint(content, 64.0, 66.0, 8.0);
+    REQUIRE(added.has_value());
+    CHECK(added->point == 1);
+    REQUIRE(content.strokes[0].points.size() == 3);
+    CHECK(content.strokes[0].points[1].x == doctest::Approx(64.0).epsilon(0.05));
+    CHECK(content.strokes[0].points[1].y == doctest::Approx(64.0).epsilon(0.05));
+
+    // A click nowhere near the curve adds nothing.
+    CHECK(!insertPoint(content, 10.0, 10.0, 4.0).has_value());
+    CHECK(content.strokes[0].points.size() == 3);
+
+    CHECK(erasePoint(content, PointRef{0, 1}));
+    CHECK(content.strokes[0].points.size() == 2);
+
+    // Down to one point there is no curve left, so the stroke goes with it — a
+    // dot the artist cannot see the shape of is one they cannot get rid of.
+    CHECK(erasePoint(content, PointRef{0, 0}));
+    CHECK(content.strokes.empty());
+    CHECK(!erasePoint(content, PointRef{0, 0}));      // and asking again is safe
+}
+
+TEST_CASE("linework composites for the screen exactly as it does for the export") {
+    // #1 again. The proof is that turning the layer into a plain raster one
+    // changes nothing: the compositor never knew the difference.
+    LineworkContent content;
+    content.strokes.push_back(horizontalStroke(1.0f, 0.3f));
+    content.strokes.back().colour = StraightRgba8{20, 40, 200, 180};
+    Document doc = lineworkDocument(content);
+    doc.background = StraightRgba8{255, 255, 255, 255};
+    (void)drawLineworkLayer(doc.layers[0], content, doc.width, doc.height);
+
+    const std::vector<StraightRgba8> exported = flatten(doc);
+    const std::vector<PremulRgba8> onScreen =
+        compositeRect(doc, 0, 0, doc.width, doc.height);
+    REQUIRE(exported.size() == onScreen.size());
+    for (std::size_t i = 0; i < exported.size(); ++i)
+        REQUIRE(exported[i] == onScreen[i].unpremultiply());
+
+    const std::uint64_t asLinework = hashCanvas(doc);
+    doc.layers[0].linework.reset();
+    doc.layers[0].kind = LayerKind::Raster;
+    CHECK(hashCanvas(doc) == asLinework);
+}
+
+TEST_CASE("a line that doubles back over itself is not drawn darker") {
+    // The difference between a drawn line and a painted one. A curve that comes
+    // back over its own path, or simply slows down, must come out one line —
+    // which is why the rasteriser accumulates coverage with max rather than
+    // blending stamp over stamp.
+    LineworkContent content;
+    LineStroke stroke = horizontalStroke();
+    stroke.colour = StraightRgba8{0, 0, 0, 100};      // semi-transparent
+    content.strokes.push_back(stroke);
+    Document doc = lineworkDocument(content);
+    (void)drawLineworkLayer(doc.layers[0], content, doc.width, doc.height);
+    const StraightRgba8 once = pickColour(doc, 64, 64);
+    CHECK(once.a > 0);
+
+    // The same line, made to pass over its own middle a second time.
+    content.strokes[0].points.insert(content.strokes[0].points.begin() + 1,
+                                     LinePoint{80.0, 64.0, 1.0f});
+    content.strokes[0].points.insert(content.strokes[0].points.begin() + 2,
+                                     LinePoint{40.0, 64.0, 1.0f});
+    (void)drawLineworkLayer(doc.layers[0], content, doc.width, doc.height);
+    CHECK(pickColour(doc, 64, 64).a == once.a);
+}
+
+TEST_CASE("a linework layer refuses paint, like a text layer does") {
+    // The protection is free: applyDab, bucketFill, fillSelection,
+    // transformRegion and mergeLayerDown all already refuse anything that is
+    // not Raster, so a curve cannot be lost to a stroke the next redraw wipes.
+    LineworkContent content;
+    content.strokes.push_back(horizontalStroke());
+    Document doc = lineworkDocument(content);
+
+    UndoRecord rec;
+    TouchedTiles touched;
+    PaintTarget target{doc.layers[0], rec, touched, doc.width, doc.height};
+    Dab dab;
+    dab.x        = 64.0;
+    dab.y        = 64.0;
+    dab.radius   = 10.0f;
+    dab.hardness = 1.0f;
+    dab.colour   = StraightRgba8{255, 0, 0, 255}.premultiply();
+    applyDab(target, dab);
+    CHECK(doc.layers[0].tiles.empty());
+
+    CHECK(bucketFill(doc, doc.layers[0].id, 64, 64,
+                     StraightRgba8{255, 0, 0, 255}, 8).empty());
+}
+
+TEST_CASE("a linework layer round-trips through .sable") {
+    LineworkContent content;
+    LineStroke curve;
+    curve.width         = 9.25f;
+    curve.minWidthRatio = 0.35f;
+    curve.colour        = StraightRgba8{12, 34, 56, 210};
+    curve.points.push_back(LinePoint{10.5, 20.25, 0.25f});
+    curve.points.push_back(LinePoint{60.0, 90.0, 1.0f});
+    curve.points.push_back(LinePoint{100.75, 30.5, 0.5f});
+    content.strokes.push_back(curve);
+
+    Document doc = lineworkDocument(content);
+    (void)drawLineworkLayer(doc.layers[0], content, doc.width, doc.height);
+    const std::uint64_t before = hashCanvas(doc);
+    REQUIRE(!doc.layers[0].tiles.empty());
+
+    const auto path = scratchFile("sable_linework.sable");
+    REQUIRE(saveProject(doc, path).has_value());
+
+    const auto reloaded = loadProject(path);
+    REQUIRE(reloaded.has_value());
+    REQUIRE(reloaded->layers.size() == 1);
+    const Layer& back = reloaded->layers[0];
+    CHECK(back.kind == LayerKind::Linework);
+    REQUIRE(back.linework.has_value());
+    REQUIRE(back.linework->strokes.size() == 1);
+
+    const LineStroke& out = back.linework->strokes[0];
+    CHECK(out.colour == curve.colour);
+    CHECK(out.width == doctest::Approx(curve.width));
+    CHECK(out.minWidthRatio == doctest::Approx(curve.minWidthRatio));
+    REQUIRE(out.points.size() == curve.points.size());
+    for (std::size_t i = 0; i < out.points.size(); ++i) {
+        CHECK(out.points[i].x == doctest::Approx(curve.points[i].x));
+        CHECK(out.points[i].y == doctest::Approx(curve.points[i].y));
+        CHECK(out.points[i].pressure == doctest::Approx(curve.points[i].pressure));
+    }
+    // The pixels are what renders, so they have to survive too — a reader that
+    // ignored the curves would still see the finished line art.
+    CHECK(hashCanvas(*reloaded) == before);
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("a linework layer survives the clone the autosave thread is handed") {
+    LineworkContent content;
+    content.strokes.push_back(horizontalStroke());
+    Document doc = lineworkDocument(content);
+
+    const Document copy = cloneDocument(doc);
+    CHECK(copy.layers[0].kind == LayerKind::Linework);
+    REQUIRE(copy.layers[0].linework.has_value());
+    CHECK(*copy.layers[0].linework == content);
+}
+
+TEST_CASE("rasterising linework gives up the curves and keeps the picture") {
+    LineworkContent content;
+    content.strokes.push_back(horizontalStroke());
+    Document doc = lineworkDocument(content);
+    (void)drawLineworkLayer(doc.layers[0], content, doc.width, doc.height);
+    const std::uint64_t drawn  = hashCanvas(doc);
+    const std::size_t   tiles  = doc.layers[0].tiles.size();
+
+    LayerProps props = propsOf(doc.layers[0]);
+    props.linework.reset();
+    doc.undo.push(setLayerProps(doc, doc.layers[0].id, props));
+    CHECK(doc.layers[0].kind == LayerKind::Raster);   // paint is allowed again
+    CHECK(!doc.layers[0].linework.has_value());
+    CHECK(doc.layers[0].tiles.size() == tiles);       // the picture stayed
+    CHECK(hashCanvas(doc) == drawn);
+
+    doc.undo.undo(doc);
+    CHECK(doc.layers[0].kind == LayerKind::Linework);
+    REQUIRE(doc.layers[0].linework.has_value());
+    CHECK(*doc.layers[0].linework == content);
+}
+
+TEST_CASE("linework off the canvas allocates nothing") {
+    LineworkContent content;
+    LineStroke away;
+    away.points.push_back(LinePoint{-4000.0, -4000.0, 1.0f});
+    away.points.push_back(LinePoint{-3000.0, -3900.0, 1.0f});
+    content.strokes.push_back(away);
+
+    Document doc = lineworkDocument(content);
+    (void)drawLineworkLayer(doc.layers[0], content, doc.width, doc.height);
+    CHECK(doc.layers[0].tiles.empty());
+}
+
+TEST_CASE("a curve through unevenly spaced points does not loop") {
+    // Uniform Catmull-Rom answers uneven spacing with a loop, and pen input is
+    // never evenly spaced. Centripetal is what keeps the line where the artist
+    // put it — checked by asking that no sample leave the box the control
+    // points sit in, which a loop or an overshoot does.
+    LineStroke stroke;
+    stroke.points.push_back(LinePoint{10.0, 100.0, 1.0f});
+    stroke.points.push_back(LinePoint{11.0, 100.0, 1.0f});    // very close
+    stroke.points.push_back(LinePoint{200.0, 100.0, 1.0f});   // then far away
+    stroke.points.push_back(LinePoint{201.0, 100.0, 1.0f});
+
+    for (const LinePoint& at : samplePoints(stroke, 1.0)) {
+        CHECK(at.x >= 9.5);
+        CHECK(at.x <= 201.5);
+        CHECK(at.y == doctest::Approx(100.0).epsilon(0.001));
+    }
 }

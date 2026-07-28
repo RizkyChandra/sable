@@ -455,7 +455,7 @@ Document cloneDocument(const Document& doc) {
 LayerProps propsOf(const Layer& layer) {
     return LayerProps{layer.name, layer.opacity, layer.blend, layer.visible,
                       layer.locked, layer.preserveOpacity, layer.clipToBelow,
-                      layer.parent, layer.text};
+                      layer.parent, layer.text, layer.linework};
 }
 
 void applyProps(Layer& layer, const LayerProps& props) {
@@ -468,12 +468,17 @@ void applyProps(Layer& layer, const LayerProps& props) {
     layer.clipToBelow     = props.clipToBelow;
     layer.parent          = props.parent;
     layer.text            = props.text;
-    // Kind follows the text, in one place, so the two can never disagree: a
-    // layer with words in it is a text layer and refuses paint, and undoing a
-    // "rasterise" gives back that protection along with the words. Folders are
-    // left alone — a folder has no pixels of its own to protect.
+    layer.linework        = props.linework;
+    // Kind follows the source, in one place, so the two can never disagree: a
+    // layer with words or curves in it is a text or linework layer and refuses
+    // paint, and undoing a "rasterise" gives back that protection along with
+    // the source. Folders are left alone — a folder has no pixels of its own to
+    // protect. Text wins if a caller somehow sets both; a layer is one or the
+    // other, and this is the one place that has to decide.
     if (layer.text.has_value())              layer.kind = LayerKind::Text;
-    else if (layer.kind == LayerKind::Text)  layer.kind = LayerKind::Raster;
+    else if (layer.linework.has_value())     layer.kind = LayerKind::Linework;
+    else if (layer.kind == LayerKind::Text ||
+             layer.kind == LayerKind::Linework) layer.kind = LayerKind::Raster;
 }
 
 namespace {
