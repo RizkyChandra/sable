@@ -25,9 +25,9 @@
 #include "sbl/paint.hpp"
 #include "sbl/project.hpp"
 
+#include "lodepng.h"
 // App-side, but deliberately SDL-free so the view transform is testable here.
 #include "view_transform.hpp"
-
 #include "miniz.h"
 #include "miniz_zip.h"
 #include "nlohmann/json.hpp"
@@ -2888,6 +2888,206 @@ TEST_CASE("a failed write returns an error rather than terminating") {
     REQUIRE(!result.has_value());
     CHECK(!result.error().detail.empty());
     CHECK(!describe(result.error().kind).empty());
+}
+
+// ------------------------------------------------------------ OpenRaster (#8)
+
+namespace {
+
+std::filesystem::path fixture(const char* name) {
+    return std::filesystem::path(SABLE_FIXTURE_DIR) / name;
+}
+
+const Layer* byName(const Document& doc, std::string_view name) {
+    for (const Layer& layer : doc.layers)
+        if (layer.name == name) return &layer;
+    return nullptr;
+}
+
+/// A stack with everything ORA has to carry: a group, a nested child, blend
+/// modes on both, fractional opacity and a hidden layer.
+Document oraSampleDocument() {
+    Document doc = makeDocument(300, 200, StraightRgba8{250, 245, 235, 255});
+    doc.layerById(doc.activeLayer)->name = "Base";
+    paintSquare(doc, doc.activeLayer, StraightRgba8{200, 30, 40, 255}, 60.0, 60.0);
+
+    doc.undo.push(addLayerAbove(doc, doc.activeLayer, "Group"));
+    const LayerId group = doc.activeLayer;
+    doc.layerById(group)->kind    = LayerKind::Folder;
+    doc.layerById(group)->opacity = 0.7f;
+    doc.layerById(group)->blend   = BlendMode::Screen;
+
+    doc.undo.push(addLayerAbove(doc, group, "Hidden"));
+    doc.layerById(doc.activeLayer)->visible = false;
+    paintSquare(doc, doc.activeLayer, StraightRgba8{0, 0, 0, 255}, 250.0, 150.0);
+
+    doc.undo.push(addLayerAbove(doc, group, "Inside"));
+    const LayerId inside = doc.activeLayer;
+    doc.layerById(inside)->parent  = group;
+    doc.layerById(inside)->blend   = BlendMode::ColourDodge;
+    doc.layerById(inside)->opacity = 0.35f;
+    paintSquare(doc, inside, StraightRgba8{20, 90, 200, 255}, 120.0, 90.0);
+    return doc;
+}
+
+}  // namespace
+
+TEST_CASE("a document round-trips through .ora") {
+    const Document doc = oraSampleDocument();
+    const std::uint64_t before = hashCanvas(doc);
+
+    const auto path = scratchFile("roundtrip.ora");
+    REQUIRE(exportDocument(doc, path).has_value());
+
+    const auto loaded = importDocument(path);
+    REQUIRE(loaded.has_value());
+    // An import is a copy of someone else's file, never the document (D-024).
+    CHECK(loaded->path.empty());
+    CHECK(loaded->width == doc.width);
+    CHECK(loaded->height == doc.height);
+    CHECK(hashCanvas(*loaded) == before);
+    REQUIRE(loaded->layers.size() == doc.layers.size());
+
+    // Compared by name, not by index: ORA nests a folder's children while
+    // Sable's vector is flat, so the two orders need not agree for the two
+    // stacks to be the same stack.
+    for (const Layer& original : doc.layers) {
+        const Layer* same = byName(*loaded, original.name);
+        REQUIRE(same != nullptr);
+        CHECK(same->kind == original.kind);
+        CHECK(same->visible == original.visible);
+        CHECK(same->blend == original.blend);
+        CHECK(same->opacity == doctest::Approx(original.opacity));
+    }
+    const Layer* group  = byName(*loaded, "Group");
+    const Layer* inside = byName(*loaded, "Inside");
+    const Layer* hidden = byName(*loaded, "Hidden");
+    REQUIRE(group != nullptr);
+    REQUIRE(inside != nullptr);
+    REQUIRE(hidden != nullptr);
+    CHECK(inside->parent == group->id);
+    CHECK(!hidden->parent.has_value());
+
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("an exported .ora carries a mergedimage that is exactly flatten()") {
+    const Document doc = oraSampleDocument();
+    const auto path = scratchFile("merged.ora");
+    REQUIRE(exportDocument(doc, path).has_value());
+
+    mz_zip_archive zip{};
+    REQUIRE(mz_zip_reader_init_file(&zip, path.string().c_str(), 0));
+    std::size_t size = 0;
+    void* data = mz_zip_reader_extract_file_to_heap(&zip, "mergedimage.png", &size, 0);
+    REQUIRE(data != nullptr);
+
+    std::vector<unsigned char> decoded;
+    unsigned w = 0, h = 0;
+    const unsigned failed =
+        lodepng::decode(decoded, w, h, static_cast<const unsigned char*>(data), size);
+    mz_free(data);
+    mz_zip_reader_end(&zip);
+    REQUIRE(failed == 0);
+
+    CHECK(w == static_cast<unsigned>(doc.width));
+    CHECK(h == static_cast<unsigned>(doc.height));
+    const std::vector<StraightRgba8> expected = flatten(doc);
+    REQUIRE(decoded.size() == expected.size() * 4);
+    bool identical = true;
+    for (std::size_t i = 0; i < expected.size(); ++i)
+        identical = identical && decoded[i * 4 + 0] == expected[i].r &&
+                    decoded[i * 4 + 1] == expected[i].g &&
+                    decoded[i * 4 + 2] == expected[i].b &&
+                    decoded[i * 4 + 3] == expected[i].a;
+    CHECK(identical);
+
+    // The spec's other required entries, which are what other applications
+    // look for before they parse anything.
+    CHECK(hasZipEntry(path, "mimetype"));
+    CHECK(hasZipEntry(path, "stack.xml"));
+    CHECK(hasZipEntry(path, "Thumbnails/thumbnail.png"));
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("a .ora written by Krita imports with its stack intact") {
+    // tests/fixtures/krita.ora was exported by Krita 6.0.3, not by Sable.
+    const auto doc = importDocument(fixture("krita.ora"));
+    REQUIRE(doc.has_value());
+    CHECK(doc->path.empty());
+    CHECK(doc->width == 64);
+    CHECK(doc->height == 48);
+    // Base, Group, Inside, Top, Hidden, Fade — and the empty "Background"
+    // layer Krita puts at the bottom of every new document.
+    CHECK(doc->layers.size() == 7);
+
+    const Layer* group  = byName(*doc, "Group");
+    const Layer* inside = byName(*doc, "Inside");
+    const Layer* top    = byName(*doc, "Top");
+    const Layer* fade   = byName(*doc, "Fade");
+    const Layer* hidden = byName(*doc, "Hidden");
+    const Layer* base   = byName(*doc, "Base");
+    REQUIRE(group != nullptr);
+    REQUIRE(inside != nullptr);
+    REQUIRE(top != nullptr);
+    REQUIRE(fade != nullptr);
+    REQUIRE(hidden != nullptr);
+    REQUIRE(base != nullptr);
+
+    CHECK(group->kind == LayerKind::Folder);
+    CHECK(group->opacity == doctest::Approx(0.501961));
+    CHECK(inside->parent == group->id);
+    CHECK(inside->kind == LayerKind::Raster);
+    CHECK(top->blend == BlendMode::Multiply);       // svg:multiply
+    CHECK(top->opacity == doctest::Approx(0.6));
+    CHECK(hidden->visible == false);
+
+    // Pixels, not only metadata: "Base" is opaque red over the whole canvas,
+    // "Inside" an opaque blue square at (8, 8), and "Fade" half-alpha red at
+    // (0, 24) — which is where a wrong straight-to-premultiplied conversion
+    // would show up.
+    const Tile* baseTile = base->find(TileKey{0, 0});
+    REQUIRE(baseTile != nullptr);
+    CHECK(baseTile->pixel(2, 2) == PremulRgba8{255, 0, 0, 255});
+
+    const Tile* insideTile = inside->find(TileKey{0, 0});
+    REQUIRE(insideTile != nullptr);
+    CHECK(insideTile->pixel(16, 16) == PremulRgba8{0, 0, 255, 255});
+    CHECK(insideTile->pixel(2, 2) == PremulRgba8{0, 0, 0, 0});
+
+    const Tile* fadeTile = fade->find(TileKey{0, 0});
+    REQUIRE(fadeTile != nullptr);
+    CHECK(fadeTile->pixel(5, 30) == PremulRgba8{128, 0, 0, 128});
+
+    // ORA has no background of its own, so an imported image keeps its
+    // transparency rather than gaining a white sheet under it.
+    CHECK(doc->background.a == 0);
+}
+
+TEST_CASE("a misnamed .ora is still read as one") {
+    // .sable, .ora and .kra are all ZIPs; the mimetype and stack.xml entries
+    // are what the registry sniffs (D-024).
+    const auto path = scratchFile("misnamed_ora.sable");
+    std::filesystem::copy_file(fixture("krita.ora"), path);
+
+    const auto doc = importDocument(path);
+    REQUIRE(doc.has_value());
+    CHECK(doc->width == 64);
+    CHECK(doc->path.empty());
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("a malformed .ora fails with a message rather than a crash") {
+    const auto path = scratchFile("broken.ora");
+    { FILE* out = std::fopen(path.string().c_str(), "wb");
+      REQUIRE(out != nullptr);
+      std::fwrite("PK\x03\x04 and then rubbish", 1, 22, out);
+      std::fclose(out); }
+
+    const auto doc = importDocument(path);
+    REQUIRE(!doc.has_value());
+    CHECK(!doc.error().detail.empty());
+    std::filesystem::remove(path);
 }
 
 // -------------------------------------------------------------- paint backend
