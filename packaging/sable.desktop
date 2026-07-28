@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Sable
+GenericName=Painting Application
+Comment=Lightweight raster painting with pen pressure
+Exec=sable %f
+Icon=sable
+Terminal=false
+Categories=Graphics;2DGraphics;RasterGraphics;
+MimeType=application/x-sable-project;
+Keywords=paint;draw;art;illustration;sketch;tablet;stylus;
+StartupNotify=true
+StartupWMClass=Sable

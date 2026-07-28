@@ -1,0 +1,28 @@
+# Build trees. `build-appimage/` also holds a downloaded appimagetool.
+build/
+build-*/
+cmake-build-*/
+
+# CMake and tooling output
+compile_commands.json
+CMakeUserPresets.json
+.cache/
+
+# Packaging output
+AppDir/
+*.AppImage
+
+# Dear ImGui writes these beside the binary if the preference directory is
+# unavailable. Normally they live under $XDG_DATA_HOME/sable.
+imgui.ini
+layout.ini
+
+# Artists' documents. Nothing here should be committed by accident; use
+# `git add -f` if a sample project is genuinely wanted in the repository.
+*.sable
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~

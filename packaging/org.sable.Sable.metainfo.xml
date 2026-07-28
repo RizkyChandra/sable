@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.sable.Sable</id>
+  <name>Sable</name>
+  <summary>Lightweight raster painting with pen pressure</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+
+  <developer id="org.sable">
+    <name>The Sable contributors</name>
+  </developer>
+
+  <!-- REQUIRED BEFORE ANY PUBLIC RELEASE.
+       appstreamcli reports url-homepage-missing, and it is right to: a
+       painting application shipped to a software centre with no homepage
+       gives users nowhere to report a bug. It is left absent rather than
+       filled with a placeholder, because a URL that does not resolve is worse
+       than an honestly missing one. Add these once the project is hosted:
+
+       <url type="homepage">https://.../</url>
+       <url type="bugtracker">https://.../issues</url>
+       <url type="help">https://.../docs</url>
+  -->
+
+
+  <description>
+    <p>
+      Sable is a small raster painting application for Linux, aimed at artists
+      who want to open a program, sketch, and close it again. It starts in well
+      under a second, presents a small interface, and runs on ordinary hardware
+      with no discrete GPU.
+    </p>
+    <p>
+      Compositing happens on the CPU and the canvas is stored as sparse tiles,
+      so memory follows the painted area rather than the canvas size. The event
+      loop blocks when nobody is drawing, so an idle window costs nothing.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Graphics tablet support with adjustable pressure curves and a stabilizer</li>
+      <li>Layers with blend modes, clipping and groups</li>
+      <li>Pencil, opaque, airbrush, marker, watercolour and smudge brushes</li>
+      <li>Selection, bucket fill and transform</li>
+      <li>Projects saved as an inspectable ZIP of PNG tiles</li>
+      <li>Crash recovery that never overwrites your own files</li>
+      <li>Every action reachable from the keyboard, and every binding reassignable</li>
+    </ul>
+    <p>
+      Sable has no screen-reader support: its interface toolkit provides no
+      AT-SPI integration. Full keyboard operability and interface scaling are
+      offered in its place. This is a known limitation, recorded deliberately.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">sable.desktop</launchable>
+  <provides><binary>sable</binary></provides>
+  <categories>
+    <category>Graphics</category>
+    <category>2DGraphics</category>
+    <category>RasterGraphics</category>
+  </categories>
+
+  <supports><control>pointing</control><control>keyboard</control><control>tablet</control></supports>
+  <requires><display_length compare="ge">768</display_length></requires>
+
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-07-28">
+      <description><p>First release. Milestones 1 to 4.</p></description>
+    </release>
+  </releases>
+</component>

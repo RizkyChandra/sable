@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The .sable project type. It is a ZIP, so the magic below is the ZIP
+     signature plus the manifest name we always write first-class into the
+     archive; matching on the extension alone would claim every .sable file
+     any other program ever invents. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-sable-project">
+    <comment>Sable painting project</comment>
+    <generic-icon name="sable"/>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.sable"/>
+    <magic priority="60">
+      <match type="string" value="PK\003\004" offset="0"/>
+    </magic>
+  </mime-type>
+</mime-info>

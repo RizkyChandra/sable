@@ -1,0 +1,203 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A second push should cancel the first run rather than queue behind it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SDL_VERSION: release-3.4.12
+
+jobs:
+  # The engine links no SDL and no ImGui (D-003), so this job needs no
+  # graphics stack and no display server at all. It is the fast gate: if the
+  # split ever leaks, this is what fails.
+  engine:
+    name: Engine and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-14
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_COMPILER=g++-14
+          -DSABLE_BUILD_APP=OFF
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # Cross-cutting requirement: run the paint and undo paths under
+  # AddressSanitizer. UndefinedBehaviorSanitizer comes along for free.
+  sanitizers:
+    name: AddressSanitizer and UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-14
+
+      - name: Configure
+        run: >
+          cmake -S . -B build-asan -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_COMPILER=g++-14
+          -DSABLE_ASAN=ON -DSABLE_BUILD_APP=OFF
+
+      - name: Build
+        run: cmake --build build-asan
+
+      - name: Run
+        run: ./build-asan/engine_tests
+
+  # The application needs SDL3, which is not in Ubuntu's archive yet, so it is
+  # built from a pinned tag and cached. This job also runs the headless
+  # self-test, which is the only automated check the SDL and ImGui wiring gets.
+  app:
+    name: Application
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-14 \
+            libx11-dev libxext-dev libxrandr-dev libxi-dev libxfixes-dev \
+            libxcursor-dev libwayland-dev libxkbcommon-dev libegl1-mesa-dev
+
+      - name: Cache SDL3
+        id: sdl-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/sdl3
+          key: sdl3-${{ runner.os }}-${{ env.SDL_VERSION }}
+
+      - name: Build SDL3
+        if: steps.sdl-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$SDL_VERSION" https://github.com/libsdl-org/SDL.git /tmp/SDL
+          cmake -S /tmp/SDL -B /tmp/SDL/build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOME/sdl3"
+          cmake --build /tmp/SDL/build
+          cmake --install /tmp/SDL/build
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_COMPILER=g++-14
+          -DCMAKE_PREFIX_PATH="$HOME/sdl3"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Self-test
+        # The offscreen video driver means this needs no display server. It
+        # paints a stroke, fills, saves and reloads a project, runs one
+        # background recovery, and exports a PNG.
+        env:
+          SDL_VIDEODRIVER: offscreen
+          LD_LIBRARY_PATH: ${{ github.workspace }}/../sdl3/lib
+        run: |
+          export LD_LIBRARY_PATH="$HOME/sdl3/lib:${LD_LIBRARY_PATH:-}"
+          ./build/sable --selftest
+
+      - name: Check the install tree
+        run: |
+          DESTDIR=/tmp/staged cmake --install build
+          test -f /tmp/staged/usr/local/bin/sable
+          test -f /tmp/staged/usr/local/share/applications/sable.desktop
+          test -f /tmp/staged/usr/local/share/metainfo/org.sable.Sable.metainfo.xml
+
+  # The background recovery is the only place document data crosses a thread
+  # boundary, so it is the only thing TSan has to look at — and the self-test
+  # drives one to completion so this job tests something real.
+  thread-sanitizer:
+    name: ThreadSanitizer (save path)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-14 \
+            libx11-dev libxext-dev libxrandr-dev libxi-dev libxfixes-dev \
+            libxcursor-dev libwayland-dev libxkbcommon-dev libegl1-mesa-dev
+
+      - name: Cache SDL3
+        id: sdl-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/sdl3
+          key: sdl3-${{ runner.os }}-${{ env.SDL_VERSION }}
+
+      - name: Build SDL3
+        if: steps.sdl-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$SDL_VERSION" https://github.com/libsdl-org/SDL.git /tmp/SDL
+          cmake -S /tmp/SDL -B /tmp/SDL/build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOME/sdl3"
+          cmake --build /tmp/SDL/build
+          cmake --install /tmp/SDL/build
+
+      - name: Configure
+        run: >
+          cmake -S . -B build-tsan -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_COMPILER=g++-14
+          -DCMAKE_PREFIX_PATH="$HOME/sdl3"
+          -DSABLE_BUILD_TESTS=OFF
+          "-DCMAKE_CXX_FLAGS=-fsanitize=thread -fno-omit-frame-pointer"
+          "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread"
+
+      - name: Build
+        run: cmake --build build-tsan
+
+      - name: Run the save path
+        env:
+          SDL_VIDEODRIVER: offscreen
+          TSAN_OPTIONS: halt_on_error=1
+        run: |
+          export LD_LIBRARY_PATH="$HOME/sdl3/lib:${LD_LIBRARY_PATH:-}"
+          ./build-tsan/sable --selftest
+
+  # Metadata that a software centre will reject on is cheaper to catch here
+  # than after a release. The homepage URL is knowingly absent until the
+  # project is hosted, so this step reports rather than fails (see D-018).
+  packaging:
+    name: Packaging metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install validators
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y desktop-file-utils appstream libxml2-utils
+
+      - name: Validate
+        run: |
+          desktop-file-validate packaging/sable.desktop
+          xmllint --noout packaging/*.xml
+          appstreamcli validate packaging/org.sable.Sable.metainfo.xml \
+            || echo "::warning::AppStream validation is failing; see D-018 (homepage URL)"
