@@ -1,5 +1,9 @@
 // The canvas viewport: pan, zoom, and one streaming SDL_Texture per visible
 // tile. The GPU blits finished pixels; it never paints them (D-007).
+//
+// Each texture holds the whole layer stack composited for that tile, straight
+// from the engine — the same code the export goes through, because a renderer
+// with its own idea of blend modes is what shipped as #1.
 #pragma once
 
 #include <SDL3/SDL.h>
@@ -45,6 +49,11 @@ public:
     void markDirty(sbl::TileKey key);
     /// Marks every tile a dab covers, clipped to the canvas.
     void markDabArea(double x, double y, float radius, const sbl::Document& doc);
+    /// Queues every live tile for re-upload, keeping the textures themselves.
+    /// For changes that alter compositing rather than pixels — a layer's
+    /// opacity, blend mode or visibility — where releaseAll() would recreate
+    /// every texture on every frame of a slider drag.
+    void markAllDirty();
     /// Drops a tile's texture — used when undo erases the tile (US-04.8).
     void release(sbl::TileKey key);
     void releaseAll();
@@ -56,7 +65,7 @@ public:
     [[nodiscard]] std::size_t uploadCount() const noexcept { return uploads_; }
 
 private:
-    SDL_Texture* textureFor(sbl::TileKey key, const sbl::Tile& tile, bool nearest);
+    SDL_Texture* textureFor(sbl::TileKey key, const sbl::Document& doc, bool nearest);
 
     SDL_Renderer* renderer_ = nullptr;
     std::unordered_map<sbl::TileKey, SDL_Texture*, sbl::TileKeyHash> textures_;

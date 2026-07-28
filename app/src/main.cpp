@@ -1278,6 +1278,9 @@ void drawLayerPanel(App& app) {
                 ImGui::SetNextItemWidth(-1.0f);
                 if (ImGui::SliderFloat("##op", &opacity, 0.0f, 1.0f, "opacity %.2f")) {
                     layer.opacity = opacity;    // live while dragging...
+                    // Opacity is baked into the composited tiles now, so the
+                    // drag is only visible if they are rebuilt.
+                    app.canvas->markAllDirty();
                     app.doc.dirty = true;
                 }
                 // ...and one undo step when the drag ends, not one per frame.

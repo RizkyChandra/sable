@@ -879,6 +879,86 @@ TEST_CASE("pickColour and flatten agree pixel for pixel") {
                     full[static_cast<std::size_t>(y) * doc.width + x]);
 }
 
+TEST_CASE("the canvas display path agrees with flatten pixel for pixel") {
+    // The canvas view composites one tile at a time through compositeRect and
+    // blits the result; the export goes through flatten. v1.0.0 shipped with
+    // the renderer applying nothing but layer opacity, so a Multiply layer
+    // drew as Normal and exported as Multiply (#1). Any inequality below is
+    // that bug returning — including an offset bug that only shows up on the
+    // tiles that are not the first one.
+    Document doc = makeDocument(300, 300, StraightRgba8{200, 210, 220, 160});
+    const LayerId base = doc.activeLayer;
+    paintSquare(doc, base, StraightRgba8{255, 0, 0, 255}, 40.0, 40.0);
+    paintSquare(doc, base, StraightRgba8{255, 0, 0, 255}, 256.0, 256.0);   // over a tile seam
+
+    doc.undo.push(addLayerAbove(doc, base, "Multiply"));
+    const LayerId mul = doc.activeLayer;
+    paintSquare(doc, mul, StraightRgba8{0, 0, 255, 255}, 60.0, 40.0);
+    paintSquare(doc, mul, StraightRgba8{0, 0, 255, 255}, 250.0, 256.0);
+    doc.layerById(mul)->blend   = BlendMode::Multiply;
+    doc.layerById(mul)->opacity = 0.55f;
+
+    doc.undo.push(addLayerAbove(doc, mul, "Clipped"));
+    const LayerId clip = doc.activeLayer;
+    paintSquare(doc, clip, StraightRgba8{0, 255, 0, 255}, 70.0, 40.0);
+    paintSquare(doc, clip, StraightRgba8{0, 255, 0, 255}, 256.0, 250.0);
+    doc.layerById(clip)->clipToBelow = true;
+
+    doc.undo.push(addLayerAbove(doc, clip, "Group"));
+    const LayerId group = doc.activeLayer;
+    doc.layerById(group)->kind    = LayerKind::Folder;
+    doc.layerById(group)->opacity = 0.6f;
+    doc.undo.push(addLayerAbove(doc, group, "In group, lower"));
+    doc.layerById(doc.activeLayer)->parent = group;
+    paintSquare(doc, doc.activeLayer, StraightRgba8{255, 200, 0, 255}, 140.0, 140.0);
+    doc.undo.push(addLayerAbove(doc, doc.activeLayer, "In group, upper"));
+    doc.layerById(doc.activeLayer)->parent = group;
+    paintSquare(doc, doc.activeLayer, StraightRgba8{0, 200, 255, 255}, 150.0, 150.0);
+
+    doc.undo.push(addLayerAbove(doc, group, "Hidden"));
+    const LayerId hidden = doc.activeLayer;
+    doc.layerById(hidden)->visible = false;
+    for (double y = 20.0; y < 300.0; y += 20.0)
+        paintSquare(doc, hidden, StraightRgba8{0, 0, 0, 255}, 150.0, y);
+
+    const std::vector<StraightRgba8> exported = flatten(doc);
+    REQUIRE(exported.size() == static_cast<std::size_t>(doc.width) * doc.height);
+
+    // The document has to actually exercise the rules, or equality is vacuous.
+    doc.layerById(mul)->blend = BlendMode::Normal;
+    REQUIRE(flatten(doc) != exported);
+    doc.layerById(mul)->blend = BlendMode::Multiply;
+
+    // Rasterise the display path the way CanvasView does it: one composited
+    // tile per texture, assembled into the canvas.
+    std::vector<StraightRgba8> screen(exported.size());
+    for (std::int32_t ty = 0; ty <= tileIndex(doc.height - 1); ++ty) {
+        for (std::int32_t tx = 0; tx <= tileIndex(doc.width - 1); ++tx) {
+            const std::vector<PremulRgba8> tile =
+                compositeRect(doc, tx * TILE_SIZE, ty * TILE_SIZE, TILE_SIZE, TILE_SIZE);
+            REQUIRE(tile.size() == static_cast<std::size_t>(TILE_PIXELS));
+            for (std::int32_t y = 0; y < TILE_SIZE; ++y) {
+                const std::int32_t cy = ty * TILE_SIZE + y;
+                if (cy >= doc.height) break;
+                for (std::int32_t x = 0; x < TILE_SIZE; ++x) {
+                    const std::int32_t cx = tx * TILE_SIZE + x;
+                    if (cx >= doc.width) break;
+                    screen[static_cast<std::size_t>(cy) * doc.width + cx] =
+                        tile[static_cast<std::size_t>(y) * TILE_SIZE + x].unpremultiply();
+                }
+            }
+        }
+    }
+
+    for (std::int32_t y = 0; y < doc.height; ++y) {
+        for (std::int32_t x = 0; x < doc.width; ++x) {
+            const auto at = static_cast<std::size_t>(y) * doc.width + x;
+            REQUIRE(screen[at] == exported[at]);      // screen == export (#1)
+            REQUIRE(pickColour(doc, x, y) == exported[at]);   // and Alt+click == both
+        }
+    }
+}
+
 TEST_CASE("a folder's opacity applies to the group, not to each child") {
     // The whole reason groups exist. Two overlapping opaque children at 50%
     // group opacity must show the group half-transparent — NOT each child

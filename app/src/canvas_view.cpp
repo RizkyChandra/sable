@@ -4,6 +4,8 @@
 #include <cmath>
 #include <vector>
 
+#include "sbl/io.hpp"
+
 namespace {
 
 constexpr float kMinZoom = 0.1f;    // US-05.3: at least 10% - 800%
@@ -68,6 +70,10 @@ void CanvasView::markDabArea(double x, double y, float radius,
             dirty_.insert(sbl::TileKey{tx, ty});
 }
 
+void CanvasView::markAllDirty() {
+    for (const auto& [key, tex] : textures_) dirty_.insert(key);
+}
+
 void CanvasView::release(sbl::TileKey key) {
     if (const auto it = textures_.find(key); it != textures_.end()) {
         SDL_DestroyTexture(it->second);
@@ -82,7 +88,7 @@ void CanvasView::releaseAll() {
     dirty_.clear();
 }
 
-SDL_Texture* CanvasView::textureFor(sbl::TileKey key, const sbl::Tile& tile,
+SDL_Texture* CanvasView::textureFor(sbl::TileKey key, const sbl::Document& doc,
                                     bool nearest) {
     auto it = textures_.find(key);
     bool fresh = false;
@@ -100,7 +106,14 @@ SDL_Texture* CanvasView::textureFor(sbl::TileKey key, const sbl::Tile& tile,
     }
 
     if (fresh || dirty_.contains(key)) {
-        SDL_UpdateTexture(it->second, nullptr, tile.pixels(), sbl::TILE_SIZE * 4);
+        // The engine composites, the GPU blits (D-007). Going through
+        // compositeRect is what makes the screen agree with the export: blend
+        // modes, clipping groups and folders all live in there, and a second
+        // implementation in this file would drift from it (#1).
+        const std::vector<sbl::PremulRgba8> px = sbl::compositeRect(
+            doc, key.first * sbl::TILE_SIZE, key.second * sbl::TILE_SIZE,
+            sbl::TILE_SIZE, sbl::TILE_SIZE);
+        SDL_UpdateTexture(it->second, nullptr, px.data(), sbl::TILE_SIZE * 4);
         dirty_.erase(key);
         ++uploads_;
     }
@@ -118,33 +131,34 @@ void CanvasView::render(const sbl::Document& doc, const View& view,
 
     const SDL_FRect canvas = canvasRectOnScreen(doc, view);
 
-    // The document background, drawn once. Tiles blend on top of it, so a
-    // never-painted tile costs nothing at all.
-    SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderDrawColor(renderer_, doc.background.r, doc.background.g,
-                           doc.background.b, doc.background.a);
-    SDL_RenderFillRect(renderer_, &canvas);
-
+    // No separate background fill: the background is the bottom of the
+    // composite, and drawing it twice would double-blend a transparent canvas.
     const bool nearest = view.zoom >= 1.0f;
     std::vector<sbl::TileKey> visible;
 
-    for (const sbl::Layer& layer : doc.layers) {
-        if (!layer.visible || layer.kind != sbl::LayerKind::Raster) continue;
-        for (const auto& [key, tile] : layer.tiles) {
-            SDL_FRect dst{
-                static_cast<float>(view.panX + key.first  * sbl::TILE_SIZE * view.zoom),
-                static_cast<float>(view.panY + key.second * sbl::TILE_SIZE * view.zoom),
-                sbl::TILE_SIZE * view.zoom,
-                sbl::TILE_SIZE * view.zoom,
+    // Every tile of the canvas, not every tile of every layer — one composited
+    // tile now stands for the whole stack.
+    for (std::int32_t ty = 0; ty <= sbl::tileIndex(doc.height - 1); ++ty) {
+        for (std::int32_t tx = 0; tx <= sbl::tileIndex(doc.width - 1); ++tx) {
+            const sbl::TileKey key{tx, ty};
+            // Clipped to the canvas, so an edge tile does not blit its
+            // transparent padding over the outline.
+            const SDL_FRect src{
+                0.0f, 0.0f,
+                static_cast<float>(std::min(sbl::TILE_SIZE, doc.width  - tx * sbl::TILE_SIZE)),
+                static_cast<float>(std::min(sbl::TILE_SIZE, doc.height - ty * sbl::TILE_SIZE)),
+            };
+            const SDL_FRect dst{
+                static_cast<float>(view.panX + tx * sbl::TILE_SIZE * view.zoom),
+                static_cast<float>(view.panY + ty * sbl::TILE_SIZE * view.zoom),
+                src.w * view.zoom,
+                src.h * view.zoom,
             };
             if (!SDL_HasRectIntersectionFloat(&dst, &viewport)) continue;
 
             visible.push_back(key);
-            if (SDL_Texture* tex = textureFor(key, tile, nearest); tex != nullptr) {
-                const float alpha = std::clamp(layer.opacity, 0.0f, 1.0f);
-                SDL_SetTextureAlphaModFloat(tex, alpha);
-                SDL_RenderTexture(renderer_, tex, nullptr, &dst);
-            }
+            if (SDL_Texture* tex = textureFor(key, doc, nearest); tex != nullptr)
+                SDL_RenderTexture(renderer_, tex, &src, &dst);
         }
     }
 
@@ -161,6 +175,7 @@ void CanvasView::render(const sbl::Document& doc, const View& view,
     }
 
     // A one-pixel outline, so a transparent canvas still has visible bounds.
+    SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(renderer_, 90, 90, 96, 255);
     SDL_RenderRect(renderer_, &canvas);
     SDL_SetRenderClipRect(renderer_, nullptr);

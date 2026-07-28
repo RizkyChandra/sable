@@ -37,13 +37,22 @@ std::vector<const Layer*> levelOf(const Document& doc, std::optional<LayerId> pa
     return out;
 }
 
+/// The rectangle of canvas a buffer covers: the whole document for flatten(),
+/// a single tile for the canvas view. Buffer pixel 0 is canvas pixel (x, y).
+struct Region {
+    std::int32_t x = 0, y = 0;
+    std::size_t  w = 0, h = 0;
+};
+
 /// Composites one level into `buf`, which is already premultiplied.
 ///
 /// A folder composites its children into a transparent scratch buffer first,
 /// then blends that as a single unit — which is the whole point of a group:
 /// its opacity and blend mode apply to the result, not to each child.
 void compositeLevel(std::vector<PremulRgba8>& buf, const Document& doc,
-                    std::optional<LayerId> parent, std::size_t w, std::size_t h) {
+                    std::optional<LayerId> parent, const Region& r) {
+    const std::size_t w = r.w;
+    const std::size_t h = r.h;
     std::vector<std::uint8_t> clipMask;
 
     for (const Layer* layer : levelOf(doc, parent)) {
@@ -58,7 +67,7 @@ void compositeLevel(std::vector<PremulRgba8>& buf, const Document& doc,
 
         if (layer->kind == LayerKind::Folder) {
             std::vector<PremulRgba8> group(w * h, PremulRgba8{});
-            compositeLevel(group, doc, layer->id, w, h);
+            compositeLevel(group, doc, layer->id, r);
             for (std::size_t i = 0; i < buf.size(); ++i) {
                 PremulRgba8 src = group[i];
                 if (!ownAlpha.empty()) ownAlpha[i] = src.a;
@@ -75,18 +84,24 @@ void compositeLevel(std::vector<PremulRgba8>& buf, const Document& doc,
             for (const auto& [key, tile] : layer->tiles) {
                 const std::int32_t ox = key.first  * TILE_SIZE;
                 const std::int32_t oy = key.second * TILE_SIZE;
-                const std::int32_t y0 = std::max<std::int32_t>(0, -oy);
-                const std::int32_t y1 = std::min<std::int32_t>(TILE_SIZE, doc.height - oy);
-                const std::int32_t x0 = std::max<std::int32_t>(0, -ox);
-                const std::int32_t x1 = std::min<std::int32_t>(TILE_SIZE, doc.width - ox);
+                // Tile-local bounds, clipped to the canvas and to the region.
+                const std::int32_t y0 = std::max({0, -oy, r.y - oy});
+                const std::int32_t y1 = std::min({TILE_SIZE, doc.height - oy,
+                                                  r.y + static_cast<std::int32_t>(h) - oy});
+                const std::int32_t x0 = std::max({0, -ox, r.x - ox});
+                const std::int32_t x1 = std::min({TILE_SIZE, doc.width - ox,
+                                                  r.x + static_cast<std::int32_t>(w) - ox});
 
                 for (std::int32_t ty = y0; ty < y1; ++ty) {
                     const PremulRgba8* row =
                         tile.pixels() + static_cast<std::size_t>(ty) * TILE_SIZE;
-                    const std::size_t rowStart =
-                        static_cast<std::size_t>(oy + ty) * w + static_cast<std::size_t>(ox);
+                    // Signed: ox - r.x is negative for a tile that starts left
+                    // of the region, and only the sum with tx is in bounds.
+                    const std::int64_t rowStart =
+                        static_cast<std::int64_t>(oy + ty - r.y) *
+                            static_cast<std::int64_t>(w) + (ox - r.x);
                     for (std::int32_t tx = x0; tx < x1; ++tx) {
-                        const std::size_t at = rowStart + static_cast<std::size_t>(tx);
+                        const auto at = static_cast<std::size_t>(rowStart + tx);
                         PremulRgba8 src = row[tx];
                         if (!ownAlpha.empty()) ownAlpha[at] = src.a;
                         if (src.a == 0) continue;
@@ -142,6 +157,27 @@ PremulRgba8 pickLevel(const Document& doc, std::optional<LayerId> parent,
 
 }  // namespace
 
+std::vector<PremulRgba8> compositeRect(const Document& doc, std::int32_t x,
+                                       std::int32_t y, std::int32_t w, std::int32_t h) {
+    if (w <= 0 || h <= 0) return {};
+    const Region r{x, y, static_cast<std::size_t>(w), static_cast<std::size_t>(h)};
+
+    // Outside the document stays transparent, so an edge tile does not paint
+    // background past the canvas bounds.
+    std::vector<PremulRgba8> buf(r.w * r.h, PremulRgba8{});
+    const PremulRgba8 bg = doc.background.premultiply();
+    const std::int32_t x0 = std::max(x, 0), x1 = std::min(x + w, doc.width);
+    const std::int32_t y0 = std::max(y, 0), y1 = std::min(y + h, doc.height);
+    for (std::int32_t py = y0; py < y1; ++py) {
+        const auto row = static_cast<std::ptrdiff_t>(
+            static_cast<std::size_t>(py - y) * r.w);
+        std::fill(buf.begin() + row + (x0 - x), buf.begin() + row + (x1 - x), bg);
+    }
+
+    compositeLevel(buf, doc, std::nullopt, r);
+    return buf;
+}
+
 std::vector<StraightRgba8> flatten(const Document& doc) {
     const auto w = static_cast<std::size_t>(std::max(doc.width, 0));
     const auto h = static_cast<std::size_t>(std::max(doc.height, 0));
@@ -149,8 +185,7 @@ std::vector<StraightRgba8> flatten(const Document& doc) {
 
     // Composite in premultiplied space, convert once at the end. Doing it the
     // other way round is what produces the dark halo (D-004, US-07.3).
-    std::vector<PremulRgba8> buf(w * h, doc.background.premultiply());
-    compositeLevel(buf, doc, std::nullopt, w, h);
+    const std::vector<PremulRgba8> buf = compositeRect(doc, 0, 0, doc.width, doc.height);
 
     std::vector<StraightRgba8> out(w * h);
     for (std::size_t i = 0; i < buf.size(); ++i) out[i] = buf[i].unpremultiply();
