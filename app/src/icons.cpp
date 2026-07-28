@@ -130,6 +130,14 @@ void drawIcon(ImDrawList* draw, Icon icon, ImVec2 topLeft, float size, ImU32 col
             p.fillRect(0.70f, 0.70f, 0.90f, 0.90f);
             break;
 
+        case Icon::Text:
+            // A serifed I: the one letterform that reads as "type" at 16 px
+            // without being any particular alphabet's letter A.
+            p.line(0.24f, 0.16f, 0.76f, 0.16f, 0.11f);   // top bar
+            p.line(0.50f, 0.16f, 0.50f, 0.84f, 0.11f);   // stem
+            p.line(0.32f, 0.84f, 0.68f, 0.84f, 0.11f);   // foot
+            break;
+
         case Icon::Plus:
             p.line(0.50f, 0.14f, 0.50f, 0.86f, 0.15f);
             p.line(0.14f, 0.50f, 0.86f, 0.50f, 0.15f);

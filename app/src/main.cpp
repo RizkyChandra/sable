@@ -44,6 +44,7 @@
 #include "sbl/select.hpp"
 #include "settings.hpp"
 #include "shortcuts.hpp"
+#include "text_tool.hpp"
 #include "widgets.hpp"
 
 namespace {
@@ -57,7 +58,7 @@ constexpr float kDegToRad      = 3.14159265358979323846f / 180.0f;
 /// What to do once the artist answers the "discard unsaved work?" prompt.
 enum class Pending { None, NewCanvas, Quit, Open, Import };
 
-enum class Tool { Brush, Eraser, Fill, Select, Lasso, Wand, Transform };
+enum class Tool { Brush, Eraser, Fill, Select, Lasso, Wand, Transform, Text };
 
 /// True for the three tools that build a selection, which share the modifier
 /// keys, the mode setting, and the rule that a click with no drag deselects.
@@ -142,6 +143,8 @@ struct App {
     sbl::Stroke           stroke;
     std::vector<sbl::Dab> scratch;
     bool painting = false;
+
+    TextTool text;
 
     // --- tablet
     std::unordered_map<SDL_PenID, PenAxisState> penAxes;
@@ -259,6 +262,7 @@ struct App {
         case Tool::Lasso:  return "lasso";
         case Tool::Wand:   return "wand";
         case Tool::Transform: return "transform";
+        case Tool::Text:   return "text";
     }
     return "brush";
 }
@@ -466,6 +470,8 @@ void applyGpuMode(App& app) {
 }
 
 void resetDocument(App& app, std::int32_t w, std::int32_t h, bool transparent) {
+    // Nothing may outlive the document it was editing.
+    app.text.finish(app.window, app.doc);
     app.canvas->releaseAll();
     app.doc = sbl::makeDocument(
         w, h, transparent ? sbl::StraightRgba8{0, 0, 0, 0}
@@ -541,6 +547,7 @@ void doSaveProject(App& app, const std::filesystem::path& path) {
 /// Open and Import are the same code path: the registry picks the reader, and
 /// it is what decides whether the document keeps a path to save back to.
 void doOpenDocument(App& app, const std::filesystem::path& path) {
+    app.text.finish(app.window, app.doc);
     auto loaded = sbl::importDocument(path);
     if (!loaded.has_value()) {
         showError(app, loaded.error());
@@ -921,6 +928,25 @@ void moveGuide(App& app, double sx, double sy) {
     }
 }
 
+/// Puts a fresh text where the artist pointed, ending whatever was being typed.
+///
+/// A click always starts a NEW text. Reopening an existing one is selecting its
+/// layer and pressing the tool's key — a rule with no hit-testing in it, and so
+/// with no invisible boxes for a click to land just outside of.
+void placeText(App& app, double sx, double sy) {
+    app.text.finish(app.window, app.doc);
+    app.text.begin(app.window, toCanvasX(app.view, sx, sy),
+                   toCanvasY(app.view, sx, sy), app.foreground);
+}
+
+/// Selects the text tool, resuming the active layer's text if it has any.
+void chooseTextTool(App& app) {
+    app.tool = Tool::Text;
+    const sbl::Layer* layer = app.doc.layerById(app.doc.activeLayer);
+    if (layer != nullptr && layer->text.has_value())
+        app.text.resume(app.window, app.doc, layer->id);
+}
+
 void stepSizePreset(App& app, int direction) {
     if (app.sizePresets.empty()) return;
     sbl::BrushPreset& brush = activeBrush(app);
@@ -1090,6 +1116,16 @@ void handleKey(App& app, const SDL_KeyboardEvent& key) {
     if (key.key == SDLK_SPACE) { app.spaceHeld = key.down; return; }
     if (!key.down) return;
 
+    // Keyboard-only placement (PRD §6): with the text tool chosen and nothing
+    // being typed yet, Enter starts a text in the middle of what is on screen.
+    // Without this the tool would need a pointing device to begin at all.
+    if (app.tool == Tool::Text && !app.text.active() &&
+        (key.key == SDLK_RETURN || key.key == SDLK_KP_ENTER)) {
+        placeText(app, app.viewport.x + app.viewport.w * 0.5,
+                       app.viewport.y + app.viewport.h * 0.5);
+        return;
+    }
+
     // Capturing a new binding takes priority over triggering the old one.
     if (app.rebinding != Action::Count) {
         if (key.key == SDLK_ESCAPE) { app.rebinding = Action::Count; return; }
@@ -1142,13 +1178,22 @@ void handleKey(App& app, const SDL_KeyboardEvent& key) {
         case Action::RotateRight: rotateView(app, +kRotateStep); break;
         case Action::ResetRotation: rotateView(app, -app.view.rotation); break;
 
-        case Action::ToolBrush:  app.tool = Tool::Brush;  break;
-        case Action::ToolLasso:  app.tool = Tool::Lasso;  break;
-        case Action::ToolWand:   app.tool = Tool::Wand;   break;
-        case Action::ToolEraser: app.tool = Tool::Eraser; break;
-        case Action::ToolFill:   app.tool = Tool::Fill;   break;
-        case Action::ToolSelect: app.tool = Tool::Select; break;
-        case Action::ToolTransform: app.tool = Tool::Transform; break;
+        // Leaving the text tool commits what was typed. A tool change is an
+        // unambiguous "I have finished with this", and the alternative — a
+        // session left running under the brush — loses the text on the first
+        // stroke that lands on its layer. Every tool that is not Text has to
+        // say so, so a tool added later cannot quietly skip it.
+        case Action::ToolBrush:  app.text.finish(app.window, app.doc); app.tool = Tool::Brush;  break;
+        case Action::ToolLasso:  app.text.finish(app.window, app.doc); app.tool = Tool::Lasso;  break;
+        case Action::ToolWand:   app.text.finish(app.window, app.doc); app.tool = Tool::Wand;   break;
+        case Action::ToolEraser: app.text.finish(app.window, app.doc); app.tool = Tool::Eraser; break;
+        case Action::ToolFill:   app.text.finish(app.window, app.doc); app.tool = Tool::Fill;   break;
+        case Action::ToolSelect: app.text.finish(app.window, app.doc); app.tool = Tool::Select; break;
+        case Action::ToolTransform:
+            app.text.finish(app.window, app.doc);
+            app.tool = Tool::Transform;
+            break;
+        case Action::ToolText: chooseTextTool(app); break;
 
         case Action::SizeDown: stepSizePreset(app, -1); break;
         case Action::SizeUp:   stepSizePreset(app, +1); break;
@@ -1191,9 +1236,27 @@ void handleEvent(App& app, const SDL_Event& e) {
                 requestPending(app, Pending::Quit);
             break;
 
+        // D-002 cost #2, answered: characters reach the canvas through SDL's
+        // text-input events, never through an ImGui field. TEXT_EDITING is the
+        // half-finished one an input method is still choosing — the whole
+        // reason this tool is not a ImGui::InputText.
+        case SDL_EVENT_TEXT_INPUT:
+        case SDL_EVENT_TEXT_EDITING:
+            if (!io.WantCaptureKeyboard &&
+                app.text.handleEvent(e, app.doc, app.window))
+                syncTextures(app, app.text.takeChanged());
+            break;
+
         case SDL_EVENT_KEY_DOWN:
         case SDL_EVENT_KEY_UP:
-            if (!io.WantCaptureKeyboard) handleKey(app, e.key);
+            if (io.WantCaptureKeyboard) break;
+            // A live text session owns the keyboard: `b` types a b rather than
+            // switching to the brush and abandoning the sentence.
+            if (app.text.handleEvent(e, app.doc, app.window)) {
+                syncTextures(app, app.text.takeChanged());
+                break;
+            }
+            handleKey(app, e.key);
             break;
 
         case SDL_EVENT_DROP_FILE:
@@ -1237,9 +1300,14 @@ void handleEvent(App& app, const SDL_Event& e) {
             // Landing on a guide handle moves it instead of painting.
             app.draggingGuide = guideAt(app, e.ptouch.x, e.ptouch.y);
             if (app.draggingGuide != kNoGuide) break;
-            // The selection tools go through the same helpers the mouse uses.
-            // A tablet is the target input device, so a lasso reachable only
-            // with a mouse would be a lasso most artists never get to use.
+            // Text and the selection tools all go through the same helpers
+            // the mouse uses. A tablet is the target input device, so a lasso
+            // reachable only with a mouse would be one most artists never use.
+            if (app.tool == Tool::Text) {
+                placeText(app, e.ptouch.x, e.ptouch.y);
+                syncTextures(app, app.text.takeChanged());
+                break;
+            }
             if (app.tool == Tool::Wand) {
                 wandAt(app, e.ptouch.x, e.ptouch.y);
                 break;
@@ -1296,6 +1364,9 @@ void handleEvent(App& app, const SDL_Event& e) {
                     pickColourAt(app, e.button.x, e.button.y);   // US-13.3
                 } else if (app.tool == Tool::Fill) {
                     doFill(app, e.button.x, e.button.y);
+                } else if (app.tool == Tool::Text) {
+                    placeText(app, e.button.x, e.button.y);
+                    syncTextures(app, app.text.takeChanged());
                 } else if (app.tool == Tool::Wand) {
                     wandAt(app, e.button.x, e.button.y);
                 } else if (selectsRegion(app.tool)) {
@@ -1494,7 +1565,10 @@ void drawToolPanel(App& app) {
             char label[64];
             std::snprintf(label, sizeof label, "%s  (%s)", name,
                           app.shortcuts.get(action).label().c_str());
-            if (iconRadio(icon, label, app.tool == tool)) app.tool = tool;
+            if (!iconRadio(icon, label, app.tool == tool)) return;
+            // Same rule as the keyboard: picking another tool commits the text.
+            if (tool == Tool::Text) chooseTextTool(app);
+            else { app.text.finish(app.window, app.doc); app.tool = tool; }
         };
         toolRow(Icon::Brush,     "Brush",     Tool::Brush,     Action::ToolBrush);
         toolRow(Icon::Eraser,    "Eraser",    Tool::Eraser,    Action::ToolEraser);
@@ -1503,6 +1577,12 @@ void drawToolPanel(App& app) {
         toolRow(Icon::Lasso,     "Lasso",     Tool::Lasso,     Action::ToolLasso);
         toolRow(Icon::Wand,      "Magic wand", Tool::Wand,     Action::ToolWand);
         toolRow(Icon::Transform, "Transform", Tool::Transform, Action::ToolTransform);
+        toolRow(Icon::Text,      "Text",      Tool::Text,      Action::ToolText);
+
+        if (app.tool == Tool::Text) {
+            app.text.drawPanel(app.doc);
+            syncTextures(app, app.text.takeChanged());
+        }
 
         if (app.tool == Tool::Transform) {
             if (!app.doc.selection.has_value() || app.doc.selection->empty()) {
@@ -1775,7 +1855,8 @@ void drawLayerPanel(App& app) {
             if (layer.parent.has_value()) ImGui::Indent(16.0f);
             char label[160];
             std::snprintf(label, sizeof label, "%s%s%s",
-                          layer.kind == sbl::LayerKind::Folder ? "[group] " : "",
+                          layer.kind == sbl::LayerKind::Folder ? "[group] "
+                          : layer.kind == sbl::LayerKind::Text ? "[text] " : "",
                           layer.name.c_str(), layer.locked ? "  [locked]" : "");
             if (ImGui::Selectable(label, active)) app.doc.activeLayer = layer.id;
 
@@ -1836,6 +1917,17 @@ void drawLayerPanel(App& app) {
                 if (ImGui::Checkbox("Clip to layer below", &clip)) {
                     edited = sbl::propsOf(layer);
                     edited.clipToBelow = clip;
+                    propsFor = layer.id;
+                }
+                // Text owns its layer's pixels, so painting on one and merging
+                // one down are both refused. This is the way out: give up the
+                // words and keep the picture. Undoable like any other property
+                // change, which is what makes it safe to offer.
+                if (layer.kind == sbl::LayerKind::Text &&
+                    ImGui::SmallButton("Rasterise text")) {
+                    app.text.finish(app.window, app.doc);
+                    edited = sbl::propsOf(layer);
+                    edited.text.reset();
                     propsFor = layer.id;
                 }
                 ImGui::Unindent(12.0f);
@@ -2488,6 +2580,11 @@ void renderFrame(App& app) {
     drawSelectionOutline(app);
     drawLassoInProgress(app);
     drawBrushCursor(app);
+    // Recolouring text is the colour panel, not a control of its own: while a
+    // session is live the text simply IS the foreground colour.
+    app.text.setColour(app.doc, app.foreground);
+    syncTextures(app, app.text.takeChanged());
+    app.text.frame(app.window, app.view, app.uiScale);
 
     ImGui::Render();
 
@@ -2881,6 +2978,157 @@ int main(int argc, char** argv) {
         app.doc.dirty   = false;
         SDL_Log("selftest: bad path recovers, drop over unsaved work prompts");
 
+        // The text tool, driven through the events a keyboard and an input
+        // method actually produce. Three things no engine test can see: that
+        // SDL's text events reach the canvas at all, that a half-finished
+        // composition is drawn and then REPLACED rather than left behind, and
+        // that a whole editing session collapses to one undo step.
+        //
+        // This is not a test of an input method. It is a test that our side of
+        // the contract is wired up; see the pull request for what was and was
+        // not tried with a real IME.
+        bool textTested = false;
+        if (!sbl::systemFonts().empty()) {
+            const std::size_t layersBefore = app.doc.layers.size();
+            const std::size_t undoBefore   = app.doc.undo.size();
+
+            app.foreground = sbl::StraightRgba8{20, 20, 20, 255};
+            app.tool = Tool::Text;
+            placeText(app, toScreenX(app.view, 60.0, 900.0),
+                           toScreenY(app.view, 60.0, 900.0));
+
+            // A font that actually carries the characters below, where there is
+            // one. Without this the kanji come out as the empty box every
+            // Latin-only font draws, and the check would pass on tofu.
+            bool cjkFont = false;
+            for (const sbl::FontEntry& entry : sbl::systemFonts()) {
+                auto face = sbl::FontFace::load(entry.path);
+                if (!face.has_value() || !face->hasGlyph(0x6F22)) continue;
+                cjkFont = app.text.useFont(app.doc, entry.path);
+                if (cjkFont) SDL_Log("selftest: typing 漢字 in %s", entry.name.c_str());
+                break;
+            }
+            if (!cjkFont)
+                SDL_Log("selftest: no CJK font here, the kanji below will be boxes");
+
+            // Whether SDL accepted the request is the one half of the IME
+            // question a self-test can answer: an input method can only reach
+            // us through a window that has text input switched on. Whether a
+            // real input method then composes into it is a question for a human
+            // with one installed, and the offscreen driver has no answer at all.
+            SDL_Log("selftest: SDL text input active under \"%s\": %s",
+                    SDL_GetCurrentVideoDriver(),
+                    SDL_TextInputActive(app.window) ? "yes" : "no");
+
+            const auto darkPixels = [&] {
+                int n = 0;
+                for (int x = 40; x < 900; x += 3)
+                    for (int y = 830; y < 940; y += 3)
+                        if (sbl::pickColour(app.doc, x, y).r < 128) ++n;
+                return n;
+            };
+            if (darkPixels() != 0) {
+                SDL_Log("selftest FAILED: the text band was not empty to begin with");
+                return 1;
+            }
+
+            // SDL_EVENT_TEXT_EDITING: the characters an input method is still
+            // choosing. D-002 named this as the reason not to use an ImGui
+            // field, so it is the first thing exercised.
+            SDL_Event editing{};
+            editing.type        = SDL_EVENT_TEXT_EDITING;
+            editing.edit.text   = "\xE3\x81\x8B\xE3\x82\x93";   // かん, mid-composition
+            editing.edit.start  = 2;
+            editing.edit.length = 0;
+            app.text.handleEvent(editing, app.doc, app.window);
+            const int duringComposition = darkPixels();
+            if (duringComposition == 0) {
+                SDL_Log("selftest FAILED: a composition in progress drew nothing");
+                return 1;
+            }
+            // Composition is NOT the document. It is on the canvas so the
+            // artist can see it, and it must not be in the file.
+            const sbl::Layer* textLayer = app.doc.active();
+            if (textLayer == nullptr || !textLayer->text.has_value() ||
+                !textLayer->text->utf8.empty()) {
+                SDL_Log("selftest FAILED: an unfinished composition reached the document");
+                return 1;
+            }
+
+            // The input method commits. The preedit must be replaced, not
+            // added to — the classic doubled-character bug.
+            SDL_Event input{};
+            input.type      = SDL_EVENT_TEXT_INPUT;
+            input.text.text = "\xE6\xBC\xA2\xE5\xAD\x97";       // 漢字
+            app.text.handleEvent(input, app.doc, app.window);
+
+            SDL_Event key{};
+            key.type = SDL_EVENT_KEY_DOWN;
+            key.key.key  = SDLK_B;      // a bare letter types, it does not
+            key.key.down = true;        // switch to the brush
+            app.text.handleEvent(key, app.doc, app.window);
+            if (app.tool != Tool::Text) {
+                SDL_Log("selftest FAILED: typing a letter changed the tool");
+                return 1;
+            }
+            input.text.text = "b";
+            app.text.handleEvent(input, app.doc, app.window);
+
+            const sbl::Layer* typed = app.doc.active();
+            if (typed == nullptr || typed->kind != sbl::LayerKind::Text ||
+                !typed->text.has_value() ||
+                typed->text->utf8 != "\xE6\xBC\xA2\xE5\xAD\x97" "b") {
+                SDL_Log("selftest FAILED: the committed text is not what was typed");
+                return 1;
+            }
+            const int afterCommit = darkPixels();
+            if (afterCommit == 0) {
+                SDL_Log("selftest FAILED: committed text drew nothing");
+                return 1;
+            }
+
+            key.key.key = SDLK_ESCAPE;
+            app.text.handleEvent(key, app.doc, app.window);
+            if (app.text.active()) {
+                SDL_Log("selftest FAILED: Escape did not finish the text");
+                return 1;
+            }
+
+            // One layer, and one step for the words and the glyphs together —
+            // plus the step that created the layer.
+            if (app.doc.layers.size() != layersBefore + 1 ||
+                app.doc.undo.size() != undoBefore + 2) {
+                SDL_Log("selftest FAILED: a text session left %zu layers and %zu steps",
+                        app.doc.layers.size() - layersBefore,
+                        app.doc.undo.size() - undoBefore);
+                return 1;
+            }
+
+            doUndo(app);
+            // The words go back with the pixels: the layer is as blank as it
+            // was the moment before the first character arrived.
+            const sbl::Layer* reverted = app.doc.active();
+            if (darkPixels() != 0 || reverted == nullptr ||
+                (reverted->text.has_value() && !reverted->text->utf8.empty())) {
+                SDL_Log("selftest FAILED: undoing the text left %d pixels and \"%s\"",
+                        darkPixels(),
+                        reverted != nullptr && reverted->text.has_value()
+                            ? reverted->text->utf8.c_str() : "");
+                return 1;
+            }
+            doRedo(app);
+            if (darkPixels() != afterCommit) {
+                SDL_Log("selftest FAILED: redo drew %d pixels where undo removed %d",
+                        darkPixels(), afterCommit);
+                return 1;
+            }
+            SDL_Log("selftest: text composes, commits and undoes as one step "
+                    "(%d pixels)", afterCommit);
+            textTested = true;
+        } else {
+            SDL_Log("selftest: no fonts on this machine, text tool not exercised");
+        }
+
         // Drive one background recovery to completion. This is the only path
         // that hands document data to another thread, so it is the only thing
         // ThreadSanitizer has to look at — and it is worth nothing to CI unless
@@ -2913,9 +3161,13 @@ int main(int argc, char** argv) {
                                    : result.error().detail.c_str());
         app.running = false;
         // Stroke, new layer, fill, and the mirrored stroke — each exactly one
-        // undoable step, however many dabs it took.
-        if (!result.has_value() || app.doc.undo.size() != 4 ||
-            app.doc.layers.size() != 2 || app.doc.active()->tiles.empty()) {
+        // undoable step, however many dabs it took. Plus the text layer and its
+        // one text step, on a machine that has a font to draw them with.
+        const std::size_t expectedUndo   = textTested ? 6u : 4u;
+        const std::size_t expectedLayers = textTested ? 3u : 2u;
+        if (!result.has_value() || app.doc.undo.size() != expectedUndo ||
+            app.doc.layers.size() != expectedLayers ||
+            app.doc.active()->tiles.empty()) {
             SDL_Log("selftest FAILED");
             return 1;
         }

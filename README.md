@@ -89,6 +89,7 @@ cmake -S . -B build-asan -G Ninja -DSABLE_ASAN=ON && cmake --build build-asan
 | Brush size | `[` and `]`, or the slider |
 | Swap / reset colours | `X` / `D` |
 | Fill / select tool | `G` / `M` |
+| Text tool | `F` — then click, or press Enter to place it in the middle |
 | Undo / redo | `Ctrl+Z` / `Ctrl+Y` |
 | New canvas | `Ctrl+N` |
 | Open / save project | `Ctrl+O` / `Ctrl+S` |
@@ -99,6 +100,13 @@ cmake -S . -B build-asan -G Ninja -DSABLE_ASAN=ON && cmake --build build-asan
 also holds the interface scale. Those two are the accessibility commitment the
 PRD makes in place of screen-reader support, so they are features rather than
 preferences.
+
+**Text** goes on a layer of its own and stays editable: select that layer, press
+the tool's key, and the words come back. Typing goes through SDL's text-input
+events rather than a UI text field, so an input method composes straight onto
+the canvas — the half-finished characters appear underlined at the caret. A text
+layer refuses paint until *Rasterise text* in the layer panel gives up the words
+and keeps the picture.
 
 Right-click a size preset to set it to the current brush size. **View** opens
 the pressure calibration curve and the tablet test pad — the test pad is where

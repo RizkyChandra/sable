@@ -48,6 +48,21 @@ StraightRgba8 parseColour(const std::string& text) {
     return c;
 }
 
+const char* alignName(TextAlign a) {
+    switch (a) {
+        case TextAlign::Centre: return "centre";
+        case TextAlign::Right:  return "right";
+        case TextAlign::Left:   break;
+    }
+    return "left";
+}
+
+TextAlign alignFromName(const std::string& name) {
+    if (name == "centre" || name == "center") return TextAlign::Centre;
+    if (name == "right")                      return TextAlign::Right;
+    return TextAlign::Left;
+}
+
 std::string tilePath(LayerId layer, TileKey key) {
     return "layers/" + std::to_string(layer) + "/tiles/" +
            std::to_string(key.first) + "_" + std::to_string(key.second) + ".png";
@@ -191,7 +206,9 @@ std::expected<void, Error> saveProject(const Document& doc,
     for (const Layer& layer : doc.layers) {
         json entry;
         entry["id"]      = layer.id;
-        entry["kind"]    = layer.kind == LayerKind::Folder ? "folder" : "raster";
+        entry["kind"]    = layer.kind == LayerKind::Folder ? "folder"
+                         : layer.kind == LayerKind::Text   ? "text"
+                                                           : "raster";
         entry["name"]    = layer.name;
         entry["opacity"] = layer.opacity;
         entry["blend"]   = std::string(blendModeName(layer.blend));
@@ -201,6 +218,22 @@ std::expected<void, Error> saveProject(const Document& doc,
         entry["clip_to_below"]    = layer.clipToBelow;
         if (layer.parent.has_value()) entry["parent"] = *layer.parent;
         else                          entry["parent"] = nullptr;
+
+        // The words, beside the pixels they were drawn as. The tiles below are
+        // still what renders, so a reader that ignores this — an older Sable,
+        // or a script — sees the finished text either way.
+        if (layer.text.has_value()) {
+            const TextContent& t = *layer.text;
+            entry["text"] = {{"utf8", t.utf8},
+                             {"font", t.fontPath},
+                             {"font_name", t.fontName},
+                             {"size", t.sizePx},
+                             {"line_spacing", t.lineSpacing},
+                             {"align", alignName(t.align)},
+                             {"x", t.x},
+                             {"y", t.y},
+                             {"colour", hexColour(t.colour)}};
+        }
 
         // Sorted, so two saves of the same document produce byte-identical
         // manifests and a diff is readable.
@@ -358,8 +391,10 @@ std::expected<Document, Error> loadProject(const std::filesystem::path& path) {
         Layer layer;
         layer.id   = entry.value("id", 0u);
         if (layer.id == NO_LAYER) continue;         // 0 is the reserved "no layer"
-        layer.kind = entry.value("kind", std::string("raster")) == "folder"
-                         ? LayerKind::Folder : LayerKind::Raster;
+        const std::string kind = entry.value("kind", std::string("raster"));
+        layer.kind = kind == "folder" ? LayerKind::Folder
+                   : kind == "text"   ? LayerKind::Text
+                                      : LayerKind::Raster;
         layer.name    = entry.value("name", std::string("Layer"));
         layer.opacity = std::clamp(entry.value("opacity", 1.0f), 0.0f, 1.0f);
         layer.blend   = blendModeFromName(entry.value("blend", std::string("normal")));
@@ -369,6 +404,29 @@ std::expected<Document, Error> loadProject(const std::filesystem::path& path) {
         layer.clipToBelow     = entry.value("clip_to_below", false);
         if (entry.contains("parent") && entry["parent"].is_number_unsigned())
             layer.parent = entry["parent"].get<LayerId>();
+
+        if (entry.contains("text") && entry["text"].is_object()) {
+            const auto& t = entry["text"];
+            TextContent text;
+            text.utf8        = t.value("utf8", std::string{});
+            text.fontPath    = t.value("font", std::string{});
+            text.fontName    = t.value("font_name", std::string{});
+            text.sizePx      = std::clamp(t.value("size", 48.0f), 1.0f, 2000.0f);
+            text.lineSpacing = std::clamp(t.value("line_spacing", 1.2f), 0.1f, 10.0f);
+            text.align       = alignFromName(t.value("align", std::string("left")));
+            text.x           = t.value("x", 0.0);
+            text.y           = t.value("y", 0.0);
+            text.colour      = parseColour(t.value("colour", std::string("#000000ff")));
+            layer.text       = std::move(text);
+            // A "text" object on a layer some other writer called raster still
+            // means the words belong to it. Trusting `kind` alone would leave a
+            // layer the tool refuses to edit for no reason the artist can see.
+            layer.kind = LayerKind::Text;
+        } else if (layer.kind == LayerKind::Text) {
+            // Text layer, no text: nothing can be edited back, and pretending
+            // otherwise gets the tool to clear the pixels on the first click.
+            layer.kind = LayerKind::Raster;
+        }
 
         doc.nextLayerId = std::max(doc.nextLayerId, layer.id + 1);
         doc.layers.push_back(std::move(layer));

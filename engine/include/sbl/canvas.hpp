@@ -145,7 +145,38 @@ enum class BlendMode : std::uint8_t {
     Darken, Lighten, ColourDodge, ColourBurn, HardLight, SoftLight,
     Difference, Exclusion,
 };
-enum class LayerKind : std::uint8_t { Raster, Folder };
+enum class LayerKind : std::uint8_t { Raster, Folder, Text };
+
+// ---------------------------------------------------------------------- text
+// Issue #20. A Text layer holds ordinary tiles like any other, rasterised from
+// the TextContent below; the text is kept beside them so it can be edited
+// again. The PIXELS are what renders, everywhere — which is why a font that has
+// been uninstalled since the file was saved cannot change a finished drawing,
+// and why the compositor needed no new case (D-002's #1 bug).
+//
+// This lives here rather than in sbl/text.hpp because it is document data: the
+// rasteriser depends on the document, so the document must not depend on it.
+
+enum class TextAlign : std::uint8_t { Left, Centre, Right };
+
+struct TextContent {
+    /// LF between lines. Nothing wraps it — a text box with automatic wrapping
+    /// is a different feature, and one an artist can do without far longer than
+    /// they can do without any text at all.
+    std::string utf8;
+    std::string fontPath;              // the file the glyphs came from
+    std::string fontName;              // family name: readable in the manifest,
+                                       // and what a fallback search matches on
+    float     sizePx      = 48.0f;
+    float     lineSpacing = 1.2f;      // multiple of the font's own line height
+    TextAlign align       = TextAlign::Left;
+    /// Canvas pixels. The anchor of the FIRST baseline: x moves with alignment,
+    /// y is the baseline itself, not the top of the glyphs.
+    double x = 0.0, y = 0.0;
+    StraightRgba8 colour{0, 0, 0, 255};
+
+    friend bool operator==(const TextContent&, const TextContent&) = default;
+};
 
 /// Every mode, in enum order. One list so a new mode cannot be added to the
 /// enum and forgotten by the name mapping, the dropdown, or the tests.
@@ -188,6 +219,10 @@ struct Layer {
     bool preserveOpacity = false;      // paint only where alpha > 0
     bool clipToBelow     = false;      // clipping group
     std::optional<LayerId> parent;     // folder membership
+    /// Set on a LayerKind::Text layer, and on nothing else. Its tiles are
+    /// generated from this, so painting on such a layer is refused rather than
+    /// silently thrown away by the next keystroke.
+    std::optional<TextContent> text;
     // Draw order is the Document's vector order, not a field here.
 
     /// Null when the tile has never been painted. Do not cache the result
@@ -269,6 +304,10 @@ struct LayerProps {
     bool preserveOpacity = false;
     bool clipToBelow     = false;
     std::optional<LayerId> parent;
+    /// Editing text is a property change, not a pixel change: carrying it here
+    /// means one text edit is ONE undo step covering both the words and the
+    /// glyphs they were drawn as, through the machinery that already exists.
+    std::optional<TextContent> text;
 };
 
 [[nodiscard]] LayerProps propsOf(const Layer&);

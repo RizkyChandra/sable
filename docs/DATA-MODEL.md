@@ -146,7 +146,7 @@ enum class BlendMode {
     Darken, Lighten, ColourDodge, ColourBurn, HardLight, SoftLight,
     Difference, Exclusion,
 };
-enum class LayerKind { Raster, Folder };
+enum class LayerKind { Raster, Folder, Text };
 
 using LayerId = uint32_t;                      // stable; never reused in a document
 inline constexpr LayerId NO_LAYER = 0;
@@ -166,7 +166,20 @@ struct Layer {
     bool preserveOpacity  = false;     // paint only where alpha > 0
     bool clipToBelow      = false;     // clipping group
     std::optional<LayerId> parent;     // folder membership
+    /// Set on a Text layer and on nothing else (D-026). Its tiles are
+    /// rasterised from this, so paint on such a layer is refused.
+    std::optional<TextContent> text;
     // Draw order is the Document's vector order, not a field here.
+};
+
+// D-026. The pixels are what renders; this is what edits them again later.
+struct TextContent {
+    std::string utf8;                  // LF between lines; nothing wraps
+    std::string fontPath, fontName;
+    float sizePx = 48.0f, lineSpacing = 1.2f;
+    TextAlign align = TextAlign::Left;
+    double x = 0.0, y = 0.0;           // canvas anchor of the FIRST baseline
+    StraightRgba8 colour{0, 0, 0, 255};
 };
 ```
 
@@ -584,7 +597,16 @@ layers/<layerId>/tiles/<tx>_<ty>.png   one PNG per non-empty tile, straight alph
       "opacity": 1.0, "blend": "normal", "visible": true,
       "locked": false, "preserve_opacity": false, "clip_to_below": false,
       "parent": null,
-      "tiles": [[0, 0], [0, 1], [1, 0]] }
+      "tiles": [[0, 0], [0, 1], [1, 0]] },
+    { "id": 2, "kind": "text", "name": "Caption",
+      "opacity": 1.0, "blend": "normal", "visible": true,
+      "locked": false, "preserve_opacity": false, "clip_to_below": false,
+      "parent": null,
+      "text": { "utf8": "漢字", "font": "/usr/share/fonts/noto/NotoSansCJK.ttc",
+                "font_name": "Noto Sans CJK JP", "size": 48.0,
+                "line_spacing": 1.2, "align": "left",
+                "x": 60.0, "y": 900.0, "colour": "#141414ff" },
+      "tiles": [[0, 3]] }
   ],
   "active_layer": 1,
   "vanishing_points": [ { "x": -320.5, "y": 512.0, "enabled": true } ],
@@ -596,13 +618,16 @@ Rules:
 
 - `format_version` is checked on load. Refuse a higher version with a clear
   message rather than reading it wrong. Version 2 added `vanishing_points`,
-  version 3 `selection`; everything each adds is optional, so v1 and v2 files
-  still load unchanged.
+  version 3 `selection`, version 4 `"kind": "text"` and the `text` object
+  beside it. Everything each adds is optional, so v1, v2 and v3 files still
+  load unchanged.
 - `"mask": true` means `selection.png` holds the coverage, one byte per pixel of
   the selection's own w x h. A selection whose mask will not decode, or decodes
   at the wrong size, is DROPPED rather than downgraded to its rectangle: a
   bigger selection than the artist drew would send the next fill somewhere they
   did not ask for.
+- A text layer's **tiles are still the picture**. `text` is what makes it
+  editable again; a reader that ignores it sees the finished words anyway.
 - Tile PNGs are **straight alpha** so external tools can open them. Convert on
   save and on load; test the round-trip for drift (D-004).
 - If the manifest's `tiles` list disagrees with the ZIP entries, trust the ZIP and
@@ -644,6 +669,8 @@ at the original path. Never written over `Document::path`.
 
 ## What is deliberately not modelled yet
 
-Layer masks, linework and vector layers, and text. They belong to Stage C/D of
-the PRD. Adding their fields now would be guessing at shapes we cannot test. Two
-cheap hooks keep them affordable later: `LayerKind` and `format_version`.
+Layer masks, and linework and vector layers. They belong to Stage D of the PRD.
+Adding their fields now would be guessing at shapes we cannot test. Two cheap
+hooks keep them affordable later: `LayerKind` and `format_version` — which is
+exactly what perspective rulers (version 2), selection masks (version 3) and
+text (`LayerKind::Text`, version 4) went on to use.
