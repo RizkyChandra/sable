@@ -14,6 +14,10 @@
 #include <utility>
 #include <vector>
 
+// For VanishingPoint. The input boundary depends on nothing, so this is a
+// one-way edge, not a tangle.
+#include "sbl/input.hpp"
+
 namespace sbl {
 
 // ------------------------------------------------------------------- colour
@@ -316,6 +320,11 @@ struct Document {
     std::filesystem::path path;            // empty until first save
     bool dirty = false;
 
+    /// Perspective guides, in canvas pixels. Document state, unlike the ruler
+    /// that uses them: a scene's horizon is part of the drawing and has to come
+    /// back with it, while "is the ruler on" is a preference.
+    std::vector<VanishingPoint> vanishingPoints;
+
     [[nodiscard]] Layer*       layerById(LayerId id) noexcept;
     [[nodiscard]] const Layer* layerById(LayerId id) const noexcept;
     [[nodiscard]] Layer*       active() noexcept { return layerById(activeLayer); }
@@ -334,6 +343,10 @@ struct Document {
 /// nothing that stops a worker reaching into the live document, so the
 /// discipline has to be explicit, and "copy it all" is the version that cannot
 /// be got subtly wrong under a deadline.
+///
+/// Copies host tiles, and only host tiles. Call `PaintBackend::readback` first
+/// if a backend may be holding pixels somewhere else — the worker thread has no
+/// device context and cannot fetch them itself.
 [[nodiscard]] Document cloneDocument(const Document& doc);
 
 // ----------------------------------------------------------- layer operations

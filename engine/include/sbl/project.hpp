@@ -19,7 +19,11 @@
 namespace sbl {
 
 /// Present from the first release so v1 files stay loadable.
-inline constexpr int SABLE_FORMAT_VERSION = 1;
+///
+/// 2 added `vanishing_points`. Everything it adds is optional, so a v1 file
+/// still loads unchanged — the bump exists so an OLDER Sable refuses a file
+/// whose perspective guides it would silently drop on the next save.
+inline constexpr int SABLE_FORMAT_VERSION = 2;
 
 /// Undo history is deliberately not saved.
 [[nodiscard]] std::expected<void, Error> saveProject(

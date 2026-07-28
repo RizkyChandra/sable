@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include "sbl/backend.hpp"
 #include "sbl/io.hpp"
 
 namespace sbl {
@@ -251,7 +252,7 @@ void appendSample(Stroke& s, const InputSample& sample, std::vector<Dab>& out) {
 
 // --------------------------------------------------------------- dab -> tiles
 
-void applyDab(PaintTarget& t, const Dab& dab) noexcept {
+void CpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
     if (t.layer.locked || t.layer.kind != LayerKind::Raster) return;
     if (dab.colour.a == 0 || dab.radius <= 0.0f) return;
 
@@ -421,8 +422,8 @@ bool withinTolerance(StraightRgba8 a, StraightRgba8 b, int tolerance) noexcept {
 
 }  // namespace
 
-UndoRecord bucketFill(Document& doc, LayerId target, std::int32_t x, std::int32_t y,
-                      StraightRgba8 colour, int tolerance) {
+UndoRecord CpuBackend::bucketFill(Document& doc, LayerId target, std::int32_t x,
+                                  std::int32_t y, StraightRgba8 colour, int tolerance) {
     UndoRecord rec;
     Layer* layer = doc.layerById(target);
     if (layer == nullptr || layer->locked || layer->kind != LayerKind::Raster) return rec;
@@ -434,7 +435,9 @@ UndoRecord bucketFill(Document& doc, LayerId target, std::int32_t x, std::int32_
 
     // Match against what the artist sees, so a fill inside line art on another
     // layer works. One flatten per fill is affordable; per pixel would not be.
-    const std::vector<StraightRgba8> composite = flatten(doc);
+    // *this, not the process default: a GPU backend delegating its fill to
+    // the CPU one must not have the match run somewhere else.
+    const std::vector<StraightRgba8> composite = flatten(doc, *this);
     if (composite.empty()) return rec;
 
     const auto w = doc.width;
@@ -497,7 +500,8 @@ UndoRecord bucketFill(Document& doc, LayerId target, std::int32_t x, std::int32_
     return rec;
 }
 
-UndoRecord fillSelection(Document& doc, LayerId target, StraightRgba8 colour) {
+UndoRecord CpuBackend::fillSelection(Document& doc, LayerId target,
+                                     StraightRgba8 colour) {
     UndoRecord rec;
     Layer* layer = doc.layerById(target);
     if (layer == nullptr || layer->locked || layer->kind != LayerKind::Raster) return rec;
@@ -520,8 +524,9 @@ UndoRecord fillSelection(Document& doc, LayerId target, StraightRgba8 colour) {
     return rec;
 }
 
-UndoRecord transformRegion(Document& doc, LayerId target, const Selection& source,
-                           const Transform& transform) {
+UndoRecord CpuBackend::transformRegion(Document& doc, LayerId target,
+                                       const Selection& source,
+                                       const Transform& transform) {
     UndoRecord rec;
     Layer* layer = doc.layerById(target);
     if (layer == nullptr || layer->locked || layer->kind != LayerKind::Raster) return rec;
@@ -635,7 +640,7 @@ UndoRecord transformRegion(Document& doc, LayerId target, const Selection& sourc
     return rec;
 }
 
-UndoRecord clearLayer(Layer& layer) {
+UndoRecord CpuBackend::clearLayer(Layer& layer) {
     UndoRecord rec;
     rec.label = "Clear";
     rec.tiles.reserve(layer.tiles.size());

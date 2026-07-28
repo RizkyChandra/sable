@@ -5,6 +5,8 @@
 #include <cstring>
 #include <utility>
 
+#include "sbl/backend.hpp"
+
 namespace sbl {
 namespace {
 
@@ -410,6 +412,7 @@ Document cloneDocument(const Document& doc) {
     copy.selection   = doc.selection;
     copy.path        = doc.path;
     copy.dirty       = doc.dirty;
+    copy.vanishingPoints = doc.vanishingPoints;
     // Undo history is deliberately not copied: it is not saved (D-011), and
     // copying it would double the memory this hand-off costs.
 
@@ -545,7 +548,7 @@ UndoRecord moveLayer(Document& doc, LayerId id, int delta) {
     return rec;
 }
 
-UndoRecord mergeLayerDown(Document& doc, LayerId id) {
+UndoRecord CpuBackend::mergeLayerDown(Document& doc, LayerId id) {
     UndoRecord rec;
     const std::size_t upper = indexOf(doc, id);
     if (upper == 0 || upper >= doc.layers.size()) return rec;   // nothing below

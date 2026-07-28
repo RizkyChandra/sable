@@ -209,6 +209,10 @@ struct Document {
     std::optional<Selection> selection;     // Milestone 3; empty = whole canvas
     std::filesystem::path path;             // empty until first save
     bool dirty = false;
+
+    // Perspective guides (D-025). The ruler that uses them is view state; the
+    // points are part of the drawing and are saved with it.
+    std::vector<VanishingPoint> vanishingPoints;
 };
 ```
 
@@ -222,15 +226,21 @@ struct PaintTarget {
     UndoRecord&   undo;
     TouchedTiles& touched;      // which tiles already hold a snapshot
     int32_t       width, height;  // canvas bounds; dabs clip to this
+    PaintBackend* backend;      // null = the process default (D-021)
 };
 
-void applyDab(PaintTarget& target, const Dab& dab) noexcept;
+void applyDab(PaintTarget& target, const Dab& dab);
 ```
 
 Not `applyDab(Document&, ...)`. This keeps the hot path free of lookups, makes
 every function unit-testable without constructing a document, and means the
 compositor can later run on a layer while the UI reads document metadata without
 anyone having to reason about aliasing.
+
+`backend` is where a GPU dispatch lives (D-021); null means `paintBackend()`,
+which is the CPU backend unless the app has installed another. The call is no
+longer `noexcept`, because a backend that fails needs to be able to say so —
+see `sbl/backend.hpp`.
 
 ---
 
@@ -551,7 +561,7 @@ layers/<layerId>/tiles/<tx>_<ty>.png   one PNG per non-empty tile, straight alph
 
 ```jsonc
 {
-  "format_version": 1,
+  "format_version": 2,
   "app": "Sable 0.1.0",
   "width": 1024, "height": 1024, "dpi": 72,
   "background": "#ffffff",
@@ -564,14 +574,16 @@ layers/<layerId>/tiles/<tx>_<ty>.png   one PNG per non-empty tile, straight alph
       "parent": null,
       "tiles": [[0, 0], [0, 1], [1, 0]] }
   ],
-  "active_layer": 1
+  "active_layer": 1,
+  "vanishing_points": [ { "x": -320.5, "y": 512.0, "enabled": true } ]
 }
 ```
 
 Rules:
 
 - `format_version` is checked on load. Refuse a higher version with a clear
-  message rather than reading it wrong.
+  message rather than reading it wrong. Version 2 added `vanishing_points`;
+  everything it adds is optional, so a v1 file still loads unchanged.
 - Tile PNGs are **straight alpha** so external tools can open them. Convert on
   save and on load; test the round-trip for drift (D-004).
 - If the manifest's `tiles` list disagrees with the ZIP entries, trust the ZIP and

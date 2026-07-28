@@ -41,6 +41,13 @@ constexpr std::array<Entry, static_cast<std::size_t>(Action::Count)> kDefaults{{
     {Action::ActualSize,    "Actual size",    SDLK_0, static_cast<SDL_Keymod>(SDL_KMOD_CTRL | SDL_KMOD_ALT)},
     {Action::ZoomIn,        "Zoom in",        SDLK_EQUALS, SDL_KMOD_NONE},
     {Action::ZoomOut,       "Zoom out",       SDLK_MINUS,  SDL_KMOD_NONE},
+    // Comma and full stop sit under the drawing hand's neighbours on a normal
+    // layout, and the pair reads as "turn back / turn on" without a modifier.
+    {Action::RotateLeft,    "Rotate left",    SDLK_COMMA,  SDL_KMOD_NONE},
+    {Action::RotateRight,   "Rotate right",   SDLK_PERIOD, SDL_KMOD_NONE},
+    // Beside fit-to-window and actual-size on Ctrl+0, because they are the
+    // same gesture: put the view back where I can read it.
+    {Action::ResetRotation, "Reset rotation", SDLK_0, static_cast<SDL_Keymod>(SDL_KMOD_CTRL | SDL_KMOD_SHIFT)},
     {Action::ToolBrush,     "Brush tool",     SDLK_B, SDL_KMOD_NONE},
     {Action::ToolEraser,    "Eraser tool",    SDLK_E, SDL_KMOD_NONE},
     {Action::ToolFill,      "Fill tool",      SDLK_G, SDL_KMOD_NONE},
@@ -50,6 +57,10 @@ constexpr std::array<Entry, static_cast<std::size_t>(Action::Count)> kDefaults{{
     {Action::SizeUp,        "Larger brush",   SDLK_RIGHTBRACKET, SDL_KMOD_NONE},
     {Action::SwapColours,   "Swap colours",   SDLK_X, SDL_KMOD_NONE},
     {Action::ResetColours,  "Reset colours",  SDLK_C, SDL_KMOD_NONE},
+    // Unmodified S and P: both letters were free, and a ruler is toggled
+    // mid-drawing often enough that a modifier would be in the way.
+    {Action::ToggleSymmetry,    "Symmetry ruler",    SDLK_S, SDL_KMOD_NONE},
+    {Action::TogglePerspective, "Perspective ruler", SDLK_P, SDL_KMOD_NONE},
 }};
 
 std::string settingKey(Action action) {

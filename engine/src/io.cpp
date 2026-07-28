@@ -1,5 +1,7 @@
 #include "sbl/io.hpp"
 
+#include "sbl/backend.hpp"
+
 #include <algorithm>
 #include <optional>
 #include <system_error>
@@ -157,8 +159,9 @@ PremulRgba8 pickLevel(const Document& doc, std::optional<LayerId> parent,
 
 }  // namespace
 
-std::vector<PremulRgba8> compositeRect(const Document& doc, std::int32_t x,
-                                       std::int32_t y, std::int32_t w, std::int32_t h) {
+std::vector<PremulRgba8> CpuBackend::compositeRect(const Document& doc, std::int32_t x,
+                                                   std::int32_t y, std::int32_t w,
+                                                   std::int32_t h) {
     if (w <= 0 || h <= 0) return {};
     const Region r{x, y, static_cast<std::size_t>(w), static_cast<std::size_t>(h)};
 
@@ -179,20 +182,26 @@ std::vector<PremulRgba8> compositeRect(const Document& doc, std::int32_t x,
 }
 
 std::vector<StraightRgba8> flatten(const Document& doc) {
+    return flatten(doc, paintBackend());
+}
+
+std::vector<StraightRgba8> flatten(const Document& doc, PaintBackend& backend) {
     const auto w = static_cast<std::size_t>(std::max(doc.width, 0));
     const auto h = static_cast<std::size_t>(std::max(doc.height, 0));
     if (w == 0 || h == 0) return {};
 
     // Composite in premultiplied space, convert once at the end. Doing it the
     // other way round is what produces the dark halo (D-004, US-07.3).
-    const std::vector<PremulRgba8> buf = compositeRect(doc, 0, 0, doc.width, doc.height);
+    const std::vector<PremulRgba8> buf =
+        backend.compositeRect(doc, 0, 0, doc.width, doc.height);
 
     std::vector<StraightRgba8> out(w * h);
     for (std::size_t i = 0; i < buf.size(); ++i) out[i] = buf[i].unpremultiply();
     return out;
 }
 
-StraightRgba8 pickColour(const Document& doc, std::int32_t x, std::int32_t y) noexcept {
+StraightRgba8 CpuBackend::pickColour(const Document& doc, std::int32_t x,
+                                     std::int32_t y) {
     if (x < 0 || y < 0 || x >= doc.width || y >= doc.height) return StraightRgba8{};
     return pickLevel(doc, std::nullopt, x, y, doc.background.premultiply()).unpremultiply();
 }

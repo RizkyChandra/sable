@@ -8,6 +8,8 @@
 #include <system_error>
 #include <vector>
 
+#include "sbl/backend.hpp"
+
 #include "lodepng.h"
 #include "miniz.h"
 #include "miniz_zip.h"
@@ -86,7 +88,9 @@ bool decodeTile(const unsigned char* data, std::size_t size, Tile& out) {
 /// 256 px preview, not an export.
 std::vector<unsigned char> encodeThumbnail(const Document& doc) {
     constexpr unsigned kMax = 256;
-    const std::vector<StraightRgba8> full = flatten(doc);
+    // The CPU backend by name: saving runs on the autosave worker, a thread
+    // with no device context, and the clone it was handed is host pixels.
+    const std::vector<StraightRgba8> full = flatten(doc, cpuBackend());
     if (full.empty()) return {};
 
     const auto srcW = static_cast<unsigned>(doc.width);
@@ -151,6 +155,15 @@ std::expected<void, Error> saveProject(const Document& doc,
     manifest["colour"] = {{"depth", 8}, {"space", "sRGB"}, {"premultiplied", true}};
     manifest["active_layer"]   = doc.activeLayer;
     manifest["layers"]         = json::array();
+
+    // Written only when there are some, so a document with no perspective
+    // guides still produces a manifest a v1 Sable would have written.
+    if (!doc.vanishingPoints.empty()) {
+        manifest["vanishing_points"] = json::array();
+        for (const VanishingPoint& vp : doc.vanishingPoints)
+            manifest["vanishing_points"].push_back(
+                {{"x", vp.x}, {"y", vp.y}, {"enabled", vp.enabled}});
+    }
 
     for (const Layer& layer : doc.layers) {
         json entry;
@@ -267,6 +280,17 @@ std::expected<Document, Error> loadProject(const std::filesystem::path& path) {
         return fail(ErrorKind::Malformed, "the manifest has an implausible canvas size");
     doc.background = parseColour(manifest.value("background", std::string("#ffffffff")));
     doc.path = path;
+
+    // Absent in v1, and in any v2 document that has none — both mean "no
+    // guides", which is why the version bump costs older files nothing.
+    if (manifest.contains("vanishing_points") && manifest["vanishing_points"].is_array()) {
+        for (const auto& entry : manifest["vanishing_points"]) {
+            if (!entry.is_object()) continue;
+            doc.vanishingPoints.push_back(VanishingPoint{
+                entry.value("x", 0.0), entry.value("y", 0.0),
+                entry.value("enabled", true)});
+        }
+    }
 
     if (!manifest.contains("layers") || !manifest["layers"].is_array())
         return fail(ErrorKind::Malformed, "the manifest lists no layers");

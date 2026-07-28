@@ -9,6 +9,7 @@
 #include "miniz_zip.h"
 #include "sbl/openraster.hpp"
 #include "sbl/project.hpp"
+#include "sbl/psd.hpp"
 
 namespace sbl {
 namespace {
@@ -41,6 +42,10 @@ bool looksLikeOpenRaster(const std::filesystem::path& path) {
     return hasZipEntry(path, "mimetype") && hasZipEntry(path, "stack.xml");
 }
 
+bool looksLikePsd(const std::filesystem::path& path) {
+    return readMagic(path, 4) == "8BPS";
+}
+
 /// The built-in table. An importer adds one entry here and nothing else.
 std::vector<Format> builtinFormats() {
     std::vector<Format> all;
@@ -57,6 +62,10 @@ std::vector<Format> builtinFormats() {
         .id = "png", .label = "PNG image", .extensions = {"png"},
         .nativeProject = false,
         .read = nullptr, .write = &exportPng, .sniff = nullptr});
+    all.push_back(Format{
+        .id = "psd", .label = "Photoshop document", .extensions = {"psd"},
+        .nativeProject = false,
+        .read = &readPsd, .write = &writePsd, .sniff = &looksLikePsd});
     return all;
 }
 
