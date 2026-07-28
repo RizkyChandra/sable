@@ -273,7 +273,7 @@ if(SABLE_BUILD_TESTS)
   # by eye. Nothing else from app/ may be included here (D-003).
   target_include_directories(engine_tests PRIVATE app/src)
   # Fixtures come from two places and both are read from the source tree, never
-  # copied: they are inputs. tests/data is the PSD pair, tests/fixtures the
+  # copied: they are inputs. tests/data is the PSD set, tests/fixtures the
   # ORA and KRA files written by Krita and GIMP.
   target_compile_definitions(engine_tests PRIVATE
     SABLE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data"

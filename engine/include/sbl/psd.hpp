@@ -21,6 +21,13 @@ namespace sbl {
 /// The background is left fully transparent, because PSD has no notion of one:
 /// whatever backs the artwork is a layer in the file and stays a layer here.
 ///
+/// A layer mask is multiplied into that layer's alpha as it is read (D-027,
+/// #35). Sable has nowhere to keep a mask, and an import that dropped it showed
+/// content the file itself hides. The mask is therefore no longer editable
+/// afterwards — what it hid is gone, not hidden. A mask on a GROUP still is
+/// dropped: it applies to the folder's composited result, which is not any one
+/// child's pixels.
+///
 /// Blend modes Sable cannot do degrade to Normal rather than failing the read.
 /// Depths other than 8 bits and colour modes other than RGB are refused with a
 /// message naming what the file actually is, which is the honest answer until
