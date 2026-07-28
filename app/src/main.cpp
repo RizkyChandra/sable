@@ -1289,10 +1289,21 @@ void drawLayerPanel(App& app) {
                     propsFor = layer.id;
                 }
 
+                // Display names, in BlendMode order. The static_assert is the
+                // whole point: add a mode to the enum without a label here and
+                // the build stops, instead of the dropdown quietly setting the
+                // wrong mode.
+                static const char* const blendLabels[] = {
+                    "Normal", "Multiply", "Screen", "Add", "Overlay",
+                    "Darken", "Lighten", "Colour Dodge", "Colour Burn",
+                    "Hard Light", "Soft Light", "Difference", "Exclusion",
+                };
+                static_assert(IM_ARRAYSIZE(blendLabels) == sbl::ALL_BLEND_MODES.size());
+
                 int blend = static_cast<int>(layer.blend);
                 ImGui::SetNextItemWidth(-1.0f);
-                if (ImGui::Combo("##blend", &blend,
-                                 "Normal\0Multiply\0Screen\0Add\0Overlay\0")) {
+                if (ImGui::Combo("##blend", &blend, blendLabels,
+                                 IM_ARRAYSIZE(blendLabels))) {
                     edited = sbl::propsOf(layer);
                     edited.blend = static_cast<sbl::BlendMode>(blend);
                     propsFor = layer.id;

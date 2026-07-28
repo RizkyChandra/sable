@@ -545,12 +545,19 @@ StraightRgba8 blendOpaque(BlendMode mode, StraightRgba8 src, StraightRgba8 dst) 
 }  // namespace
 
 TEST_CASE("blend mode names round-trip, and unknown names degrade to normal") {
-    for (const BlendMode mode : {BlendMode::Normal, BlendMode::Multiply,
-                                 BlendMode::Screen, BlendMode::Add, BlendMode::Overlay})
+    for (const BlendMode mode : ALL_BLEND_MODES)
         CHECK(blendModeFromName(blendModeName(mode)) == mode);
 
-    // A file written by a later version must open, not fail (D-011).
-    CHECK(blendModeFromName("colour-dodge") == BlendMode::Normal);
+    // Distinct names, or two modes collapse into one on load.
+    std::vector<std::string_view> names;
+    for (const BlendMode mode : ALL_BLEND_MODES) names.push_back(blendModeName(mode));
+    std::sort(names.begin(), names.end());
+    CHECK(std::unique(names.begin(), names.end()) == names.end());
+
+    // A file written by a later version must open, not fail (D-011). "hue" is
+    // one of the non-separable HSL modes Sable does not have.
+    CHECK(blendModeFromName("hue") == BlendMode::Normal);
+    CHECK(blendModeFromName("luminosity") == BlendMode::Normal);
     CHECK(blendModeFromName("") == BlendMode::Normal);
 }
 
@@ -602,19 +609,102 @@ TEST_CASE("overlay keeps black black and white white") {
     CHECK(onWhite.r == 255);
 }
 
+TEST_CASE("darken and lighten pick a channel, and are idempotent") {
+    const StraightRgba8 src{200, 50, 128, 255};
+    const StraightRgba8 dst{100, 150, 128, 255};
+    const StraightRgba8 darker  = blendOpaque(BlendMode::Darken, src, dst);
+    const StraightRgba8 lighter = blendOpaque(BlendMode::Lighten, src, dst);
+    CHECK(darker  == StraightRgba8{100, 50, 128, 255});
+    CHECK(lighter == StraightRgba8{200, 150, 128, 255});
+
+    // Identity elements: darkening with white and lightening with black.
+    CHECK(blendOpaque(BlendMode::Darken, StraightRgba8{255, 255, 255, 255}, dst) == dst);
+    CHECK(blendOpaque(BlendMode::Lighten, StraightRgba8{0, 0, 0, 255}, dst) == dst);
+}
+
+TEST_CASE("dodge brightens and burn darkens, without dividing by zero") {
+    const StraightRgba8 base{128, 128, 128, 255};
+    CHECK(blendOpaque(BlendMode::ColourDodge, StraightRgba8{64, 64, 64, 255}, base).r > base.r);
+    CHECK(blendOpaque(BlendMode::ColourBurn, StraightRgba8{192, 192, 192, 255}, base).r < base.r);
+
+    // Identity elements: dodging by black and burning by white.
+    CHECK(blendOpaque(BlendMode::ColourDodge, StraightRgba8{0, 0, 0, 255}, base) == base);
+    CHECK(blendOpaque(BlendMode::ColourBurn, StraightRgba8{255, 255, 255, 255}, base) == base);
+
+    // The degenerate cases. White dodge over anything but black saturates;
+    // black burn over anything but white goes to black; and a black backdrop
+    // stays black under any dodge, which is where a naive cb/(1-cs) produces
+    // a NaN and then a garbage pixel.
+    const StraightRgba8 white{255, 255, 255, 255};
+    const StraightRgba8 black{0, 0, 0, 255};
+    CHECK(blendOpaque(BlendMode::ColourDodge, white, base).r == 255);
+    CHECK(blendOpaque(BlendMode::ColourDodge, white, black).r == 0);
+    CHECK(blendOpaque(BlendMode::ColourBurn, black, base).r == 0);
+    CHECK(blendOpaque(BlendMode::ColourBurn, black, white).r == 255);
+}
+
+TEST_CASE("hard light is overlay with the operands swapped") {
+    // Overlay is defined as hard light applied the other way round, so this
+    // catches the two drifting apart.
+    const StraightRgba8 a{37, 142, 211, 255};
+    const StraightRgba8 b{200, 90, 15, 255};
+    CHECK(blendOpaque(BlendMode::HardLight, a, b) == blendOpaque(BlendMode::Overlay, b, a));
+
+    // Mid grey is hard light's identity, as it is soft light's.
+    const StraightRgba8 mid{128, 128, 128, 255};
+    const StraightRgba8 unchanged = blendOpaque(BlendMode::HardLight, mid, b);
+    CHECK(unchanged.r == doctest::Approx(b.r).epsilon(0.02));
+}
+
+TEST_CASE("soft light nudges towards the source without clipping") {
+    const StraightRgba8 base{128, 128, 128, 255};
+    const StraightRgba8 lit  = blendOpaque(BlendMode::SoftLight, StraightRgba8{255, 255, 255, 255}, base);
+    const StraightRgba8 dark = blendOpaque(BlendMode::SoftLight, StraightRgba8{0, 0, 0, 255}, base);
+    CHECK(lit.r  > base.r);
+    CHECK(dark.r < base.r);
+    // Softer than hard light: pure white must not blow mid grey to white.
+    CHECK(lit.r < 255);
+    CHECK(dark.r > 0);
+
+    // Mid grey changes nothing, and the shadow branch below cb = 0.25 stays
+    // continuous — a kink there is a visible band on a gradient.
+    CHECK(blendOpaque(BlendMode::SoftLight, StraightRgba8{128, 128, 128, 255}, base) == base);
+    const StraightRgba8 shadow{60, 60, 60, 255};
+    const StraightRgba8 justAbove{66, 66, 66, 255};
+    const int below = blendOpaque(BlendMode::SoftLight, StraightRgba8{255, 255, 255, 255}, shadow).r;
+    const int above = blendOpaque(BlendMode::SoftLight, StraightRgba8{255, 255, 255, 255}, justAbove).r;
+    CHECK(std::abs(above - below) < 16);
+}
+
+TEST_CASE("difference and exclusion are symmetric, and black is their identity") {
+    const StraightRgba8 a{200, 50, 128, 255};
+    const StraightRgba8 b{100, 150, 128, 255};
+    CHECK(blendOpaque(BlendMode::Difference, a, b) == blendOpaque(BlendMode::Difference, b, a));
+    CHECK(blendOpaque(BlendMode::Exclusion, a, b) == blendOpaque(BlendMode::Exclusion, b, a));
+
+    const StraightRgba8 black{0, 0, 0, 255};
+    CHECK(blendOpaque(BlendMode::Difference, black, a) == a);
+    CHECK(blendOpaque(BlendMode::Exclusion, black, a) == a);
+
+    // Difference with itself is black; exclusion of mid grey with itself is
+    // mid grey, which is the one place the two visibly disagree.
+    CHECK(blendOpaque(BlendMode::Difference, a, a) == black);
+    const StraightRgba8 mid{128, 128, 128, 255};
+    CHECK(blendOpaque(BlendMode::Exclusion, mid, mid).r == doctest::Approx(128).epsilon(0.02));
+}
+
 TEST_CASE("a transparent source leaves the backdrop untouched in every mode") {
     const PremulRgba8 clear{0, 0, 0, 0};
     const PremulRgba8 base{100, 50, 25, 255};
-    for (const BlendMode mode : {BlendMode::Normal, BlendMode::Multiply,
-                                 BlendMode::Screen, BlendMode::Add, BlendMode::Overlay})
+    for (const BlendMode mode : ALL_BLEND_MODES)
         CHECK(blendOver(mode, clear, base) == base);
 }
 
 TEST_CASE("blending never produces colour brighter than its own alpha") {
     // A premultiplied pixel with a channel above its alpha is invalid, and it
-    // renders as a bright fringe. Sweep the modes for it.
-    for (const BlendMode mode : {BlendMode::Normal, BlendMode::Multiply,
-                                 BlendMode::Screen, BlendMode::Add, BlendMode::Overlay}) {
+    // renders as a bright fringe. Sweep every mode for it — this is the check
+    // that has to grow when a mode is added, so it reads ALL_BLEND_MODES.
+    for (const BlendMode mode : ALL_BLEND_MODES) {
         for (int sa = 0; sa <= 255; sa += 17) {
             for (int da = 0; da <= 255; da += 17) {
                 const auto src = StraightRgba8{255, 128, 0,
