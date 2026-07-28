@@ -52,11 +52,17 @@ constexpr std::array<Entry, static_cast<std::size_t>(Action::Count)> kDefaults{{
     {Action::ToolEraser,    "Eraser tool",    SDLK_E, SDL_KMOD_NONE},
     {Action::ToolFill,      "Fill tool",      SDLK_G, SDL_KMOD_NONE},
     {Action::ToolSelect,    "Select tool",    SDLK_M, SDL_KMOD_NONE},
+    {Action::ToolLasso,     "Lasso tool",     SDLK_L, SDL_KMOD_NONE},
+    {Action::ToolWand,      "Magic wand",     SDLK_W, SDL_KMOD_NONE},
     {Action::ToolTransform, "Transform tool", SDLK_T, SDL_KMOD_NONE},
     {Action::SizeDown,      "Smaller brush",  SDLK_LEFTBRACKET,  SDL_KMOD_NONE},
     {Action::SizeUp,        "Larger brush",   SDLK_RIGHTBRACKET, SDL_KMOD_NONE},
     {Action::SwapColours,   "Swap colours",   SDLK_X, SDL_KMOD_NONE},
     {Action::ResetColours,  "Reset colours",  SDLK_C, SDL_KMOD_NONE},
+    // Unmodified S and P: both letters were free, and a ruler is toggled
+    // mid-drawing often enough that a modifier would be in the way.
+    {Action::ToggleSymmetry,    "Symmetry ruler",    SDLK_S, SDL_KMOD_NONE},
+    {Action::TogglePerspective, "Perspective ruler", SDLK_P, SDL_KMOD_NONE},
 }};
 
 std::string settingKey(Action action) {

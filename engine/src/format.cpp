@@ -8,7 +8,10 @@
 #include "miniz.h"
 #include "miniz_zip.h"
 #include "sbl/backend.hpp"
+#include "sbl/kra.hpp"
+#include "sbl/openraster.hpp"
 #include "sbl/project.hpp"
+#include "sbl/psd.hpp"
 
 namespace sbl {
 namespace {
@@ -36,6 +39,19 @@ bool looksLikeSable(const std::filesystem::path& path) {
     return hasZipEntry(path, "document.json");
 }
 
+/// A .kra has a mimetype entry too, so the manifest is what separates them.
+bool looksLikeOpenRaster(const std::filesystem::path& path) {
+    return hasZipEntry(path, "mimetype") && hasZipEntry(path, "stack.xml");
+}
+
+bool looksLikeKrita(const std::filesystem::path& path) {
+    return hasZipEntry(path, "maindoc.xml");
+}
+
+bool looksLikePsd(const std::filesystem::path& path) {
+    return readMagic(path, 4) == "8BPS";
+}
+
 /// The built-in table. An importer adds one entry here and nothing else.
 std::vector<Format> builtinFormats() {
     std::vector<Format> all;
@@ -44,9 +60,22 @@ std::vector<Format> builtinFormats() {
         .nativeProject = true,
         .read = &loadProject, .write = &saveProject, .sniff = &looksLikeSable});
     all.push_back(Format{
+        .id = "ora", .label = "OpenRaster image", .extensions = {"ora"},
+        .nativeProject = false,
+        .read = &readOpenRaster, .write = &writeOpenRaster,
+        .sniff = &looksLikeOpenRaster});
+    all.push_back(Format{
+        .id = "kra", .label = "Krita document", .extensions = {"kra"},
+        .nativeProject = false,
+        .read = &readKrita, .write = nullptr, .sniff = &looksLikeKrita});
+    all.push_back(Format{
         .id = "png", .label = "PNG image", .extensions = {"png"},
         .nativeProject = false,
         .read = nullptr, .write = &exportPng, .sniff = nullptr});
+    all.push_back(Format{
+        .id = "psd", .label = "Photoshop document", .extensions = {"psd"},
+        .nativeProject = false,
+        .read = &readPsd, .write = &writePsd, .sniff = &looksLikePsd});
     return all;
 }
 

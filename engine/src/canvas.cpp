@@ -432,6 +432,7 @@ Document cloneDocument(const Document& doc) {
     copy.selection   = doc.selection;
     copy.path        = doc.path;
     copy.dirty       = doc.dirty;
+    copy.vanishingPoints = doc.vanishingPoints;
     // Undo history is deliberately not copied: it is not saved (D-011), and
     // copying it would double the memory this hand-off costs.
 

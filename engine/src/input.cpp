@@ -166,4 +166,112 @@ InputSample Stabilizer::finish(const InputSample& last) noexcept {
     return last;
 }
 
+// --------------------------------------------------------- perspective ruler
+
+bool PerspectiveRuler::usable() const noexcept {
+    if (!enabled) return false;
+    for (const VanishingPoint& p : points)
+        if (p.enabled) return true;
+    return false;
+}
+
+bool PerspectiveRuler::choose(double x, double y) noexcept {
+    const double dx = x - anchorX_;
+    const double dy = y - anchorY_;
+    const double len = std::sqrt(dx * dx + dy * dy);
+    // Canvas pixels of travel before the direction is trusted. Under a couple
+    // of pixels the "direction" is hand tremor, and a guide picked from tremor
+    // is one the artist cannot correct without lifting the pen.
+    constexpr double kCommitDistance = 4.0;
+    if (len < kCommitDistance) return false;
+
+    double best = -1.0;
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        if (!points[i].enabled) continue;
+        double ux = points[i].x - anchorX_;
+        double uy = points[i].y - anchorY_;
+        const double ulen = std::sqrt(ux * ux + uy * uy);
+        if (ulen < 1e-9) continue;      // the stroke started on the point itself
+        ux /= ulen;
+        uy /= ulen;
+        // |cos| rather than cos: a receding line is drawn away from the
+        // vanishing point as often as towards it, and both lie on one guide.
+        const double score = std::abs((dx * ux + dy * uy) / len);
+        if (score > best) {
+            best = score;
+            chosen_ = static_cast<int>(i);
+            dirX_ = ux;
+            dirY_ = uy;
+        }
+    }
+    return chosen_ >= 0;
+}
+
+InputSample PerspectiveRuler::apply(const InputSample& in) noexcept {
+    if (!usable()) return in;
+
+    if (!primed_) {
+        anchorX_ = in.x;
+        anchorY_ = in.y;
+        primed_ = true;
+        return in;
+    }
+    if (chosen_ < 0 && !choose(in.x, in.y)) return in;
+
+    // Foot of the perpendicular onto the guide. Projecting rather than
+    // extending means the artist still controls how far along the line the
+    // stroke reaches, and can draw back down it.
+    const double t = (in.x - anchorX_) * dirX_ + (in.y - anchorY_) * dirY_;
+    InputSample out = in;              // pressure and tilt pass through
+    out.x = anchorX_ + t * dirX_;
+    out.y = anchorY_ + t * dirY_;
+    return out;
+}
+
+// ------------------------------------------------------------ symmetry ruler
+
+void SymmetryRuler::map(double x, double y, float angle,
+                        std::vector<SymmetryImage>& out) const {
+    out.clear();
+    if (!active()) {
+        out.push_back(SymmetryImage{x, y, angle});
+        return;
+    }
+
+    const double rx = x - centreX;
+    const double ry = y - centreY;
+    const auto emit = [&](double px, double py, float a) {
+        out.push_back(SymmetryImage{centreX + px, centreY + py, a});
+    };
+
+    if (radial > 1) {
+        // Dihedral: n rotations, plus their mirrors when either axis is on.
+        // Generating them this way is what keeps the set duplicate-free —
+        // listing the flags separately alongside the rotations produces the
+        // same transform twice for even n, and a doubled dab is a dark blotch.
+        const int n = std::min(radial, kMaxRadial);
+        const bool mirrored = vertical || horizontal;
+        constexpr double kTau = 6.283185307179586476925286766559;
+        for (int k = 0; k < n; ++k) {
+            const double a = kTau * k / n;
+            const double c = std::cos(a), s = std::sin(a);
+            emit(rx * c - ry * s, rx * s + ry * c, angle + static_cast<float>(a));
+            if (mirrored) {
+                // Mirror in x first, then the same rotation. Reflection turns
+                // a leaning dab the other way, or the mirror reads as a copy.
+                const double mx = -rx;
+                emit(mx * c - ry * s, mx * s + ry * c,
+                     static_cast<float>(3.14159265358979323846 + a) - angle);
+            }
+        }
+        return;
+    }
+
+    emit(rx, ry, angle);
+    if (vertical)   emit(-rx, ry, static_cast<float>(3.14159265358979323846) - angle);
+    if (horizontal) emit(rx, -ry, -angle);
+    if (vertical && horizontal)
+        emit(-rx, -ry, angle + static_cast<float>(3.14159265358979323846));
+}
+
 }  // namespace sbl

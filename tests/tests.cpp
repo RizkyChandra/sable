@@ -32,10 +32,11 @@
 #include "sbl/io.hpp"
 #include "sbl/paint.hpp"
 #include "sbl/project.hpp"
+#include "sbl/select.hpp"
 
+#include "lodepng.h"
 // App-side, but deliberately SDL-free so the view transform is testable here.
 #include "view_transform.hpp"
-
 #include "miniz.h"
 #include "miniz_zip.h"
 #include "nlohmann/json.hpp"
@@ -1396,6 +1397,236 @@ TEST_CASE("the stabilizer holds a sharp corner") {
     CHECK(out.y > 100.0);
 }
 
+// --------------------------------------------------------------- rulers (M5)
+
+TEST_CASE("a symmetry ruler that is off produces the sample and nothing else") {
+    SymmetryRuler ruler;
+    ruler.vertical = true;                 // configured, but not switched on
+    std::vector<SymmetryImage> images;
+    ruler.map(30.0, 40.0, 0.0f, images);
+    REQUIRE(images.size() == 1);
+    CHECK(images[0].x == doctest::Approx(30.0));
+    CHECK(images[0].y == doctest::Approx(40.0));
+}
+
+TEST_CASE("a vertical axis mirrors x about the centre and leaves y alone") {
+    SymmetryRuler ruler;
+    ruler.enabled = true;
+    ruler.vertical = true;
+    ruler.centreX = 100.0;
+    ruler.centreY = 50.0;
+
+    std::vector<SymmetryImage> images;
+    ruler.map(130.0, 20.0, 0.0f, images);
+    REQUIRE(images.size() == 2);
+    // The original comes first, so a caller can skip what it has already painted.
+    CHECK(images[0].x == doctest::Approx(130.0));
+    CHECK(images[0].y == doctest::Approx(20.0));
+    CHECK(images[1].x == doctest::Approx(70.0));
+    CHECK(images[1].y == doctest::Approx(20.0));
+
+    ruler.vertical = false;
+    ruler.horizontal = true;
+    ruler.map(130.0, 20.0, 0.0f, images);
+    REQUIRE(images.size() == 2);
+    CHECK(images[1].x == doctest::Approx(130.0));
+    CHECK(images[1].y == doctest::Approx(80.0));
+
+    ruler.vertical = true;                 // both axes: four quadrants
+    ruler.map(130.0, 20.0, 0.0f, images);
+    CHECK(images.size() == 4);
+}
+
+TEST_CASE("radial symmetry spaces its copies evenly at one radius") {
+    SymmetryRuler ruler;
+    ruler.enabled = true;
+    ruler.radial  = 6;
+    ruler.centreX = 200.0;
+    ruler.centreY = 200.0;
+
+    std::vector<SymmetryImage> images;
+    ruler.map(240.0, 200.0, 0.0f, images);        // 40 px out along +x
+    REQUIRE(images.size() == 6);
+    for (const SymmetryImage& image : images) {
+        const double dx = image.x - 200.0, dy = image.y - 200.0;
+        CHECK(std::sqrt(dx * dx + dy * dy) == doctest::Approx(40.0));
+    }
+
+    // No two copies land on the same spot. A doubled dab is not a subtle
+    // failure — it paints twice and shows as a dark blotch on the seam.
+    for (std::size_t i = 0; i < images.size(); ++i)
+        for (std::size_t j = i + 1; j < images.size(); ++j)
+            CHECK(std::hypot(images[i].x - images[j].x,
+                             images[i].y - images[j].y) > 1.0);
+}
+
+TEST_CASE("radial symmetry with an axis is dihedral, and still has no duplicates") {
+    SymmetryRuler ruler;
+    ruler.enabled  = true;
+    ruler.radial   = 4;            // even: the case where a naive transform
+    ruler.vertical = true;         // list produces the half turn twice
+    ruler.centreX = 0.0;
+    ruler.centreY = 0.0;
+
+    std::vector<SymmetryImage> images;
+    ruler.map(10.0, 3.0, 0.0f, images);
+    REQUIRE(images.size() == 8);
+    for (std::size_t i = 0; i < images.size(); ++i)
+        for (std::size_t j = i + 1; j < images.size(); ++j)
+            CHECK(std::hypot(images[i].x - images[j].x,
+                             images[i].y - images[j].y) > 1e-6);
+}
+
+TEST_CASE("radial copies are capped rather than trusted") {
+    SymmetryRuler ruler;
+    ruler.enabled = true;
+    ruler.radial  = 100000;        // a slider dragged, or a settings file edited
+    std::vector<SymmetryImage> images;
+    ruler.map(10.0, 0.0, 0.0f, images);
+    CHECK(images.size() == static_cast<std::size_t>(SymmetryRuler::kMaxRadial));
+}
+
+TEST_CASE("a perspective ruler with no usable point changes nothing") {
+    PerspectiveRuler ruler;
+    ruler.points.push_back(VanishingPoint{500.0, 100.0, false});   // disabled
+    ruler.enabled = true;
+    CHECK(!ruler.usable());
+    for (int i = 0; i < 20; ++i) {
+        const InputSample in = at(i * 9.0, i * 4.0);
+        const InputSample out = ruler.apply(in);
+        CHECK(out.x == doctest::Approx(in.x));
+        CHECK(out.y == doctest::Approx(in.y));
+    }
+}
+
+TEST_CASE("a perspective stroke lands on the line through its start and the point") {
+    PerspectiveRuler ruler;
+    ruler.enabled = true;
+    ruler.points.push_back(VanishingPoint{400.0, 0.0, true});
+
+    const double startX = 0.0, startY = 100.0;
+    (void)ruler.apply(at(startX, startY));
+
+    // A drifting hand: the y wanders 30 px off the guide.
+    double worst = 0.0;
+    for (int i = 1; i <= 60; ++i) {
+        const double x = i * 5.0;
+        const InputSample out = ruler.apply(at(x, startY + (i % 2 == 0 ? 30.0 : -30.0)));
+        // The guide runs from (0, 100) to (400, 0): y = 100 - x / 4.
+        const double onGuide = startY - out.x * 0.25;
+        worst = std::max(worst, std::abs(out.y - onGuide));
+    }
+    CHECK(worst < 1e-9);
+    CHECK(ruler.chosen() == 0);
+
+    // Pressure is the artist's, not the ruler's (the same rule as US-11.6).
+    InputSample sample = at(200.0, 50.0);
+    sample.pressure = 0.42f;
+    CHECK(ruler.apply(sample).pressure == doctest::Approx(0.42f));
+}
+
+TEST_CASE("perspective picks the point the stroke is heading towards") {
+    // Two-point perspective: which guide is meant is in the opening direction,
+    // so the artist never has to say which one out loud.
+    PerspectiveRuler ruler;
+    ruler.enabled = true;
+    ruler.points.push_back(VanishingPoint{-1000.0, 0.0, true});    // away left
+    ruler.points.push_back(VanishingPoint{1000.0, 0.0, true});     // away right
+
+    ruler.reset();
+    (void)ruler.apply(at(500.0, 500.0));
+    (void)ruler.apply(at(520.0, 490.0));       // heading up and to the right
+    CHECK(ruler.chosen() == 1);
+
+    ruler.reset();
+    (void)ruler.apply(at(500.0, 500.0));
+    (void)ruler.apply(at(480.0, 490.0));       // heading up and to the left
+    CHECK(ruler.chosen() == 0);
+
+    // A single sample commits to nothing: the first pixel of a stroke is
+    // tremor, and a guide chosen from tremor cannot be corrected mid-stroke.
+    ruler.reset();
+    (void)ruler.apply(at(500.0, 500.0));
+    (void)ruler.apply(at(500.5, 500.2));
+    CHECK(ruler.chosen() == -1);
+}
+
+TEST_CASE("symmetry composes with the stabilizer instead of fighting it") {
+    // The mirror must be of the SMOOTHED stroke. Mirroring the raw input and
+    // smoothing only the original gives two strokes of different shapes, which
+    // is what "the rulers fight the stabilizer" would look like on screen.
+    Document doc = makeDocument(256, 256, StraightRgba8{0, 0, 0, 0});
+    Layer& layer = doc.layers.front();
+
+    SymmetryRuler ruler;
+    ruler.enabled  = true;
+    ruler.vertical = true;
+    ruler.centreX  = 128.0;
+    ruler.centreY  = 128.0;
+
+    Stabilizer stabilizer;
+    stabilizer.setLevel(3);
+
+    BrushPreset brush = defaultPencil();
+    brush.size = 6.0f;
+    Stroke stroke;
+    beginStroke(stroke, brush, StraightRgba8{0, 0, 0, 255}, layer.id);
+    PaintTarget target{layer, stroke.pending, stroke.touched, doc.width, doc.height};
+
+    std::vector<Dab> scratch;
+    std::vector<SymmetryImage> images;
+    double worstRaw = 0.0, worstPainted = 0.0;
+    double lastX = 0.0, lastMirrorX = 0.0, lastY = 0.0;
+
+    for (int i = 0; i < 160; ++i) {
+        const double x = 20.0 + i * 0.5;
+        const double y = 40.0 + (i % 2 == 0 ? 5.0 : -5.0);      // a shaky line
+        // Past the first samples, where the string is still being taken up:
+        // that is latency, not wobble, and D-103 says not to confuse the two.
+        const bool settled = i >= 10;
+        if (settled) worstRaw = std::max(worstRaw, std::abs(y - 40.0));
+
+        const InputSample smoothed = stabilizer.apply(at(x, y));
+        paintSample(stroke, target, smoothed, scratch);
+        for (const Dab& dab : scratch) {
+            if (settled) worstPainted = std::max(worstPainted, std::abs(dab.y - 40.0));
+            ruler.map(dab.x, dab.y, dab.angle, images);
+            REQUIRE(images.size() == 2);
+            // The image is the mirror of what the STABILIZER produced, not of
+            // the raw sample: the ruler sits downstream of the smoothing.
+            CHECK(images[1].x == doctest::Approx(256.0 - dab.x));
+            CHECK(images[1].y == doctest::Approx(dab.y));
+
+            Dab mirrored = dab;
+            mirrored.x = images[1].x;
+            mirrored.y = images[1].y;
+            applyDab(target, mirrored);
+
+            lastX = dab.x;
+            lastMirrorX = mirrored.x;
+            lastY = dab.y;
+        }
+    }
+
+    CHECK(worstPainted < worstRaw);          // the smoothing survived the mirror
+
+    const auto opaque = [&](double x, double y) {
+        return pickColour(doc, static_cast<std::int32_t>(std::lround(x)),
+                          static_cast<std::int32_t>(std::lround(y))).a > 0;
+    };
+    CHECK(opaque(lastX, lastY));
+    CHECK(opaque(lastMirrorX, lastY));
+
+    // One stroke is ONE undo step however many dabs symmetry multiplied it
+    // into — and undoing it has to clear both sides, which it only does if the
+    // images went into the same record.
+    doc.undo.push(std::move(stroke.pending));
+    CHECK(doc.undo.size() == 1);
+    (void)doc.undo.undo(doc);
+    CHECK(!opaque(lastX, lastY));
+    CHECK(!opaque(lastMirrorX, lastY));
+}
+
 // ----------------------------------------------------- brushes (M3/M4)
 
 TEST_CASE("every built-in brush has a distinct id and a sane configuration") {
@@ -1718,6 +1949,302 @@ TEST_CASE("transforming an empty or locked region does nothing") {
                           Transform{}).empty());
 }
 
+// ------------------------------------------- lasso and magic wand (#18)
+
+namespace {
+
+/// A square as a lasso path, corners on pixel boundaries so the expected
+/// coverage is exactly 0 or 255 and a test can be strict about it.
+std::vector<Point> squarePath(double x, double y, double side) {
+    return {{x, y}, {x + side, y}, {x + side, y + side}, {x, y + side}};
+}
+
+}  // namespace
+
+TEST_CASE("a lasso selects the inside of its loop and nothing else") {
+    const Selection sel = lassoSelection(squarePath(20.0, 20.0, 40.0), 100, 100);
+    REQUIRE(!sel.empty());
+    CHECK(sel.x == 20);
+    CHECK(sel.y == 20);
+    CHECK(sel.w == 40);
+    CHECK(sel.h == 40);
+    CHECK(sel.contains(20, 20));
+    CHECK(sel.contains(59, 59));
+    CHECK(!sel.contains(19, 40));
+    CHECK(!sel.contains(60, 40));
+    // Axis- and pixel-aligned, so there is no partial coverage anywhere: the
+    // rectangle it happens to be is recognised and the mask dropped.
+    CHECK(sel.mask.empty());
+}
+
+TEST_CASE("a lasso edge is anti-aliased rather than stepped") {
+    // A triangle, so the long edge crosses pixels at an angle. A hard-edged
+    // rasteriser answers only 0 and 255; this must answer in between.
+    const std::vector<Point> triangle{{10.0, 10.0}, {90.0, 10.0}, {10.0, 90.0}};
+    const Selection sel = lassoSelection(triangle, 100, 100);
+    REQUIRE(!sel.mask.empty());
+
+    int partial = 0;
+    for (const std::uint8_t v : sel.mask)
+        if (v != 0 && v != 255) ++partial;
+    CHECK(partial > 20);
+
+    CHECK(sel.contains(15, 15));                     // well inside
+    CHECK(!sel.contains(80, 80));                    // beyond the diagonal
+    // The hypotenuse runs along x + y = 100, so this pixel straddles it.
+    CHECK(sel.coverage(45, 54) > 0);
+    CHECK(sel.coverage(45, 54) < 255);
+}
+
+TEST_CASE("a self-crossing lasso encloses everything it went round") {
+    // A path that doubles back over itself. Even-odd winding punches the
+    // overlap out; non-zero keeps it, which is what an artist scribbling a
+    // loop means by it.
+    const std::vector<Point> eight{{10.0, 10.0}, {50.0, 10.0}, {50.0, 50.0},
+                                   {10.0, 50.0}, {10.0, 30.0}, {50.0, 30.0},
+                                   {50.0, 40.0}, {10.0, 40.0}};
+    const Selection sel = lassoSelection(eight, 100, 100);
+    CHECK(sel.contains(30, 35));
+}
+
+TEST_CASE("a lasso with too few points, or off the canvas, selects nothing") {
+    CHECK(lassoSelection(squarePath(10.0, 10.0, 20.0), 0, 0).empty());
+    const std::vector<Point> two{{1.0, 1.0}, {5.0, 5.0}};
+    CHECK(lassoSelection(two, 50, 50).empty());
+    CHECK(lassoSelection(squarePath(-90.0, -90.0, 40.0), 50, 50).empty());
+}
+
+TEST_CASE("painting is clipped to a lasso, not to its bounding box") {
+    Document doc = makeDocument(100, 100, StraightRgba8{255, 255, 255, 255});
+    const std::vector<Point> triangle{{10.0, 10.0}, {90.0, 10.0}, {10.0, 90.0}};
+    const Selection selection = lassoSelection(triangle, 100, 100);
+    REQUIRE(!selection.mask.empty());
+
+    Layer* layer = doc.active();
+    BrushPreset p = defaultOpaque();
+    p.size     = 200.0f;                // covers the whole bounding box
+    p.hardness = 1.0f;
+    p.pressure = PressureMapping{};
+
+    Stroke s;
+    std::vector<Dab> scratch;
+    beginStroke(s, p, StraightRgba8{0, 0, 0, 255}, layer->id);
+    PaintTarget t{*layer, s.pending, s.touched, doc.width, doc.height, &selection};
+    paintSample(s, t, at(50.0, 50.0), scratch);
+
+    CHECK(pickColour(doc, 15, 15) == StraightRgba8{0, 0, 0, 255});
+    // Inside the bounding box but past the diagonal: a rectangle-only
+    // selection would have painted here.
+    CHECK(pickColour(doc, 80, 80) == StraightRgba8{255, 255, 255, 255});
+}
+
+TEST_CASE("filling a lasso selection fades at the edge instead of stepping") {
+    Document doc = makeDocument(100, 100, StraightRgba8{255, 255, 255, 255});
+    const std::vector<Point> triangle{{10.0, 10.0}, {90.0, 10.0}, {10.0, 90.0}};
+    doc.selection = lassoSelection(triangle, 100, 100);
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{0, 0, 0, 255}));
+
+    CHECK(pickColour(doc, 15, 15) == StraightRgba8{0, 0, 0, 255});
+    CHECK(pickColour(doc, 85, 85) == StraightRgba8{255, 255, 255, 255});
+
+    // Somewhere along the diagonal there are grey pixels. Without coverage
+    // there would be only black and white, and the edge would be a staircase.
+    int greys = 0;
+    for (std::int32_t i = 12; i < 88; ++i) {
+        const StraightRgba8 c = pickColour(doc, i, 99 - i);
+        if (c.r > 20 && c.r < 235) ++greys;
+    }
+    CHECK(greys > 5);
+}
+
+TEST_CASE("the magic wand finds the same region the bucket fill would") {
+    Document doc = makeDocument(120, 120, StraightRgba8{255, 255, 255, 255});
+    doc.selection = Selection{30, 30, 50, 40};
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{0, 90, 200, 255}));
+    doc.selection.reset();
+
+    const Selection wand = magicWandSelection(doc, 50, 50, 0);
+    REQUIRE(!wand.empty());
+    CHECK(wand.contains(30, 30));
+    CHECK(wand.contains(79, 69));
+    CHECK(!wand.contains(29, 50));
+    CHECK(!wand.contains(80, 50));
+
+    // The same boundary the bucket's own flood reports — they run the same
+    // code, and this is the test that says so out loud.
+    const std::vector<StraightRgba8> composite = flatten(doc);
+    const std::vector<bool> region =
+        floodRegion(composite, doc.width, doc.height, 50, 50, 0, nullptr);
+    for (std::int32_t y = 0; y < doc.height; ++y)
+        for (std::int32_t x = 0; x < doc.width; ++x)
+            REQUIRE(region[static_cast<std::size_t>(y) * 120 + x] == wand.contains(x, y));
+}
+
+TEST_CASE("the magic wand is bounded by tolerance and by the canvas") {
+    Document doc = makeDocument(60, 60, StraightRgba8{255, 255, 255, 255});
+    doc.selection = Selection{0, 0, 30, 60};
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{250, 250, 250, 255}));
+    doc.selection.reset();
+
+    // Five apart: outside tolerance 2, inside tolerance 16. Asked with
+    // `contains` rather than by width, because the bounding box also holds the
+    // one-pixel soft rim.
+    CHECK(!magicWandSelection(doc, 10, 10, 2).contains(30, 10));
+    CHECK(magicWandSelection(doc, 10, 10, 16).contains(30, 10));
+    CHECK(magicWandSelection(doc, 10, 10, 16).contains(59, 59));
+    // A click off the canvas selects nothing rather than clamping to an edge
+    // the artist did not click on.
+    CHECK(magicWandSelection(doc, -1, 10, 0).empty());
+    CHECK(magicWandSelection(doc, 60, 10, 0).empty());
+}
+
+TEST_CASE("a magic wand selection constrains painting and bucket fill") {
+    Document doc = makeDocument(120, 120, StraightRgba8{255, 255, 255, 255});
+    doc.selection = Selection{20, 20, 40, 40};
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{0, 200, 0, 255}));
+    doc.selection = magicWandSelection(doc, 40, 40, 0);
+    REQUIRE(!doc.selection->empty());
+
+    doc.undo.push(bucketFill(doc, doc.activeLayer, 40, 40,
+                             StraightRgba8{200, 0, 0, 255}, 0));
+    CHECK(pickColour(doc, 40, 40) == StraightRgba8{200, 0, 0, 255});
+    CHECK(pickColour(doc, 100, 100) == StraightRgba8{255, 255, 255, 255});
+    // Clicking outside the wand's region still fills nothing.
+    CHECK(bucketFill(doc, doc.activeLayer, 100, 100,
+                     StraightRgba8{0, 0, 255, 255}, 0).empty());
+}
+
+TEST_CASE("transforming a lasso region moves the shape, not its bounding box") {
+    Document doc = makeDocument(120, 120, StraightRgba8{255, 255, 255, 255});
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{0, 0, 0, 255}));
+
+    const std::vector<Point> triangle{{20.0, 20.0}, {80.0, 20.0}, {20.0, 80.0}};
+    const Selection region = lassoSelection(triangle, 120, 120);
+    doc.undo.push(transformRegion(doc, doc.activeLayer, region, Transform{}));
+
+    // A pixel inside the loop was lifted and put straight back.
+    CHECK(pickColour(doc, 30, 30) == StraightRgba8{0, 0, 0, 255});
+    // A pixel in the bounding box but outside the loop was never lifted, so it
+    // is still black rather than cleared.
+    CHECK(pickColour(doc, 75, 75) == StraightRgba8{0, 0, 0, 255});
+}
+
+TEST_CASE("add, subtract and intersect combine coverage") {
+    const Selection a{0, 0, 40, 40};
+    const Selection b{20, 20, 40, 40};
+
+    const Selection sum = combineSelections(a, b, SelectMode::Add);
+    CHECK(sum.x == 0);
+    CHECK(sum.w == 60);
+    CHECK(sum.contains(5, 5));
+    CHECK(sum.contains(55, 55));
+    CHECK(!sum.contains(55, 5));       // the corner neither rectangle covers
+
+    const Selection cut = combineSelections(a, b, SelectMode::Subtract);
+    CHECK(cut.contains(5, 5));
+    CHECK(!cut.contains(30, 30));
+
+    const Selection both = combineSelections(a, b, SelectMode::Intersect);
+    CHECK(both.x == 20);
+    CHECK(both.y == 20);
+    CHECK(both.w == 20);
+    CHECK(both.h == 20);
+    // Two rectangles intersected are a rectangle: the mask must be dropped, or
+    // every selection stays a mask for the rest of the session.
+    CHECK(both.mask.empty());
+
+    CHECK(combineSelections(a, b, SelectMode::Replace) == b);
+}
+
+TEST_CASE("combining with nothing is not a way to lose a selection") {
+    const Selection a{10, 10, 20, 20};
+    CHECK(combineSelections(a, Selection{}, SelectMode::Add) == a);
+    CHECK(combineSelections(a, Selection{}, SelectMode::Subtract) == a);
+    CHECK(combineSelections(a, Selection{}, SelectMode::Intersect).empty());
+    CHECK(combineSelections(Selection{}, a, SelectMode::Add) == a);
+    // Nothing to subtract from, and nothing to intersect with.
+    CHECK(combineSelections(Selection{}, a, SelectMode::Subtract).empty());
+    CHECK(combineSelections(Selection{}, a, SelectMode::Intersect).empty());
+
+    // Subtracting a region from itself leaves nothing at all, not an empty box
+    // that still blocks painting.
+    CHECK(combineSelections(a, a, SelectMode::Subtract).empty());
+}
+
+TEST_CASE("subtracting keeps the anti-aliased edge of what remains") {
+    const std::vector<Point> triangle{{10.0, 10.0}, {90.0, 10.0}, {10.0, 90.0}};
+    const Selection lasso = lassoSelection(triangle, 100, 100);
+    const Selection cut =
+        combineSelections(lasso, Selection{10, 10, 20, 20}, SelectMode::Subtract);
+    REQUIRE(!cut.mask.empty());
+    CHECK(!cut.contains(15, 15));                    // taken out
+    CHECK(cut.contains(60, 15));                     // still in
+    int partial = 0;
+    for (const std::uint8_t v : cut.mask)
+        if (v != 0 && v != 255) ++partial;
+    CHECK(partial > 20);                             // the diagonal survived
+}
+
+TEST_CASE("a rectangular selection carries no mask") {
+    // The fast path, stated as a test: the common case must not start paying
+    // for the feature that made the uncommon one possible.
+    Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+    doc.selection = Selection{8, 8, 16, 16};
+    CHECK(doc.selection->mask.empty());
+    CHECK(doc.selection->coverage(8, 8) == 255);
+    CHECK(doc.selection->coverage(7, 8) == 0);
+}
+
+TEST_CASE("a selection with a mask survives a save, a load and a clone") {
+    Document doc = makeDocument(120, 120, StraightRgba8{255, 255, 255, 255});
+    const std::vector<Point> triangle{{10.0, 10.0}, {100.0, 10.0}, {10.0, 100.0}};
+    doc.selection = lassoSelection(triangle, 120, 120);
+    REQUIRE(!doc.selection->mask.empty());
+
+    const auto path = scratchFile("sable_selection.sable");
+    REQUIRE(saveProject(doc, path).has_value());
+    const auto loaded = loadProject(path);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->selection.has_value());
+    CHECK(*loaded->selection == *doc.selection);
+
+    // The clone the background save hands its worker must carry it too, or a
+    // recovered file comes back without the selection (D-013).
+    const Document copy = cloneDocument(*loaded);
+    REQUIRE(copy.selection.has_value());
+    CHECK(*copy.selection == *doc.selection);
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("a rectangular selection round-trips without a mask file") {
+    Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+    doc.selection = Selection{5, 6, 20, 21};
+
+    const auto path = scratchFile("sable_selection_rect.sable");
+    REQUIRE(saveProject(doc, path).has_value());
+
+    mz_zip_archive zip{};
+    REQUIRE(mz_zip_reader_init_file(&zip, path.string().c_str(), 0));
+    CHECK(mz_zip_reader_locate_file(&zip, "selection.png", nullptr, 0) < 0);
+    mz_zip_reader_end(&zip);
+
+    const auto loaded = loadProject(path);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->selection.has_value());
+    CHECK(*loaded->selection == Selection{5, 6, 20, 21});
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("a document with nothing selected saves no selection at all") {
+    Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+    const auto path = scratchFile("sable_selection_none.sable");
+    REQUIRE(saveProject(doc, path).has_value());
+    const auto loaded = loadProject(path);
+    REQUIRE(loaded.has_value());
+    CHECK(!loaded->selection.has_value());
+    std::filesystem::remove(path);
+}
+
 // ------------------------------------------------- project format (M3)
 
 namespace {
@@ -1826,39 +2353,89 @@ TEST_CASE("undo history is not saved") {
     std::filesystem::remove(path);
 }
 
+/// Rewrites the manifest's format_version in place, leaving everything else.
+/// Used to fake both a future file and an older one.
+namespace {
+void rewriteFormatVersion(const std::filesystem::path& path, int version) {
+    mz_zip_archive in{};
+    REQUIRE(mz_zip_reader_init_file(&in, path.string().c_str(), 0));
+    std::size_t size = 0;
+    void* data = mz_zip_reader_extract_file_to_heap(&in, "document.json", &size, 0);
+    REQUIRE(data != nullptr);
+    std::string text(static_cast<const char*>(data), size);
+    mz_free(data);
+    mz_zip_reader_end(&in);
+
+    const std::string key = "\"format_version\": ";
+    const auto at = text.find(key);
+    REQUIRE(at != std::string::npos);
+    const auto end = text.find_first_not_of("0123456789", at + key.size());
+    REQUIRE(end != std::string::npos);
+    text.replace(at, end - at, key + std::to_string(version));
+
+    mz_zip_archive out{};
+    REQUIRE(mz_zip_writer_init_file(&out, path.string().c_str(), 0));
+    mz_zip_writer_add_mem(&out, "document.json", text.data(), text.size(),
+                          MZ_DEFAULT_COMPRESSION);
+    mz_zip_writer_finalize_archive(&out);
+    mz_zip_writer_end(&out);
+}
+}  // namespace
+
 TEST_CASE("a newer format version is refused rather than read wrong") {
     Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
     const auto path = scratchFile("sable_future.sable");
     REQUIRE(saveProject(doc, path).has_value());
-
-    // Rewrite the manifest claiming a far future version.
-    {
-        mz_zip_archive in{};
-        REQUIRE(mz_zip_reader_init_file(&in, path.string().c_str(), 0));
-        std::size_t size = 0;
-        void* data = mz_zip_reader_extract_file_to_heap(&in, "document.json", &size, 0);
-        REQUIRE(data != nullptr);
-        std::string text(static_cast<const char*>(data), size);
-        mz_free(data);
-        mz_zip_reader_end(&in);
-
-        const auto at = text.find("\"format_version\": 1");
-        REQUIRE(at != std::string::npos);
-        text.replace(at, 19, "\"format_version\": 9");
-
-        mz_zip_archive out{};
-        REQUIRE(mz_zip_writer_init_file(&out, path.string().c_str(), 0));
-        mz_zip_writer_add_mem(&out, "document.json", text.data(), text.size(),
-                              MZ_DEFAULT_COMPRESSION);
-        mz_zip_writer_finalize_archive(&out);
-        mz_zip_writer_end(&out);
-    }
+    rewriteFormatVersion(path, 999);
 
     const auto loaded = loadProject(path);
     REQUIRE(!loaded.has_value());
     CHECK(loaded.error().kind == ErrorKind::UnsupportedVersion);
     CHECK(loaded.error().detail.find("newer version") != std::string::npos);
     std::filesystem::remove(path);
+}
+
+TEST_CASE("vanishing points survive a save and load") {
+    Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+    doc.vanishingPoints.push_back(VanishingPoint{-320.5, 40.25, true});
+    doc.vanishingPoints.push_back(VanishingPoint{900.0, 40.25, false});
+
+    const auto path = scratchFile("sable_vanishing.sable");
+    REQUIRE(saveProject(doc, path).has_value());
+    const auto loaded = loadProject(path);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->vanishingPoints.size() == 2);
+    CHECK(loaded->vanishingPoints[0].x == doctest::Approx(-320.5));
+    CHECK(loaded->vanishingPoints[0].y == doctest::Approx(40.25));
+    CHECK(loaded->vanishingPoints[0].enabled);
+    CHECK(loaded->vanishingPoints[1].x == doctest::Approx(900.0));
+    // Off is a position worth keeping, not a reason to drop the point.
+    CHECK(!loaded->vanishingPoints[1].enabled);
+
+    // The clone the background save hands to its worker has to carry them too,
+    // or a recovered file comes back without its perspective (D-013).
+    CHECK(cloneDocument(*loaded).vanishingPoints.size() == 2);
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("files from before the version bumps still open") {
+    // A v1 document is a v2 one with no vanishing_points, and a v2 one is a v3
+    // with no selection. Everything each bump added is optional, so no bump may
+    // cost an existing file its contents.
+    for (const int version : {1, 2}) {
+        Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+        const auto path = scratchFile("sable_old.sable");
+        REQUIRE(saveProject(doc, path).has_value());
+        rewriteFormatVersion(path, version);
+
+        const auto loaded = loadProject(path);
+        REQUIRE(loaded.has_value());
+        CHECK(loaded->width == 64);
+        CHECK(loaded->layers.size() == 1);
+        CHECK(loaded->vanishingPoints.empty());
+        CHECK(!loaded->selection.has_value());
+        std::filesystem::remove(path);
+    }
 }
 
 TEST_CASE("malformed and missing files fail with a message, never a crash") {
@@ -2057,6 +2634,392 @@ TEST_CASE("the dialog filters come from the registry") {
     }));
     CHECK(std::ranges::none_of(exportable, [](const DialogFilter& f) {
         return f.pattern == "sable";
+    }));
+}
+
+// ------------------------------------------------------------------ PSD (#6)
+//
+// The fixtures come from tests/data/make_psd_fixtures.py, which composites the
+// same artwork independently in floating point. flat.psd is therefore ground
+// truth for what Photoshop, Krita and GIMP show, and comparing Sable's
+// flatten() of layered.psd against it is a check against another
+// implementation rather than against Sable itself.
+
+namespace {
+
+std::filesystem::path testData(const char* name) {
+    return std::filesystem::path(SABLE_TEST_DATA_DIR) / name;
+}
+
+const Layer* layerNamed(const Document& doc, std::string_view name) {
+    for (const Layer& layer : doc.layers)
+        if (layer.name == name) return &layer;
+    return nullptr;
+}
+
+/// A 26-byte PSD header and three empty sections. Enough to reach — and be
+/// rejected by — every check readPsd() makes before it looks at any pixels.
+std::filesystem::path writePsdHeader(const char* file, std::uint16_t depth,
+                                     std::uint16_t colourMode) {
+    const auto path = scratchFile(file);
+    const auto be16 = [](std::vector<unsigned char>& out, std::uint16_t v) {
+        out.push_back(static_cast<unsigned char>(v >> 8));
+        out.push_back(static_cast<unsigned char>(v & 0xFF));
+    };
+    const auto be32 = [&](std::vector<unsigned char>& out, std::uint32_t v) {
+        be16(out, static_cast<std::uint16_t>(v >> 16));
+        be16(out, static_cast<std::uint16_t>(v & 0xFFFF));
+    };
+
+    std::vector<unsigned char> bytes{'8', 'B', 'P', 'S'};
+    be16(bytes, 1);
+    bytes.insert(bytes.end(), 6, 0);
+    be16(bytes, 4);
+    be32(bytes, 8);            // height
+    be32(bytes, 8);            // width
+    be16(bytes, depth);
+    be16(bytes, colourMode);
+    be32(bytes, 0);            // colour mode data
+    be32(bytes, 0);            // image resources
+    be32(bytes, 0);            // layer and mask information
+
+    FILE* out = std::fopen(path.string().c_str(), "wb");
+    REQUIRE(out != nullptr);
+    std::fwrite(bytes.data(), 1, bytes.size(), out);
+    std::fclose(out);
+    return path;
+}
+
+}  // namespace
+
+TEST_CASE("a layered PSD imports its stack, groups, names and modes") {
+    const auto doc = importDocument(testData("layered.psd"));
+    REQUIRE(doc.has_value());
+
+    CHECK(doc->width == 64);
+    CHECK(doc->height == 48);
+    // PSD has no document background, so nothing may be composited underneath
+    // or a file with transparency stops matching what Photoshop shows.
+    CHECK(doc->background.a == 0);
+    CHECK(doc->path.empty());
+    CHECK(!doc->dirty);
+
+    // Bottom to top, a folder ahead of its own children — Sable's order, which
+    // PSD writes the other way round.
+    REQUIRE(doc->layers.size() == 6);
+    CHECK(doc->layers[0].name == "Base");
+    CHECK(doc->layers[1].name == "Sky");
+    CHECK(doc->layers[2].name == "Fill");
+    CHECK(doc->layers[3].name == "Tint");
+    CHECK(doc->layers[4].name == "Shadow");
+    CHECK(doc->layers[5].name == "Ink");
+
+    const Layer* group = layerNamed(*doc, "Sky");
+    REQUIRE(group != nullptr);
+    CHECK(group->kind == LayerKind::Folder);
+    CHECK(group->tiles.empty());
+    CHECK(group->opacity == doctest::Approx(200.0f / 255.0f).epsilon(0.005));
+    for (const char* child : {"Fill", "Tint", "Shadow"}) {
+        const Layer* layer = layerNamed(*doc, child);
+        REQUIRE(layer != nullptr);
+        CHECK(layer->kind == LayerKind::Raster);
+        CHECK(layer->parent == group->id);
+    }
+    for (const char* top : {"Base", "Ink"})
+        CHECK(!layerNamed(*doc, top)->parent.has_value());
+
+    CHECK(layerNamed(*doc, "Ink")->blend == BlendMode::Multiply);
+    CHECK(layerNamed(*doc, "Ink")->opacity == doctest::Approx(128.0f / 255.0f).epsilon(0.005));
+    CHECK(!layerNamed(*doc, "Shadow")->visible);
+    CHECK(layerNamed(*doc, "Tint")->clipToBelow);
+    CHECK(!layerNamed(*doc, "Fill")->clipToBelow);
+
+    // Both compression schemes: "Fill" is stored raw, the rest PackBits.
+    CHECK(!layerNamed(*doc, "Fill")->tiles.empty());
+    CHECK(!layerNamed(*doc, "Base")->tiles.empty());
+}
+
+TEST_CASE("a PSD flattens to the composite the file itself carries") {
+    // The acceptance criterion for #6: what Sable draws matches what every
+    // other application shows for the same file, within 8-bit tolerance.
+    const auto layered = importDocument(testData("layered.psd"));
+    const auto flat    = importDocument(testData("flat.psd"));
+    REQUIRE(layered.has_value());
+    REQUIRE(flat.has_value());
+
+    // A PSD with no layer section is a real case, not a corner: it is what
+    // most exporters produce.
+    REQUIRE(flat->layers.size() == 1);
+
+    const std::vector<StraightRgba8> ours   = flatten(*layered);
+    const std::vector<StraightRgba8> theirs = flatten(*flat);
+    REQUIRE(ours.size() == theirs.size());
+
+    int worst = 0;
+    for (std::size_t i = 0; i < ours.size(); ++i) {
+        worst = std::max({worst,
+            std::abs(ours[i].r - theirs[i].r), std::abs(ours[i].g - theirs[i].g),
+            std::abs(ours[i].b - theirs[i].b), std::abs(ours[i].a - theirs[i].a)});
+    }
+    CHECK(worst <= 2);
+}
+
+TEST_CASE("an imported PSD round-trips through .sable") {
+    const auto imported = importDocument(testData("layered.psd"));
+    REQUIRE(imported.has_value());
+    const std::uint64_t before = hashCanvas(*imported);
+
+    const auto path = scratchFile("psd_import_roundtrip.sable");
+    REQUIRE(saveProject(*imported, path).has_value());
+    const auto reloaded = loadProject(path);
+    REQUIRE(reloaded.has_value());
+
+    REQUIRE(reloaded->layers.size() == imported->layers.size());
+    for (std::size_t i = 0; i < reloaded->layers.size(); ++i) {
+        CHECK(reloaded->layers[i].name   == imported->layers[i].name);
+        CHECK(reloaded->layers[i].blend  == imported->layers[i].blend);
+        CHECK(reloaded->layers[i].parent == imported->layers[i].parent);
+    }
+    CHECK(hashCanvas(*reloaded) == before);
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("a PSD is recognised by content even when the extension lies") {
+    const auto path = scratchFile("psd_misnamed.sable");
+    std::filesystem::copy_file(testData("layered.psd"), path);
+
+    const auto doc = importDocument(path);
+    REQUIRE(doc.has_value());
+    CHECK(doc->layers.size() == 6);
+    CHECK(doc->path.empty());
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("PSDs Sable cannot read are refused, not read wrong") {
+    // Until 16-bit lands (D-023), the honest answer is a message naming what
+    // the file actually is — never a canvas full of garbage.
+    const auto deep = writePsdHeader("psd_16bit.psd", 16, 3);
+    const auto wide = importDocument(deep);
+    REQUIRE(!wide.has_value());
+    CHECK(wide.error().detail.find("16 bits") != std::string::npos);
+
+    const auto cmyk = writePsdHeader("psd_cmyk.psd", 8, 4);
+    const auto inky = importDocument(cmyk);
+    REQUIRE(!inky.has_value());
+    CHECK(inky.error().detail.find("CMYK") != std::string::npos);
+
+    // Truncation is the common form of corruption, and must not crash.
+    const auto stub = scratchFile("psd_truncated.psd");
+    { FILE* out = std::fopen(stub.string().c_str(), "wb");
+      REQUIRE(out != nullptr);
+      std::fwrite("8BPS\0\1", 1, 6, out);
+      std::fclose(out); }
+    CHECK(!importDocument(stub).has_value());
+
+    std::filesystem::remove(deep);
+    std::filesystem::remove(cmyk);
+    std::filesystem::remove(stub);
+}
+
+// ------------------------------------------------------------ PSD export (#7)
+
+namespace {
+
+/// Everything the writer has to carry: a group with children, a clipped layer,
+/// a hidden layer, non-Normal blend modes and partial opacities.
+///
+/// The background is transparent because PSD has no document background — one
+/// that is not becomes an extra layer, which has its own test below.
+Document psdSampleDocument() {
+    Document doc = makeDocument(300, 200, StraightRgba8{0, 0, 0, 0});
+    doc.dpi = 144;
+    doc.layers[0].name = "Base";
+    paintSquare(doc, doc.activeLayer, StraightRgba8{200, 30, 40, 255}, 80.0, 80.0);
+
+    doc.undo.push(addLayerAbove(doc, doc.activeLayer, "Group"));
+    const LayerId group = doc.activeLayer;
+    doc.layerById(group)->kind    = LayerKind::Folder;
+    doc.layerById(group)->opacity = 0.6f;
+
+    doc.undo.push(addLayerAbove(doc, group, "Fill"));
+    const LayerId fill = doc.activeLayer;
+    doc.layerById(fill)->parent = group;
+    paintSquare(doc, fill, StraightRgba8{20, 60, 200, 255}, 150.0, 100.0);
+
+    doc.undo.push(addLayerAbove(doc, fill, "Tint"));
+    const LayerId tint = doc.activeLayer;
+    doc.layerById(tint)->parent      = group;
+    doc.layerById(tint)->clipToBelow = true;
+    doc.layerById(tint)->blend       = BlendMode::Screen;
+    paintSquare(doc, tint, StraightRgba8{240, 220, 60, 200}, 160.0, 110.0);
+
+    doc.undo.push(addLayerAbove(doc, tint, "Hidden"));
+    doc.layerById(doc.activeLayer)->visible         = false;
+    doc.layerById(doc.activeLayer)->preserveOpacity = true;
+    paintSquare(doc, doc.activeLayer, StraightRgba8{0, 0, 0, 255}, 40.0, 160.0);
+
+    doc.undo.push(addLayerAbove(doc, doc.activeLayer, "Ink"));
+    doc.layerById(doc.activeLayer)->blend   = BlendMode::Multiply;
+    doc.layerById(doc.activeLayer)->opacity = 0.4f;
+    paintSquare(doc, doc.activeLayer, StraightRgba8{40, 200, 90, 220}, 200.0, 150.0);
+    return doc;
+}
+
+/// The same PSD with its layer section removed, so importing it yields only the
+/// merged composite the file carries — which is exactly what a viewer that does
+/// not parse layers shows.
+std::filesystem::path flattenedCopyOfPsd(const std::filesystem::path& src,
+                                         const char* name) {
+    std::vector<unsigned char> bytes;
+    { FILE* in = std::fopen(src.string().c_str(), "rb");
+      REQUIRE(in != nullptr);
+      std::fseek(in, 0, SEEK_END);
+      bytes.resize(static_cast<std::size_t>(std::ftell(in)));
+      std::fseek(in, 0, SEEK_SET);
+      bytes.resize(std::fread(bytes.data(), 1, bytes.size(), in));
+      std::fclose(in); }
+    REQUIRE(bytes.size() > 26);
+
+    // Header, then three length-prefixed sections; the merged image follows.
+    std::size_t at = 26;
+    for (int i = 0; i < 3; ++i) {
+        REQUIRE(at + 4 <= bytes.size());
+        at += 4 + ((static_cast<std::size_t>(bytes[at]) << 24) |
+                   (static_cast<std::size_t>(bytes[at + 1]) << 16) |
+                   (static_cast<std::size_t>(bytes[at + 2]) << 8) |
+                    static_cast<std::size_t>(bytes[at + 3]));
+    }
+    REQUIRE(at <= bytes.size());
+
+    const auto out = scratchFile(name);
+    FILE* file = std::fopen(out.string().c_str(), "wb");
+    REQUIRE(file != nullptr);
+    const std::vector<unsigned char> empty(12, 0);      // three zero lengths
+    std::fwrite(bytes.data(), 1, 26, file);
+    std::fwrite(empty.data(), 1, empty.size(), file);
+    std::fwrite(bytes.data() + at, 1, bytes.size() - at, file);
+    std::fclose(file);
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("a document round-trips through PSD") {
+    const Document original = psdSampleDocument();
+    const std::uint64_t before = hashCanvas(original);
+    const auto path = scratchFile("psd_export_roundtrip.psd");
+
+    REQUIRE(exportDocument(original, path).has_value());
+    const auto loaded = importDocument(path);
+    REQUIRE(loaded.has_value());
+
+    CHECK(loaded->width  == original.width);
+    CHECK(loaded->height == original.height);
+    REQUIRE(loaded->layers.size() == original.layers.size());
+
+    for (std::size_t i = 0; i < loaded->layers.size(); ++i) {
+        const Layer& a = original.layers[i];
+        const Layer& b = loaded->layers[i];
+        CHECK(b.name    == a.name);
+        CHECK(b.kind    == a.kind);
+        CHECK(b.blend   == a.blend);
+        CHECK(b.visible == a.visible);
+        CHECK(b.clipToBelow     == a.clipToBelow);
+        CHECK(b.preserveOpacity == a.preserveOpacity);
+        CHECK(b.opacity == doctest::Approx(a.opacity).epsilon(0.005));
+        // Ids are reassigned on import, so group membership is checked by
+        // position rather than by number.
+        CHECK(b.parent.has_value() == a.parent.has_value());
+    }
+
+    // Group membership survives, which is the part PSD's begin/end markers are
+    // doing all the work for.
+    const Layer* group = layerNamed(*loaded, "Group");
+    REQUIRE(group != nullptr);
+    CHECK(group->kind == LayerKind::Folder);
+    for (const char* child : {"Fill", "Tint"})
+        CHECK(layerNamed(*loaded, child)->parent == group->id);
+
+    // Pixels: exact, not merely close. Layer data is straight alpha in a PSD
+    // exactly as it is in a .sable, so this is the same premultiply round trip
+    // the project format already relies on (D-004).
+    CHECK(hashCanvas(*loaded) == before);
+    CHECK(loaded->path.empty());
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("the PSD composite section matches flatten()") {
+    // Many viewers read only the merged image, so it is not decoration. The
+    // copy below has its layer section stripped, which is what those viewers
+    // effectively see.
+    const Document original = psdSampleDocument();
+    const auto path = scratchFile("psd_export_composite.psd");
+    REQUIRE(exportDocument(original, path).has_value());
+
+    const auto stripped = flattenedCopyOfPsd(path, "psd_export_merged.psd");
+    const auto merged = importDocument(stripped);
+    REQUIRE(merged.has_value());
+    REQUIRE(merged->layers.size() == 1);
+
+    const std::vector<StraightRgba8> expected = flatten(original);
+    const std::vector<StraightRgba8> got      = flatten(*merged);
+    REQUIRE(got.size() == expected.size());
+    CHECK(got == expected);
+
+    std::filesystem::remove(path);
+    std::filesystem::remove(stripped);
+}
+
+TEST_CASE("an opaque document background is written as a layer") {
+    // PSD has nowhere to put a document background, so it becomes the bottom
+    // layer. One more layer than was exported, and identical pixels — the
+    // alternative loses the background entirely.
+    Document doc = psdSampleDocument();
+    doc.background = StraightRgba8{240, 230, 220, 255};
+    const std::uint64_t before = hashCanvas(doc);
+
+    const auto path = scratchFile("psd_export_background.psd");
+    REQUIRE(exportDocument(doc, path).has_value());
+    const auto loaded = importDocument(path);
+    REQUIRE(loaded.has_value());
+
+    REQUIRE(loaded->layers.size() == doc.layers.size() + 1);
+    CHECK(loaded->layers.front().name == "Background");
+    CHECK(loaded->background.a == 0);
+    CHECK(hashCanvas(*loaded) == before);
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("exporting a PSD leaves the document alone, dirty flag included") {
+    // US-07.5, the same guarantee PNG export gives.
+    Document doc = psdSampleDocument();
+    doc.dirty = true;
+    const std::uint64_t before = hashCanvas(doc);
+    const std::size_t layers = doc.layers.size();
+
+    const auto path = scratchFile("psd_export_untouched.psd");
+    REQUIRE(exportDocument(doc, path).has_value());
+    CHECK(doc.dirty);
+    CHECK(doc.layers.size() == layers);
+    CHECK(hashCanvas(doc) == before);
+    CHECK(doc.path.empty());
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("PSD export refuses rather than writing a file no reader accepts") {
+    Document doc = psdSampleDocument();
+    doc.width = 40000;                       // past PSD's own limit; PSB territory
+    const auto path = scratchFile("psd_export_huge.psd");
+    const auto written = exportDocument(doc, path);
+    REQUIRE(!written.has_value());
+    CHECK(written.error().detail.find("30000") != std::string::npos);
+    CHECK(!std::filesystem::exists(path));
+}
+
+TEST_CASE("the registry offers PSD for export as well as import") {
+    const auto exportable = dialogFilters(FormatUse::Write, false);
+    CHECK(std::ranges::any_of(exportable, [](const DialogFilter& f) {
+        return f.pattern == "psd";
     }));
 }
 
@@ -2264,6 +3227,309 @@ TEST_CASE("a failed write returns an error rather than terminating") {
     REQUIRE(!result.has_value());
     CHECK(!result.error().detail.empty());
     CHECK(!describe(result.error().kind).empty());
+}
+
+// ------------------------------------------------------------ OpenRaster (#8)
+
+namespace {
+
+std::filesystem::path fixture(const char* name) {
+    return std::filesystem::path(SABLE_FIXTURE_DIR) / name;
+}
+
+const Layer* byName(const Document& doc, std::string_view name) {
+    for (const Layer& layer : doc.layers)
+        if (layer.name == name) return &layer;
+    return nullptr;
+}
+
+/// A stack with everything ORA has to carry: a group, a nested child, blend
+/// modes on both, fractional opacity and a hidden layer.
+Document oraSampleDocument() {
+    Document doc = makeDocument(300, 200, StraightRgba8{250, 245, 235, 255});
+    doc.layerById(doc.activeLayer)->name = "Base";
+    paintSquare(doc, doc.activeLayer, StraightRgba8{200, 30, 40, 255}, 60.0, 60.0);
+
+    doc.undo.push(addLayerAbove(doc, doc.activeLayer, "Group"));
+    const LayerId group = doc.activeLayer;
+    doc.layerById(group)->kind    = LayerKind::Folder;
+    doc.layerById(group)->opacity = 0.7f;
+    doc.layerById(group)->blend   = BlendMode::Screen;
+
+    doc.undo.push(addLayerAbove(doc, group, "Hidden"));
+    doc.layerById(doc.activeLayer)->visible = false;
+    paintSquare(doc, doc.activeLayer, StraightRgba8{0, 0, 0, 255}, 250.0, 150.0);
+
+    doc.undo.push(addLayerAbove(doc, group, "Inside"));
+    const LayerId inside = doc.activeLayer;
+    doc.layerById(inside)->parent  = group;
+    doc.layerById(inside)->blend   = BlendMode::ColourDodge;
+    doc.layerById(inside)->opacity = 0.35f;
+    paintSquare(doc, inside, StraightRgba8{20, 90, 200, 255}, 120.0, 90.0);
+    return doc;
+}
+
+}  // namespace
+
+TEST_CASE("a document round-trips through .ora") {
+    const Document doc = oraSampleDocument();
+    const std::uint64_t before = hashCanvas(doc);
+
+    const auto path = scratchFile("roundtrip.ora");
+    REQUIRE(exportDocument(doc, path).has_value());
+
+    const auto loaded = importDocument(path);
+    REQUIRE(loaded.has_value());
+    // An import is a copy of someone else's file, never the document (D-024).
+    CHECK(loaded->path.empty());
+    CHECK(loaded->width == doc.width);
+    CHECK(loaded->height == doc.height);
+    CHECK(hashCanvas(*loaded) == before);
+    REQUIRE(loaded->layers.size() == doc.layers.size());
+
+    // Compared by name, not by index: ORA nests a folder's children while
+    // Sable's vector is flat, so the two orders need not agree for the two
+    // stacks to be the same stack.
+    for (const Layer& original : doc.layers) {
+        const Layer* same = byName(*loaded, original.name);
+        REQUIRE(same != nullptr);
+        CHECK(same->kind == original.kind);
+        CHECK(same->visible == original.visible);
+        CHECK(same->blend == original.blend);
+        CHECK(same->opacity == doctest::Approx(original.opacity));
+    }
+    const Layer* group  = byName(*loaded, "Group");
+    const Layer* inside = byName(*loaded, "Inside");
+    const Layer* hidden = byName(*loaded, "Hidden");
+    REQUIRE(group != nullptr);
+    REQUIRE(inside != nullptr);
+    REQUIRE(hidden != nullptr);
+    CHECK(inside->parent == group->id);
+    CHECK(!hidden->parent.has_value());
+
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("an exported .ora carries a mergedimage that is exactly flatten()") {
+    const Document doc = oraSampleDocument();
+    const auto path = scratchFile("merged.ora");
+    REQUIRE(exportDocument(doc, path).has_value());
+
+    mz_zip_archive zip{};
+    REQUIRE(mz_zip_reader_init_file(&zip, path.string().c_str(), 0));
+    std::size_t size = 0;
+    void* data = mz_zip_reader_extract_file_to_heap(&zip, "mergedimage.png", &size, 0);
+    REQUIRE(data != nullptr);
+
+    std::vector<unsigned char> decoded;
+    unsigned w = 0, h = 0;
+    const unsigned failed =
+        lodepng::decode(decoded, w, h, static_cast<const unsigned char*>(data), size);
+    mz_free(data);
+    mz_zip_reader_end(&zip);
+    REQUIRE(failed == 0);
+
+    CHECK(w == static_cast<unsigned>(doc.width));
+    CHECK(h == static_cast<unsigned>(doc.height));
+    const std::vector<StraightRgba8> expected = flatten(doc);
+    REQUIRE(decoded.size() == expected.size() * 4);
+    bool identical = true;
+    for (std::size_t i = 0; i < expected.size(); ++i)
+        identical = identical && decoded[i * 4 + 0] == expected[i].r &&
+                    decoded[i * 4 + 1] == expected[i].g &&
+                    decoded[i * 4 + 2] == expected[i].b &&
+                    decoded[i * 4 + 3] == expected[i].a;
+    CHECK(identical);
+
+    // The spec's other required entries, which are what other applications
+    // look for before they parse anything.
+    CHECK(hasZipEntry(path, "mimetype"));
+    CHECK(hasZipEntry(path, "stack.xml"));
+    CHECK(hasZipEntry(path, "Thumbnails/thumbnail.png"));
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("a .ora written by Krita imports with its stack intact") {
+    // tests/fixtures/krita.ora was exported by Krita 6.0.3, not by Sable.
+    const auto doc = importDocument(fixture("krita.ora"));
+    REQUIRE(doc.has_value());
+    CHECK(doc->path.empty());
+    CHECK(doc->width == 64);
+    CHECK(doc->height == 48);
+    // Base, Group, Inside, Top, Hidden, Fade — and the empty "Background"
+    // layer Krita puts at the bottom of every new document.
+    CHECK(doc->layers.size() == 7);
+
+    const Layer* group  = byName(*doc, "Group");
+    const Layer* inside = byName(*doc, "Inside");
+    const Layer* top    = byName(*doc, "Top");
+    const Layer* fade   = byName(*doc, "Fade");
+    const Layer* hidden = byName(*doc, "Hidden");
+    const Layer* base   = byName(*doc, "Base");
+    REQUIRE(group != nullptr);
+    REQUIRE(inside != nullptr);
+    REQUIRE(top != nullptr);
+    REQUIRE(fade != nullptr);
+    REQUIRE(hidden != nullptr);
+    REQUIRE(base != nullptr);
+
+    CHECK(group->kind == LayerKind::Folder);
+    CHECK(group->opacity == doctest::Approx(0.501961));
+    CHECK(inside->parent == group->id);
+    CHECK(inside->kind == LayerKind::Raster);
+    CHECK(top->blend == BlendMode::Multiply);       // svg:multiply
+    CHECK(top->opacity == doctest::Approx(0.6));
+    CHECK(hidden->visible == false);
+
+    // Pixels, not only metadata: "Base" is opaque red over the whole canvas,
+    // "Inside" an opaque blue square at (8, 8), and "Fade" half-alpha red at
+    // (0, 24) — which is where a wrong straight-to-premultiplied conversion
+    // would show up.
+    const Tile* baseTile = base->find(TileKey{0, 0});
+    REQUIRE(baseTile != nullptr);
+    CHECK(baseTile->pixel(2, 2) == PremulRgba8{255, 0, 0, 255});
+
+    const Tile* insideTile = inside->find(TileKey{0, 0});
+    REQUIRE(insideTile != nullptr);
+    CHECK(insideTile->pixel(16, 16) == PremulRgba8{0, 0, 255, 255});
+    CHECK(insideTile->pixel(2, 2) == PremulRgba8{0, 0, 0, 0});
+
+    const Tile* fadeTile = fade->find(TileKey{0, 0});
+    REQUIRE(fadeTile != nullptr);
+    CHECK(fadeTile->pixel(5, 30) == PremulRgba8{128, 0, 0, 128});
+
+    // ORA has no background of its own, so an imported image keeps its
+    // transparency rather than gaining a white sheet under it.
+    CHECK(doc->background.a == 0);
+}
+
+TEST_CASE("a misnamed .ora is still read as one") {
+    // .sable, .ora and .kra are all ZIPs; the mimetype and stack.xml entries
+    // are what the registry sniffs (D-024).
+    const auto path = scratchFile("misnamed_ora.sable");
+    std::filesystem::copy_file(fixture("krita.ora"), path);
+
+    const auto doc = importDocument(path);
+    REQUIRE(doc.has_value());
+    CHECK(doc->width == 64);
+    CHECK(doc->path.empty());
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("a malformed .ora fails with a message rather than a crash") {
+    const auto path = scratchFile("broken.ora");
+    { FILE* out = std::fopen(path.string().c_str(), "wb");
+      REQUIRE(out != nullptr);
+      std::fwrite("PK\x03\x04 and then rubbish", 1, 22, out);
+      std::fclose(out); }
+
+    const auto doc = importDocument(path);
+    REQUIRE(!doc.has_value());
+    CHECK(!doc.error().detail.empty());
+    std::filesystem::remove(path);
+}
+
+// ------------------------------------------------------------------ Krita (#9)
+
+TEST_CASE("a .kra written by Krita imports with its layer stack intact") {
+    // tests/fixtures/krita.kra was saved by Krita 6.0.3. It holds, bottom to
+    // top: an empty Background, an opaque red Base, a half-opacity Group with
+    // a blue square inside it, a multiply layer at 60%, a hidden layer, a
+    // half-alpha layer, and an invert FILTER layer that Sable cannot read.
+    const auto doc = importDocument(fixture("krita.kra"));
+    REQUIRE(doc.has_value());
+    CHECK(doc->path.empty());          // never the artist's file (D-024)
+    CHECK(doc->width == 64);
+    CHECK(doc->height == 48);
+    CHECK(doc->dpi == 72);
+
+    // Seven layers arrived; the filter layer was skipped rather than sinking
+    // the load.
+    CHECK(doc->layers.size() == 7);
+    CHECK(byName(*doc, "Invert") == nullptr);
+
+    // Krita's layers are unbounded, and the tiles it stores are only what
+    // differs from the layer's default pixel. Krita's own Background layer
+    // stores NO tiles at all and is opaque white purely by that default, so
+    // ignoring it would quietly drop the white background out of every
+    // document an artist brings over.
+    const Layer* background = byName(*doc, "Background");
+    REQUIRE(background != nullptr);
+    const Tile* backgroundTile = background->find(TileKey{0, 0});
+    REQUIRE(backgroundTile != nullptr);
+    CHECK(backgroundTile->pixel(40, 40) == PremulRgba8{255, 255, 255, 255});
+
+    const Layer* group  = byName(*doc, "Group");
+    const Layer* inside = byName(*doc, "Inside");
+    const Layer* top    = byName(*doc, "Top");
+    const Layer* fade   = byName(*doc, "Fade");
+    const Layer* hidden = byName(*doc, "Hidden");
+    const Layer* base   = byName(*doc, "Base");
+    REQUIRE(group != nullptr);
+    REQUIRE(inside != nullptr);
+    REQUIRE(top != nullptr);
+    REQUIRE(fade != nullptr);
+    REQUIRE(hidden != nullptr);
+    REQUIRE(base != nullptr);
+
+    CHECK(group->kind == LayerKind::Folder);
+    CHECK(group->opacity == doctest::Approx(128.0 / 255.0));
+    CHECK(inside->parent == group->id);
+    CHECK(!base->parent.has_value());
+    CHECK(top->blend == BlendMode::Multiply);
+    CHECK(top->opacity == doctest::Approx(153.0 / 255.0));
+    CHECK(hidden->visible == false);
+
+    // The pixels, which is what the tiled, LZF-compressed, plane-separated
+    // layer data is for. Krita stores B, G, R, A planes with straight alpha;
+    // any of those three read wrongly and these three checks fail.
+    const Tile* baseTile = base->find(TileKey{0, 0});
+    REQUIRE(baseTile != nullptr);
+    CHECK(baseTile->pixel(2, 2) == PremulRgba8{255, 0, 0, 255});
+
+    const Tile* insideTile = inside->find(TileKey{0, 0});
+    REQUIRE(insideTile != nullptr);
+    CHECK(insideTile->pixel(16, 16) == PremulRgba8{0, 0, 255, 255});
+    CHECK(insideTile->pixel(2, 2) == PremulRgba8{0, 0, 0, 0});
+
+    const Tile* fadeTile = fade->find(TileKey{0, 0});
+    REQUIRE(fadeTile != nullptr);
+    CHECK(fadeTile->pixel(5, 30) == PremulRgba8{128, 0, 0, 128});
+
+    // The same document exported to ORA by Krita must import to the same
+    // picture — two readers, two containers, one answer.
+    const auto viaOra = importDocument(fixture("krita.ora"));
+    REQUIRE(viaOra.has_value());
+    CHECK(hashCanvas(*doc) == hashCanvas(*viaOra));
+}
+
+TEST_CASE("a misnamed .kra is still read as one") {
+    const auto path = scratchFile("misnamed_kra.sable");
+    std::filesystem::copy_file(fixture("krita.kra"), path);
+
+    const auto doc = importDocument(path);
+    REQUIRE(doc.has_value());
+    CHECK(doc->width == 64);
+    CHECK(doc->path.empty());
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("a malformed .kra fails with a message rather than a crash") {
+    const auto path = scratchFile("broken.kra");
+    { FILE* out = std::fopen(path.string().c_str(), "wb");
+      REQUIRE(out != nullptr);
+      std::fwrite("PK\x03\x04 not really a Krita document", 1, 33, out);
+      std::fclose(out); }
+
+    const auto doc = importDocument(path);
+    REQUIRE(!doc.has_value());
+    CHECK(!doc.error().detail.empty());
+    std::filesystem::remove(path);
+
+    // Sable writes no .kra: reading someone else's format is interop, writing
+    // it is a promise about fidelity we have not made.
+    const auto written = exportDocument(oraSampleDocument(), scratchFile("nope.kra"));
+    REQUIRE(!written.has_value());
 }
 
 // -------------------------------------------------------------- paint backend
