@@ -110,7 +110,9 @@ add_library(engine STATIC
   engine/src/paint.cpp
   engine/src/io.cpp
   engine/src/project.cpp
-  engine/src/format.cpp)
+  engine/src/format.cpp
+  engine/src/openraster.cpp
+  engine/src/xml.cpp)
 target_include_directories(engine PUBLIC engine/include)
 target_link_libraries(engine PRIVATE lodepng miniz nlohmann_json)
 target_compile_options(engine PRIVATE ${SABLE_WARNINGS})
@@ -222,7 +224,12 @@ if(SABLE_BUILD_TESTS)
 
   # Headless by design (D-003) — these run in CI with no display server.
   add_executable(engine_tests tests/tests.cpp)
-  target_link_libraries(engine_tests PRIVATE sable::engine doctest miniz nlohmann_json)
+  target_link_libraries(engine_tests PRIVATE sable::engine doctest lodepng miniz
+                                             nlohmann_json)
+  # Interop fixtures are real files written by other applications; the tests
+  # read them from the source tree rather than copying them into the build.
+  target_compile_definitions(engine_tests PRIVATE
+    SABLE_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
   # The allocation counter (US-02.9) replaces global operator new/delete, which
   # both compilers misread as a malloc/delete mismatch. It is not one.
   target_compile_options(engine_tests PRIVATE ${SABLE_WARNINGS})

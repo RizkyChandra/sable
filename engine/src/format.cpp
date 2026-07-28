@@ -7,6 +7,7 @@
 
 #include "miniz.h"
 #include "miniz_zip.h"
+#include "sbl/openraster.hpp"
 #include "sbl/project.hpp"
 
 namespace sbl {
@@ -35,6 +36,11 @@ bool looksLikeSable(const std::filesystem::path& path) {
     return hasZipEntry(path, "document.json");
 }
 
+/// A .kra has a mimetype entry too, so the manifest is what separates them.
+bool looksLikeOpenRaster(const std::filesystem::path& path) {
+    return hasZipEntry(path, "mimetype") && hasZipEntry(path, "stack.xml");
+}
+
 /// The built-in table. An importer adds one entry here and nothing else.
 std::vector<Format> builtinFormats() {
     std::vector<Format> all;
@@ -42,6 +48,11 @@ std::vector<Format> builtinFormats() {
         .id = "sable", .label = "Sable project", .extensions = {"sable"},
         .nativeProject = true,
         .read = &loadProject, .write = &saveProject, .sniff = &looksLikeSable});
+    all.push_back(Format{
+        .id = "ora", .label = "OpenRaster image", .extensions = {"ora"},
+        .nativeProject = false,
+        .read = &readOpenRaster, .write = &writeOpenRaster,
+        .sniff = &looksLikeOpenRaster});
     all.push_back(Format{
         .id = "png", .label = "PNG image", .extensions = {"png"},
         .nativeProject = false,
