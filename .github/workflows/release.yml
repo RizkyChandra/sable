@@ -130,6 +130,20 @@ jobs:
       # and on Windows and macOS it is the ONLY evidence the application runs
       # at all — neither platform has ever been exercised by hand (PRD §3
       # lists them as v1 non-goals).
+      # A dynamically linked release binary is a broken release binary: it
+      # fails on a machine without the toolchain, with no message at all. This
+      # proves the shipped executable stands alone.
+      - name: Check the binary is self-contained
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "DLL imports of sable.exe:"
+          objdump -p build/sable.exe | grep -i 'DLL Name' | sort -u
+          if objdump -p build/sable.exe | grep -qiE 'libstdc\+\+|libgcc_s|libwinpthread'; then
+            echo "::error::sable.exe still depends on MinGW runtime DLLs"
+            exit 1
+          fi
+
       - name: Self-test
         shell: bash
         env:
@@ -138,7 +152,7 @@ jobs:
           if [ "${{ runner.os }}" = "macOS" ]; then
             ./build/Sable.app/Contents/MacOS/Sable --selftest
           elif [ "${{ runner.os }}" = "Windows" ]; then
-            ./build/sable.exe --selftest || exit 1
+            ./build/sable.exe --selftest
           else
             ./build/sable --selftest
           fi

@@ -143,6 +143,18 @@ if(SABLE_BUILD_APP)
   if(WIN32 AND NOT SABLE_CONSOLE)
     set_target_properties(sable PROPERTIES WIN32_EXECUTABLE ON)
   endif()
+
+  # MinGW links libstdc++, libgcc and libwinpthread as DLLs by default. A
+  # downloaded sable.exe must not require the user to have a MinGW toolchain
+  # installed, so the runtime is linked in. This is a distribution
+  # requirement, not a convenience — without it the executable simply fails to
+  # start, with no message.
+  if(MINGW)
+    target_link_options(sable PRIVATE -static -static-libgcc -static-libstdc++)
+    if(TARGET engine_tests)
+      target_link_options(engine_tests PRIVATE -static -static-libgcc -static-libstdc++)
+    endif()
+  endif()
   if(APPLE)
     set_target_properties(sable PROPERTIES
       MACOSX_BUNDLE ON
