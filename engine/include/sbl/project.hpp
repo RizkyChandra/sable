@@ -23,7 +23,12 @@ namespace sbl {
 /// 2 added `vanishing_points`. Everything it adds is optional, so a v1 file
 /// still loads unchanged — the bump exists so an OLDER Sable refuses a file
 /// whose perspective guides it would silently drop on the next save.
-inline constexpr int SABLE_FORMAT_VERSION = 2;
+///
+/// 3 added text layers: `"kind": "text"` and a `text` object beside it. Same
+/// bargain — older files load untouched, and an older Sable refuses a v3 file
+/// rather than opening it, dropping the words, and saving back a picture the
+/// artist can no longer edit.
+inline constexpr int SABLE_FORMAT_VERSION = 3;
 
 /// Undo history is deliberately not saved.
 [[nodiscard]] std::expected<void, Error> saveProject(

@@ -90,6 +90,21 @@ target_include_directories(miniz SYSTEM PUBLIC
   ${miniz_SOURCE_DIR} ${CMAKE_BINARY_DIR}/miniz_generated)
 set_target_properties(miniz PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# stb_truetype — glyph rasterising for the text tool (#20). Public domain, one
+# header, and the same rasteriser Dear ImGui already bundles. Fetched from
+# upstream rather than reached for inside ImGui's tree because the engine has
+# to build with SABLE_BUILD_APP=OFF, which is when ImGui is not fetched at all.
+# stb has never cut a release tag, so a SHA is the only reproducible pin —
+# 2026-07-28's master, same reasoning as lodepng above.
+FetchContent_Declare(stb
+  GIT_REPOSITORY https://github.com/nothings/stb.git
+  GIT_TAG        31c1ad37456438565541f4919958214b6e762fb4
+  SOURCE_SUBDIR  do-not-configure)
+FetchContent_MakeAvailable(stb)
+
+add_library(stb_truetype INTERFACE)
+target_include_directories(stb_truetype SYSTEM INTERFACE ${stb_SOURCE_DIR})
+
 # nlohmann/json — the .sable manifest. One header.
 FetchContent_Declare(nlohmann_json
   GIT_REPOSITORY https://github.com/nlohmann/json.git
@@ -114,9 +129,10 @@ add_library(engine STATIC
   engine/src/io.cpp
   engine/src/project.cpp
   engine/src/format.cpp
-  engine/src/psd.cpp)
+  engine/src/psd.cpp
+  engine/src/text.cpp)
 target_include_directories(engine PUBLIC engine/include)
-target_link_libraries(engine PRIVATE lodepng miniz nlohmann_json)
+target_link_libraries(engine PRIVATE lodepng miniz nlohmann_json stb_truetype)
 target_compile_options(engine PRIVATE ${SABLE_WARNINGS})
 add_library(sable::engine ALIAS engine)
 
@@ -146,7 +162,8 @@ if(SABLE_BUILD_APP)
 
   add_executable(sable app/src/main.cpp app/src/canvas_view.cpp
                        app/src/widgets.cpp app/src/settings.cpp
-                       app/src/shortcuts.cpp app/src/icons.cpp)
+                       app/src/shortcuts.cpp app/src/icons.cpp
+                       app/src/text_tool.cpp)
 
   # A GUI application on Windows, and a real bundle on macOS — an unbundled
   # binary there cannot take keyboard focus properly.

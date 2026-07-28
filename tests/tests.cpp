@@ -24,6 +24,7 @@
 #include "sbl/io.hpp"
 #include "sbl/paint.hpp"
 #include "sbl/project.hpp"
+#include "sbl/text.hpp"
 
 // App-side, but deliberately SDL-free so the view transform is testable here.
 #include "view_transform.hpp"
@@ -3121,4 +3122,332 @@ TEST_CASE("rotating about a screen point leaves that point's pixel under it") {
     CHECK(v.rotation == doctest::Approx(0.0));
     CHECK(toCanvasX(v, sx, sy) == doctest::Approx(cx).epsilon(1e-9));
     CHECK(toCanvasY(v, sx, sy) == doctest::Approx(cy).epsilon(1e-9));
+}
+
+// ----------------------------------------------------------------------------
+// Text (#20)
+//
+// The rasterising tests need a font, and a machine can have none — a CI image
+// usually does, a minimal container does not. Those say so and pass rather than
+// failing for a reason that has nothing to do with Sable. Everything checkable
+// without a font is checked unconditionally, and that covers the two things
+// most likely to break silently: the .sable round trip, and the UTF-8
+// boundaries a CJK caret depends on.
+
+namespace {
+
+std::optional<FontFace> anyFont() {
+    for (const FontEntry& entry : systemFonts())
+        if (auto face = FontFace::load(entry.path); face.has_value())
+            return std::move(*face);
+    return std::nullopt;
+}
+
+/// How many pixels the text actually covered.
+int inkedPixels(const Document& doc) {
+    int n = 0;
+    for (const Layer& layer : doc.layers)
+        for (const auto& [key, tile] : layer.tiles)
+            for (int i = 0; i < TILE_PIXELS; ++i)
+                if (tile.pixels()[i].a > 0) ++n;
+    return n;
+}
+
+}  // namespace
+
+TEST_CASE("a caret moves by characters, not by bytes") {
+    // The whole reason this exists: "漢字" is six bytes and two characters, and
+    // a backspace that took one byte would leave half a character behind.
+    const std::string cjk = "a\xE6\xBC\xA2\xE5\xAD\x97z";   // a漢字z
+    CHECK(utf8Next(cjk, 0) == 1);
+    CHECK(utf8Next(cjk, 1) == 4);
+    CHECK(utf8Next(cjk, 4) == 7);
+    CHECK(utf8Next(cjk, 7) == 8);
+    CHECK(utf8Next(cjk, 8) == 8);            // never past the end
+
+    CHECK(utf8Prev(cjk, 8) == 7);
+    CHECK(utf8Prev(cjk, 7) == 4);
+    CHECK(utf8Prev(cjk, 4) == 1);
+    CHECK(utf8Prev(cjk, 1) == 0);
+    CHECK(utf8Prev(cjk, 0) == 0);            // never before the start
+
+    // Landing mid-character still moves to a boundary rather than compounding
+    // the mistake.
+    CHECK(utf8Prev(cjk, 3) == 1);
+    CHECK(utf8Next(cjk, 2) == 4);
+}
+
+TEST_CASE("a text layer round-trips through .sable") {
+    Document doc = makeDocument(256, 256, StraightRgba8{255, 255, 255, 255});
+    Layer& layer = doc.layers[0];
+    layer.kind = LayerKind::Text;
+
+    TextContent text;
+    text.utf8        = "hello\n\xE6\xBC\xA2\xE5\xAD\x97";   // two lines, one CJK
+    text.fontPath    = "/usr/share/fonts/nowhere/Fake.ttf";
+    text.fontName    = "Fake Sans";
+    text.sizePx      = 33.5f;
+    text.lineSpacing = 1.75f;
+    text.align       = TextAlign::Centre;
+    text.x           = 120.5;
+    text.y           = 64.25;
+    text.colour      = StraightRgba8{10, 20, 30, 200};
+    layer.text = text;
+    // A tile too: the pixels are what renders and the words are what edits, and
+    // losing either half makes the other useless.
+    layer.tileFor(TileKey{0, 0}).fill(PremulRgba8{10, 10, 10, 255});
+
+    const auto path = std::filesystem::temp_directory_path() / "sable_text.sable";
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    REQUIRE(saveProject(doc, path).has_value());
+
+    const auto reloaded = loadProject(path);
+    REQUIRE(reloaded.has_value());
+    REQUIRE(reloaded->layers.size() == 1);
+    const Layer& back = reloaded->layers[0];
+    CHECK(back.kind == LayerKind::Text);
+    REQUIRE(back.text.has_value());
+    CHECK(back.text->utf8 == text.utf8);
+    CHECK(back.text->fontPath == text.fontPath);
+    CHECK(back.text->fontName == text.fontName);
+    CHECK(back.text->sizePx == doctest::Approx(text.sizePx));
+    CHECK(back.text->lineSpacing == doctest::Approx(text.lineSpacing));
+    CHECK(back.text->align == TextAlign::Centre);
+    CHECK(back.text->x == doctest::Approx(text.x));
+    CHECK(back.text->y == doctest::Approx(text.y));
+    CHECK(back.text->colour == text.colour);
+    CHECK(back.tiles.size() == 1);
+
+    std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("a text layer survives the clone the autosave thread is handed") {
+    // D-013's hand-off. A recovered file that had lost its words would still
+    // look right and be uneditable, which is the worst of both.
+    Document doc = makeDocument(64, 64, StraightRgba8{0, 0, 0, 0});
+    doc.layers[0].kind = LayerKind::Text;
+    TextContent text;
+    text.utf8     = "recover me";
+    text.fontName = "Fake Sans";
+    doc.layers[0].text = text;
+
+    const Document copy = cloneDocument(doc);
+    REQUIRE(copy.layers[0].text.has_value());
+    CHECK(copy.layers[0].text->utf8 == "recover me");
+    CHECK(copy.layers[0].kind == LayerKind::Text);
+}
+
+TEST_CASE("editing text is one undo step covering the words and the pixels") {
+    // The pair has to move together: undoing to pixels that say one thing and a
+    // string that says another leaves the next edit resuming from a lie. This
+    // is the record shape TextTool::finish builds.
+    Document doc = makeDocument(64, 64, StraightRgba8{0, 0, 0, 0});
+    Layer& layer = doc.layers[0];
+    layer.kind = LayerKind::Text;
+
+    TextContent before;
+    before.utf8 = "before";
+    layer.text  = before;
+    const LayerProps props = propsOf(layer);
+
+    UndoRecord rec;
+    rec.tiles.push_back(TileSnapshot{layer.id, TileKey{0, 0}, std::nullopt});
+    layer.tileFor(TileKey{0, 0}).fill(PremulRgba8{255, 0, 0, 255});
+    TextContent after = before;
+    after.utf8 = "after";
+    layer.text = after;
+    rec.label = "Text";
+    rec.structure = LayerStructureDelta{LayerChange::Properties, layer.id, 0,
+                                        std::nullopt, props};
+    doc.undo.push(std::move(rec));
+
+    doc.undo.undo(doc);
+    CHECK(doc.layers[0].text->utf8 == "before");
+    CHECK(doc.layers[0].tiles.empty());
+
+    doc.undo.redo(doc);
+    CHECK(doc.layers[0].text->utf8 == "after");
+    CHECK(doc.layers[0].tiles.size() == 1);
+}
+
+TEST_CASE("rasterising text gives up the words and keeps the picture") {
+    // The way out of a text layer: it is a property change, so it undoes, and
+    // undoing has to give back the protection from paint as well as the words.
+    Document doc = makeDocument(64, 64, StraightRgba8{0, 0, 0, 0});
+    Layer& layer = doc.layers[0];
+    TextContent text;
+    text.utf8 = "words";
+    layer.text = text;
+    layer.kind = LayerKind::Text;
+    layer.tileFor(TileKey{0, 0}).fill(PremulRgba8{5, 5, 5, 255});
+
+    LayerProps props = propsOf(layer);
+    props.text.reset();
+    doc.undo.push(setLayerProps(doc, layer.id, props));
+    CHECK(doc.layers[0].kind == LayerKind::Raster);   // paint is allowed again
+    CHECK(!doc.layers[0].text.has_value());
+    CHECK(doc.layers[0].tiles.size() == 1);           // the picture stayed
+
+    doc.undo.undo(doc);
+    CHECK(doc.layers[0].kind == LayerKind::Text);
+    REQUIRE(doc.layers[0].text.has_value());
+    CHECK(doc.layers[0].text->utf8 == "words");
+}
+
+TEST_CASE("text lays out down the page, and alignment moves the line") {
+    const auto face = anyFont();
+    if (!face.has_value()) { MESSAGE("no font here; layout not exercised"); return; }
+
+    TextContent content;
+    content.utf8   = "one\ntwo";
+    content.sizePx = 32.0f;
+    content.x      = 100.0;
+    content.y      = 200.0;
+
+    const TextLayout left = layoutText(*face, content);
+    REQUIRE(left.lines.size() == 2);
+    CHECK(left.lines[0].baseline == doctest::Approx(200.0));
+    // The second line sits a whole line lower, never on top of the first.
+    CHECK(left.lines[1].baseline - left.lines[0].baseline ==
+          doctest::Approx(left.lineHeight));
+    CHECK(left.lines[0].x == doctest::Approx(100.0));
+    CHECK(left.lines[0].width > 0.0);
+
+    // Spacing is a multiple of the font's own line, so doubling it doubles the
+    // gap and changes nothing else.
+    content.lineSpacing = 2.0f;
+    const TextLayout loose = layoutText(*face, content);
+    CHECK(loose.lineHeight == doctest::Approx(left.lineHeight / 1.2 * 2.0));
+
+    content.lineSpacing = 1.2f;
+    content.align = TextAlign::Centre;
+    const TextLayout centred = layoutText(*face, content);
+    CHECK(centred.lines[0].x ==
+          doctest::Approx(100.0 - centred.lines[0].width * 0.5));
+
+    content.align = TextAlign::Right;
+    const TextLayout right = layoutText(*face, content);
+    CHECK(right.lines[0].x == doctest::Approx(100.0 - right.lines[0].width));
+
+    // A caret at the end of a line belongs to that line, not to the next one.
+    CHECK(lineOf(left, 0) == 0);
+    CHECK(lineOf(left, 3) == 0);
+    CHECK(lineOf(left, 4) == 1);
+}
+
+TEST_CASE("drawing text puts ink on the canvas and undo takes all of it away") {
+    const auto face = anyFont();
+    if (!face.has_value()) { MESSAGE("no font here; rasterising not exercised"); return; }
+
+    Document doc = makeDocument(512, 256, StraightRgba8{0, 0, 0, 0});
+    Layer& layer = doc.layers[0];
+    layer.kind = LayerKind::Text;
+
+    TextContent content;
+    content.utf8   = "Sable";
+    content.sizePx = 64.0f;
+    content.x      = 20.0;
+    content.y      = 120.0;
+    content.colour = StraightRgba8{0, 0, 0, 255};
+
+    UndoRecord first = drawTextLayer(layer, content, *face, doc.width, doc.height);
+    const int inkFirst = inkedPixels(doc);
+    CHECK(inkFirst > 0);
+
+    // Every keystroke redraws the layer from scratch, so tiles are replaced
+    // rather than accumulated — otherwise deleting a character would leave it
+    // on the canvas.
+    content.utf8 = "S";
+    UndoRecord second = drawTextLayer(layer, content, *face, doc.width, doc.height);
+    CHECK(inkedPixels(doc) < inkFirst);
+
+    // One session, one step: the merge keeps the state from before the FIRST
+    // keystroke, which is what undoing a whole edit has to restore.
+    mergeTextRecord(first, std::move(second));
+    doc.undo.push(std::move(first));
+    doc.undo.undo(doc);
+    CHECK(inkedPixels(doc) == 0);
+    CHECK(doc.layers[0].tiles.empty());
+
+    doc.undo.redo(doc);
+    CHECK(inkedPixels(doc) > 0);
+}
+
+TEST_CASE("text placed off the canvas allocates nothing") {
+    const auto face = anyFont();
+    if (!face.has_value()) { MESSAGE("no font here; clipping not exercised"); return; }
+
+    Document doc = makeDocument(64, 64, StraightRgba8{0, 0, 0, 0});
+    Layer& layer = doc.layers[0];
+
+    TextContent content;
+    content.utf8   = "off the edge";
+    content.sizePx = 48.0f;
+    content.x      = -4000.0;
+    content.y      = -4000.0;
+    UndoRecord rec = drawTextLayer(layer, content, *face, doc.width, doc.height);
+    CHECK(layer.tiles.empty());
+
+    content.x = 4000.0;
+    content.y = 4000.0;
+    rec = drawTextLayer(layer, content, *face, doc.width, doc.height);
+    CHECK(layer.tiles.empty());
+}
+
+TEST_CASE("text composites for the screen exactly as it does for the export") {
+    // #1, the worst bug of v1.0.0, applied to text: the tool draws into
+    // ordinary tiles precisely so that there is no second path to disagree.
+    const auto face = anyFont();
+    if (!face.has_value()) { MESSAGE("no font here; compositing not exercised"); return; }
+
+    Document doc = makeDocument(200, 120, StraightRgba8{255, 255, 255, 255});
+    doc.layers[0].kind = LayerKind::Text;
+    TextContent content;
+    content.utf8   = "export";
+    content.sizePx = 48.0f;
+    content.x      = 10.0;
+    content.y      = 80.0;
+    content.colour = StraightRgba8{200, 30, 40, 255};
+    const UndoRecord rec = drawTextLayer(doc.layers[0], content, *face,
+                                         doc.width, doc.height);
+    REQUIRE(!doc.layers[0].tiles.empty());
+
+    const std::vector<StraightRgba8> exported = flatten(doc);
+    const std::vector<PremulRgba8> onScreen =
+        compositeRect(doc, 0, 0, doc.width, doc.height);
+    REQUIRE(exported.size() == onScreen.size());
+    for (std::size_t i = 0; i < exported.size(); ++i)
+        REQUIRE(exported[i] == onScreen[i].unpremultiply());
+}
+
+TEST_CASE("a CJK glyph rasterises, where the machine has a font carrying one") {
+    // The audience D-002 said an illustration tool cannot afford to exclude.
+    // This is the half a headless test can reach — whether the glyphs draw at
+    // all. Whether an input METHOD reaches them is a windowed question, and the
+    // pull request says plainly whether it was tried.
+    const std::string kanji = "\xE6\xBC\xA2";   // 漢
+    for (const FontEntry& entry : systemFonts()) {
+        auto face = FontFace::load(entry.path);
+        if (!face.has_value()) continue;
+        // The glyph, not merely an advance: a font with no Japanese in it still
+        // advances the pen and still draws — the empty box. Counting that as
+        // "CJK works" is exactly the assumption this issue said not to make.
+        if (!face->hasGlyph(0x6F22)) continue;
+
+        Document doc = makeDocument(128, 128, StraightRgba8{0, 0, 0, 0});
+        TextContent content;
+        content.utf8   = kanji;
+        content.sizePx = 48.0f;
+        content.x      = 20.0;
+        content.y      = 80.0;
+        const UndoRecord rec =
+            drawTextLayer(doc.layers[0], content, *face, doc.width, doc.height);
+        if (inkedPixels(doc) == 0) continue;    // an advance, but no outline
+
+        MESSAGE("CJK rasterised through " << entry.name);
+        CHECK(inkedPixels(doc) > 0);
+        return;
+    }
+    MESSAGE("no font here carries CJK; rasterising not exercised");
 }

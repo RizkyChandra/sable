@@ -808,6 +808,60 @@ speed — two problems bought in exchange for reusing `paintSample`.
 
 ---
 
+## D-026 — Text: rasterised into an ordinary layer, with the words kept beside it
+
+**Status:** Decided
+**Affects:** `engine/include/sbl/text.hpp`, `engine/src/text.cpp`,
+`app/src/text_tool.cpp`, `LayerKind`, `.sable` format version 3
+
+A text layer holds normal tiles, rasterised from a `TextContent` that is stored
+next to them. The pixels are what renders — everywhere, screen and export alike.
+The words are what edits.
+
+**Why not a layer the compositor renders on demand:** `sbl::compositeRect` is
+the one compositor both the screen and the export go through, and #1 is what
+happened the last time there were two. Teaching it to rasterise glyphs would
+mean shaping outlines inside the hot path of every tile upload, with a glyph
+cache to make it bearable — and a document whose appearance depends on a font
+file still being installed. Rasterising on edit costs one pass over a few tiles
+per keystroke and needs no compositor change at all.
+
+**Why not rasterise-on-commit, with no text kept:** that is a text tool you can
+use once. The whole value of the feature is the second visit, when a caption
+needs a word changed at the size and position it was already placed at.
+
+**What it costs the artist, stated plainly:** re-editing redraws from the font
+named in the file. If that font is gone, the drawing is unchanged — it is
+pixels — but resuming the text substitutes another face and says so, and
+finishing that edit redraws in the substitute. Type set on a machine with the
+font is never silently altered on a machine without it; only editing it is.
+
+**Why `LayerKind::Text` and not just the optional:** `applyDab`, `bucketFill`,
+`fillSelection`, `transformRegion` and `mergeLayerDown` already refuse anything
+that is not `Raster`, so a text layer is protected from paint that the next
+keystroke would throw away without one line added to any of them. `applyProps`
+keeps the kind and the text in step, which is what makes "rasterise text" — give
+up the words, keep the picture — a property change, and so undoable.
+
+**Rasteriser: stb_truetype, fetched from upstream.** Public domain, one header,
+and the same one Dear ImGui bundles. Not taken from inside ImGui's tree because
+D-022 lets the engine link SDL3 but not ImGui, and the engine has to build with
+`SABLE_BUILD_APP=OFF`. Note stb_truetype's own warning that it does no range
+checking on font files; Sable only ever loads a font the artist chose or one
+already installed on the machine.
+
+**Input: SDL3, exactly as D-002 planned.** `SDL_StartTextInput`,
+`SDL_EVENT_TEXT_INPUT`, `SDL_EVENT_TEXT_EDITING`, `SDL_SetTextInputArea` — no
+`ImGui::InputText` anywhere near the canvas. The preedit is drawn into the layer
+so the artist sees real glyphs at the real size while composing; only the caret
+and the composition underline are overlays.
+
+**Alternative rejected:** word wrapping inside a text box. Explicit line breaks
+only, for now: a wrap needs a box, a box needs handles, and handles need a
+transform mode of their own.
+
+---
+
 ## Open decisions
 
 These blocked the milestone named. They have all been answered — the entries

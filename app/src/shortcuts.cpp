@@ -53,6 +53,11 @@ constexpr std::array<Entry, static_cast<std::size_t>(Action::Count)> kDefaults{{
     {Action::ToolFill,      "Fill tool",      SDLK_G, SDL_KMOD_NONE},
     {Action::ToolSelect,    "Select tool",    SDLK_M, SDL_KMOD_NONE},
     {Action::ToolTransform, "Transform tool", SDLK_T, SDL_KMOD_NONE},
+    // F, not the T every other application uses: T is the transform tool's
+    // already, and moving an existing default would land on the key an
+    // upgrading artist has stored for transform — two actions, one key, and
+    // whichever came first in this table wins. F is free and reads as "font".
+    {Action::ToolText,      "Text tool",      SDLK_F, SDL_KMOD_NONE},
     {Action::SizeDown,      "Smaller brush",  SDLK_LEFTBRACKET,  SDL_KMOD_NONE},
     {Action::SizeUp,        "Larger brush",   SDLK_RIGHTBRACKET, SDL_KMOD_NONE},
     {Action::SwapColours,   "Swap colours",   SDLK_X, SDL_KMOD_NONE},
