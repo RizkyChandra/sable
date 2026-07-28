@@ -7,7 +7,7 @@ bytes. Run it from anywhere:
 
     python3 tests/data/make_psd_fixtures.py
 
-It writes two files:
+It writes four files:
 
   layered.psd  64x48, six layers including a group, a hidden layer, a clipped
                layer, a non-Normal blend mode and both PSD compression schemes.
@@ -16,8 +16,16 @@ It writes two files:
                flatten() of layered.psd against it, so the check is against an
                independent implementation of the compositing rules rather than
                against Sable itself.
+  masked.psd   layer masks (#35): one covering the whole layer with partial
+               values, one smaller than its layer so the default colour shows,
+               and one disabled mask that must be ignored entirely.
+  masked_flat.psd  the same pair for masked.psd — ground truth for what a
+               reader that honours the masks has to show.
 
-Verified against Pillow's and ImageMagick's PSD readers when written.
+Verified against Pillow's and ImageMagick's PSD readers when written. The masked
+pair was checked against ImageMagick, which reads the masks and reports exactly
+the coverage intended; Pillow drops any layer carrying a fifth channel, so it
+can confirm only the merged image of those two.
 """
 
 import os
@@ -92,14 +100,31 @@ def composite(layers):
 
 
 def layer_pixels(layer):
-    """A layer's own straight-alpha pixels across the whole canvas."""
+    """A layer's own straight-alpha pixels across the whole canvas.
+
+    A mask multiplies the alpha and nothing else — that is the whole of what a
+    layer mask does, and why an importer can bake one into the pixels.
+    """
     out = [(0.0, 0.0, 0.0, 0.0)] * (W * H)
     left, top, right, bottom = layer["rect"]
     r, g, b, a = layer["colour"]
+    mask = layer.get("mask")
     for y in range(top, bottom):
         for x in range(left, right):
-            out[y * W + x] = (float(r), float(g), float(b), float(a))
+            alpha = float(a)
+            if mask is not None and mask["enabled"]:
+                alpha = round(alpha * mask_value(mask, x, y) / 255.0)
+            out[y * W + x] = (float(r), float(g), float(b), alpha)
     return out
+
+
+def mask_value(mask, x, y):
+    """The mask's coverage at a canvas pixel; outside its own rectangle it is
+    the default colour PSD stores beside the rectangle."""
+    left, top, right, bottom = mask["rect"]
+    if not (left <= x < right and top <= y < bottom):
+        return mask["outside"]
+    return mask["plane"][(y - top) * (right - left) + (x - left)]
 
 
 # ---------------------------------------------------------------- PSD output
@@ -161,6 +186,17 @@ def unicode_name(name):
     return additional(b"luni", be32(len(units) // 2) + units)
 
 
+def mask_block(mask):
+    """PSD's 20-byte layer mask data: a rectangle of its own, the value the
+    mask takes outside it, and the flags — bit 1 of which disables it."""
+    if mask is None:
+        return be32(0)
+    left, top, right, bottom = mask["rect"]
+    flags = 0 if mask["enabled"] else 0x02
+    return (be32(20) + struct.pack(">iiii", top, left, bottom, right) +
+            bytes([mask["outside"], flags]) + b"\0\0")
+
+
 def layer_record(rec):
     left, top, right, bottom = rec["rect"]
     w, h = right - left, bottom - top
@@ -168,6 +204,11 @@ def layer_record(rec):
     channels = []
     for cid, plane in rec["planes"]:
         channels.append((cid, channel_block(plane, w, h, rec["compression"])))
+    mask = rec.get("mask")
+    if mask is not None:
+        m_left, m_top, m_right, m_bottom = mask["rect"]
+        channels.append((-2, channel_block(mask["plane"], m_right - m_left,
+                                           m_bottom - m_top, rec["compression"])))
 
     out = bytearray()
     out += struct.pack(">iiii", top, left, bottom, right)
@@ -180,7 +221,7 @@ def layer_record(rec):
     out += bytes([flags, 0])
 
     extra = bytearray()
-    extra += be32(0)                        # layer mask data: none
+    extra += mask_block(mask)
     extra += be32(0)                        # layer blending ranges: none
     extra += pascal_name(rec["name"])
     extra += unicode_name(rec["name"])
@@ -273,6 +314,43 @@ INK = {"name": "Ink", "rect": (16, 16, 56, 44), "colour": (0, 200, 80, 200),
 STACK = [BASE, GROUP, INK]          # bottom to top
 
 
+# ------------------------------------------------------------- masks (#35)
+# Everything a masked import has to get right: partial coverage rather than
+# only on and off, a mask rectangle smaller than the layer it belongs to (so
+# the default colour decides the rest), and a disabled mask, which must be
+# ignored — applying it would erase a layer the file shows in full.
+
+def mask(rect, enabled=True, outside=0, value=None):
+    left, top, right, bottom = rect
+    plane = bytes(value(left + x, top + y) if value else 255
+                  for y in range(bottom - top) for x in range(right - left))
+    return {"rect": rect, "outside": outside, "enabled": enabled, "plane": plane}
+
+
+MASK_BASE = {"name": "Base", "rect": (0, 0, W, H), "colour": (40, 80, 160, 255),
+             "blend": "norm", "opacity": 255, "clipping": False, "visible": True,
+             "compression": 1, "kind": "raster", "children": []}
+# Three vertical bands: hidden, half-covered, fully shown.
+MASK_BANDS = {"name": "Bands", "rect": (0, 0, W, H), "colour": (255, 0, 0, 255),
+              "blend": "norm", "opacity": 255, "clipping": False, "visible": True,
+              "compression": 1, "kind": "raster", "children": [],
+              "mask": mask((0, 0, W, H),
+                           value=lambda x, y: 255 if x < 21 else (128 if x < 42 else 0))}
+# A mask rectangle covering only part of its layer: the rest takes the default
+# colour, which is 0, so it disappears.
+MASK_SMALL = {"name": "Patch", "rect": (8, 8, 56, 40), "colour": (0, 255, 0, 255),
+              "blend": "norm", "opacity": 255, "clipping": False, "visible": True,
+              "compression": 0, "kind": "raster", "children": [],
+              "mask": mask((8, 8, 32, 24))}
+# All zeroes, and disabled: a reader that applies it loses the layer.
+MASK_OFF = {"name": "Unmasked", "rect": (48, 32, W, H), "colour": (255, 255, 0, 255),
+            "blend": "norm", "opacity": 255, "clipping": False, "visible": True,
+            "compression": 1, "kind": "raster", "children": [],
+            "mask": mask((48, 32, W, H), enabled=False, value=lambda x, y: 0)}
+
+MASKED = [MASK_BASE, MASK_BANDS, MASK_SMALL, MASK_OFF]
+
+
 def records_for(layer):
     """PSD writes bottom to top, so a group is: closing marker, children, header."""
     if layer["kind"] != "folder":
@@ -295,7 +373,14 @@ def main():
     pixels = composite(STACK)
     write_layered(os.path.join(here, "layered.psd"), records, pixels)
     write_flat(os.path.join(here, "flat.psd"), pixels)
-    print("wrote layered.psd and flat.psd")
+
+    masked_records = []
+    for layer in MASKED:
+        masked_records += records_for(layer)
+    masked_pixels = composite(MASKED)
+    write_layered(os.path.join(here, "masked.psd"), masked_records, masked_pixels)
+    write_flat(os.path.join(here, "masked_flat.psd"), masked_pixels)
+    print("wrote layered.psd, flat.psd, masked.psd and masked_flat.psd")
 
 
 if __name__ == "__main__":
