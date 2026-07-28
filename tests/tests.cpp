@@ -24,6 +24,9 @@
 #include "sbl/paint.hpp"
 #include "sbl/project.hpp"
 
+// App-side, but deliberately SDL-free so the view transform is testable here.
+#include "view_transform.hpp"
+
 #include "miniz.h"
 #include "miniz_zip.h"
 #include "nlohmann/json.hpp"
@@ -2222,4 +2225,73 @@ TEST_CASE("a failed write returns an error rather than terminating") {
     REQUIRE(!result.has_value());
     CHECK(!result.error().detail.empty());
     CHECK(!describe(result.error().kind).empty());
+}
+
+// ---------------------------------------------------------- view transform
+
+// The screen<->canvas mapping is the one piece of app code these tests can
+// reach, and the one where a mistake is hardest to see: a dropped rotation
+// term still looks almost right at ten degrees and paints in the wrong place.
+
+namespace {
+constexpr double kPi = 3.14159265358979323846;
+double radians(double degrees) { return degrees * kPi / 180.0; }
+}  // namespace
+
+TEST_CASE("screen -> canvas -> screen is the identity at any angle") {
+    // Negative, past a right angle, past a half turn, and past a full one.
+    for (const double degrees : {0.0, 15.0, -37.5, 90.0, 179.9, 200.0, 359.0, -400.0}) {
+        const View v{-123.5, 64.25, 2.5f, radians(degrees)};
+        for (const double sx : {-40.0, 0.0, 17.0, 1024.0})
+            for (const double sy : {-9.0, 0.0, 33.5, 768.0}) {
+                const double cx = toCanvasX(v, sx, sy);
+                const double cy = toCanvasY(v, sx, sy);
+                CHECK(toScreenX(v, cx, cy) == doctest::Approx(sx).epsilon(1e-9));
+                CHECK(toScreenY(v, cx, cy) == doctest::Approx(sy).epsilon(1e-9));
+
+                // And the other way round, so neither direction can be the one
+                // quietly carrying a sign error.
+                const double bx = toScreenX(v, sx, sy);
+                const double by = toScreenY(v, sx, sy);
+                CHECK(toCanvasX(v, bx, by) == doctest::Approx(sx).epsilon(1e-9));
+                CHECK(toCanvasY(v, bx, by) == doctest::Approx(sy).epsilon(1e-9));
+            }
+    }
+}
+
+TEST_CASE("an unrotated view is still a subtract and a divide") {
+    // US-05.6 must not regress: the pan/zoom case has to keep landing exactly
+    // where it did before rotation existed.
+    const View v{100.0, -50.0, 4.0f, 0.0};
+    CHECK(toCanvasX(v, 300.0, 0.0) == doctest::Approx(50.0));
+    CHECK(toCanvasY(v, 0.0, 30.0) == doctest::Approx(20.0));
+    CHECK(toScreenX(v, 50.0, 20.0) == doctest::Approx(300.0));
+    CHECK(toScreenY(v, 50.0, 20.0) == doctest::Approx(30.0));
+}
+
+TEST_CASE("a quarter turn maps the canvas x axis onto screen y") {
+    // Screen y grows downwards, so a positive angle reads as clockwise.
+    const View v{0.0, 0.0, 1.0f, radians(90.0)};
+    CHECK(toScreenX(v, 10.0, 0.0) == doctest::Approx(0.0).epsilon(1e-9));
+    CHECK(toScreenY(v, 10.0, 0.0) == doctest::Approx(10.0));
+}
+
+TEST_CASE("rotating about a screen point leaves that point's pixel under it") {
+    View v{37.0, -11.0, 1.75f, radians(12.0)};
+    const double sx = 640.0, sy = 360.0;
+    const double cx = toCanvasX(v, sx, sy);
+    const double cy = toCanvasY(v, sx, sy);
+
+    for (int step = 0; step < 30; ++step) {     // more than a full turn
+        rotateAbout(v, sx, sy, radians(15.0));
+        CHECK(toCanvasX(v, sx, sy) == doctest::Approx(cx).epsilon(1e-9));
+        CHECK(toCanvasY(v, sx, sy) == doctest::Approx(cy).epsilon(1e-9));
+        // Normalised, so the status readout cannot wander off to 450 degrees.
+        CHECK(std::abs(v.rotation) <= kPi + 1e-12);
+    }
+
+    rotateAbout(v, sx, sy, -v.rotation);        // the reset action
+    CHECK(v.rotation == doctest::Approx(0.0));
+    CHECK(toCanvasX(v, sx, sy) == doctest::Approx(cx).epsilon(1e-9));
+    CHECK(toCanvasY(v, sx, sy) == doctest::Approx(cy).epsilon(1e-9));
 }
