@@ -11,8 +11,8 @@ PaintTool SAI's feel, built from original code.
 **Status: Milestones 1–4 feature-complete for v1.** Canvas, seven brushes,
 undo, PNG export, pen pressure with calibration, stabilizer, colour, layers
 with blend modes, clipping and groups, selection, bucket fill, transform, the
-`.sable` project format, PSD import, crash recovery, dockable panels,
-reassignable keys, interface scaling, and light/dark themes.
+`.sable` project format, layered PSD import and export, crash recovery,
+dockable panels, reassignable keys, interface scaling, and light/dark themes.
 
 **One v1 requirement is not met, and cannot be met here: US-00.** The stylus
 spike needs a real tablet, and none was available. Every pressure claim in
