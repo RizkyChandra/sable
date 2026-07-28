@@ -183,7 +183,11 @@ Selection magicWandSelection(const Document& doc, std::int32_t x, std::int32_t y
     out.h = std::min(doc.height - 1, maxY + 1) - out.y + 1;
     out.mask.assign(static_cast<std::size_t>(out.w) * static_cast<std::size_t>(out.h), 0);
 
-    const auto inside = [&](std::int32_t px, std::int32_t py) {
+    // Explicit -> bool: std::vector<bool> hands back a proxy reference, not a
+    // bool, so without this the two returns have different types. libstdc++
+    // converts and libc++ does not, which made this compile on Linux and fail
+    // on macOS.
+    const auto inside = [&](std::int32_t px, std::int32_t py) -> bool {
         if (px < 0 || py < 0 || px >= doc.width || py >= doc.height) return false;
         return region[static_cast<std::size_t>(py) * static_cast<std::size_t>(doc.width) +
                       static_cast<std::size_t>(px)];
