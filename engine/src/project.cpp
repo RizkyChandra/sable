@@ -206,9 +206,10 @@ std::expected<void, Error> saveProject(const Document& doc,
     for (const Layer& layer : doc.layers) {
         json entry;
         entry["id"]      = layer.id;
-        entry["kind"]    = layer.kind == LayerKind::Folder ? "folder"
-                         : layer.kind == LayerKind::Text   ? "text"
-                                                           : "raster";
+        entry["kind"]    = layer.kind == LayerKind::Folder   ? "folder"
+                         : layer.kind == LayerKind::Text     ? "text"
+                         : layer.kind == LayerKind::Linework ? "linework"
+                                                             : "raster";
         entry["name"]    = layer.name;
         entry["opacity"] = layer.opacity;
         entry["blend"]   = std::string(blendModeName(layer.blend));
@@ -233,6 +234,25 @@ std::expected<void, Error> saveProject(const Document& doc,
                              {"x", t.x},
                              {"y", t.y},
                              {"colour", hexColour(t.colour)}};
+        }
+
+        // The curves, beside the pixels they were drawn as (#17). Same rule as
+        // the text above: the tiles are still what renders, so a reader that
+        // ignores this sees the finished line art either way. Each point is
+        // [x, y, pressure] — three numbers on one line keeps a manifest with a
+        // few hundred of them readable, which is the whole reason it is JSON.
+        if (layer.linework.has_value()) {
+            json strokes = json::array();
+            for (const LineStroke& stroke : layer.linework->strokes) {
+                json points = json::array();
+                for (const LinePoint& p : stroke.points)
+                    points.push_back({p.x, p.y, p.pressure});
+                strokes.push_back({{"colour", hexColour(stroke.colour)},
+                                   {"width", stroke.width},
+                                   {"min_width", stroke.minWidthRatio},
+                                   {"points", std::move(points)}});
+            }
+            entry["linework"] = {{"strokes", std::move(strokes)}};
         }
 
         // Sorted, so two saves of the same document produce byte-identical
@@ -392,9 +412,10 @@ std::expected<Document, Error> loadProject(const std::filesystem::path& path) {
         layer.id   = entry.value("id", 0u);
         if (layer.id == NO_LAYER) continue;         // 0 is the reserved "no layer"
         const std::string kind = entry.value("kind", std::string("raster"));
-        layer.kind = kind == "folder" ? LayerKind::Folder
-                   : kind == "text"   ? LayerKind::Text
-                                      : LayerKind::Raster;
+        layer.kind = kind == "folder"   ? LayerKind::Folder
+                   : kind == "text"     ? LayerKind::Text
+                   : kind == "linework" ? LayerKind::Linework
+                                        : LayerKind::Raster;
         layer.name    = entry.value("name", std::string("Layer"));
         layer.opacity = std::clamp(entry.value("opacity", 1.0f), 0.0f, 1.0f);
         layer.blend   = blendModeFromName(entry.value("blend", std::string("normal")));
@@ -427,6 +448,43 @@ std::expected<Document, Error> loadProject(const std::filesystem::path& path) {
             // otherwise gets the tool to clear the pixels on the first click.
             layer.kind = LayerKind::Raster;
         }
+
+        // `!layer.text`: a layer is words or curves, never both, and the text
+        // above has already claimed this one if it had any.
+        if (!layer.text.has_value() && entry.contains("linework") &&
+            entry["linework"].is_object() &&
+            entry["linework"].value("strokes", json::array()).is_array()) {
+            LineworkContent work;
+            for (const auto& s : entry["linework"]["strokes"]) {
+                if (!s.is_object()) continue;
+                LineStroke stroke;
+                stroke.colour = parseColour(s.value("colour", std::string("#000000ff")));
+                stroke.width  = std::clamp(s.value("width", 4.0f), 0.1f, 4000.0f);
+                stroke.minWidthRatio = std::clamp(s.value("min_width", 0.15f), 0.0f, 1.0f);
+                if (s.contains("points") && s["points"].is_array()) {
+                    for (const auto& p : s["points"]) {
+                        // A point that is not three numbers is skipped rather
+                        // than defaulted: a control point invented at the origin
+                        // would drag the artist's curve across the canvas.
+                        if (!p.is_array() || p.size() < 3) continue;
+                        if (!p[0].is_number() || !p[1].is_number() || !p[2].is_number())
+                            continue;
+                        stroke.points.push_back(
+                            LinePoint{p[0].get<double>(), p[1].get<double>(),
+                                      std::clamp(p[2].get<float>(), 0.0f, 1.0f)});
+                    }
+                }
+                if (!stroke.points.empty()) work.strokes.push_back(std::move(stroke));
+            }
+            if (!work.strokes.empty()) {
+                layer.linework = std::move(work);
+                // Same rule the text takes above: curves on a layer someone
+                // else called raster still belong to it.
+                layer.kind = LayerKind::Linework;
+            }
+        }
+        if (layer.kind == LayerKind::Linework && !layer.linework.has_value())
+            layer.kind = LayerKind::Raster;
 
         doc.nextLayerId = std::max(doc.nextLayerId, layer.id + 1);
         doc.layers.push_back(std::move(layer));

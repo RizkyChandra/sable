@@ -148,7 +148,8 @@ add_library(engine STATIC
   engine/src/openraster.cpp
   engine/src/xml.cpp
   engine/src/psd.cpp
-  engine/src/text.cpp)
+  engine/src/text.cpp
+  engine/src/linework.cpp)
 target_include_directories(engine PUBLIC engine/include)
 target_link_libraries(engine PRIVATE lodepng miniz nlohmann_json stb_truetype)
 target_compile_options(engine PRIVATE ${SABLE_WARNINGS})
@@ -184,7 +185,7 @@ if(SABLE_BUILD_APP)
   add_executable(sable app/src/main.cpp app/src/canvas_view.cpp
                        app/src/widgets.cpp app/src/settings.cpp
                        app/src/shortcuts.cpp app/src/icons.cpp
-                       app/src/text_tool.cpp)
+                       app/src/text_tool.cpp app/src/linework_tool.cpp)
 
   # A GUI application on Windows, and a real bundle on macOS — an unbundled
   # binary there cannot take keyboard focus properly.

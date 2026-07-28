@@ -60,6 +60,7 @@ constexpr std::array<Entry, static_cast<std::size_t>(Action::Count)> kDefaults{{
     // upgrading artist has stored for transform — two actions, one key, and
     // whichever came first in this table wins. F is free and reads as "font".
     {Action::ToolText,      "Text tool",      SDLK_F, SDL_KMOD_NONE},
+    {Action::ToolLinework,  "Linework tool",  SDLK_V, SDL_KMOD_NONE},
     {Action::SizeDown,      "Smaller brush",  SDLK_LEFTBRACKET,  SDL_KMOD_NONE},
     {Action::SizeUp,        "Larger brush",   SDLK_RIGHTBRACKET, SDL_KMOD_NONE},
     {Action::SwapColours,   "Swap colours",   SDLK_X, SDL_KMOD_NONE},

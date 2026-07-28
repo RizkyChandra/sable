@@ -1035,6 +1035,64 @@ dropped, and #40's channel says so per group, naming it. Mask density and
 feathering are likewise ignored — the mask is used at the coverage the file
 stores.
 
+## D-028 — Linework: curves rasterised into an ordinary layer, kept beside it
+
+**Status:** Decided
+**Affects:** `LayerKind`, `engine/include/sbl/linework.hpp`,
+`engine/src/linework.cpp`, `app/src/linework_tool.cpp`, `.sable` format
+version 5
+
+A linework layer holds normal tiles, rasterised from a `LineworkContent` stored
+next to them. D-026's bargain, unchanged, because the shape of the problem is
+the same one: the pixels are what renders, everywhere; the curves are what
+edits.
+
+**Why not a layer the compositor draws on demand:** `sbl::compositeRect` is the
+one compositor the screen and the export both go through, and #1 is what
+happened the last time there were two. Curves in the compositor would mean
+tessellating splines inside the hot path of every tile upload — and, worse,
+teaching the **GPU** compositor to do it identically, or the two backends
+disagree on any document with a line in it. Rasterising on edit costs one pass
+over a few tiles per drag and needs no compositor change at all. The test for
+this is the blunt one: turning a finished linework layer into a plain raster
+layer changes not one pixel.
+
+**Curve: centripetal Catmull-Rom, through the control points.** Interpolating,
+so the artist drags the point they can see and the line goes there — no
+off-curve handles to store, to draw, or to explain. Centripetal rather than
+uniform because pen input is never evenly spaced, and uniform Catmull-Rom
+answers uneven spacing with a loop: a curve that visibly leaves the points it
+was given.
+
+**Coverage accumulated with max, composited once per stroke.** A curve that
+doubles back over itself, or simply slows down, must not come out darker there.
+That is the difference between a drawn line and a painted one, and the reason
+this is not `applyDab` in a loop.
+
+**Pressure is per control point and stays editable.** It is the artist's own
+record of how hard they pressed, so it travels with the point, and it is
+interpolated linearly along a segment rather than splined — a spline through
+pressure can overshoot past 1 between two points that never did, which reads as
+a line getting thicker where nobody pressed harder.
+
+**Why `LayerKind::Linework` and not just the optional:** `applyDab`,
+`bucketFill`, `fillSelection`, `transformRegion` and `mergeLayerDown` already
+refuse anything that is not `Raster`, so a linework layer is protected from
+paint the next redraw would wipe without one line added to any of them.
+`applyProps` keeps the kind and the curves in step, which is what makes
+"rasterise linework" — give up the curves, keep the line — a property change,
+and so undoable.
+
+**What it costs the artist, stated plainly:** the curves are Sable's own. PSD,
+ORA and KRA have nowhere to put them, so a linework layer exported to any of
+those is the finished line and nothing more. That is the same trade text
+already makes, and the `.sable` file keeps the editable version.
+
+**Alternative rejected:** Bezier handles. Two extra points per control point to
+store, to hit-test, to draw and to teach, for a curve an interpolating spline
+already produces. If a use turns up that the spline genuinely cannot express,
+the format version is the hook — the same one this used.
+
 ---
 
 ## Open decisions
