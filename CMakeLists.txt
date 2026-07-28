@@ -111,6 +111,7 @@ add_library(engine STATIC
   engine/src/io.cpp
   engine/src/project.cpp
   engine/src/format.cpp
+  engine/src/kra.cpp
   engine/src/openraster.cpp
   engine/src/xml.cpp)
 target_include_directories(engine PUBLIC engine/include)
