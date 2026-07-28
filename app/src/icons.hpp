@@ -19,7 +19,7 @@
 #include "imgui.h"
 
 enum class Icon {
-    Brush, Eraser, Fill, Select, Transform, Text,
+    Brush, Eraser, Fill, Select, Lasso, Wand, Transform, Text,
     Plus, Duplicate, Delete, Merge, Group, Ungroup, Raise, Lower,
     Eye, EyeClosed, Lock, Swap, Reset,
 };

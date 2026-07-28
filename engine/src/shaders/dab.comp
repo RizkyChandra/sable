@@ -1,0 +1,77 @@
+// A batch of dabs into one tile, on the GPU (#13).
+//
+// `CpuBackend::applyDab` in engine/src/paint.cpp, per pixel instead of per
+// dab. The dabs of a stroke are batched into one dispatch and replayed in
+// order inside the loop, which is what makes the result identical to applying
+// them one after another — each dab sees the previous one's output.
+//
+// Regenerate with engine/src/shaders/build.sh.
+#version 450
+
+#include "sable.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, set = 1, binding = 0) buffer Arena { uint arena[]; };
+
+const int kMaxDabs = 64;
+
+layout(std140, set = 2, binding = 0) uniform Params {
+    // x: dab count, y: arena slot, z: preserveOpacity
+    uvec4 head;
+    // Tile origin in canvas pixels, then the half-open box paint may land in:
+    // the canvas clipped by the selection.
+    ivec4 origin;
+    ivec4 clipBox;
+    vec4  geom[kMaxDabs];    // x, y, radius, hardness
+    uvec4 paint[kMaxDabs];   // x: packed premultiplied colour, y: erase
+} P;
+
+// paint.cpp `coverage`, including kAaWidth.
+float coverage(float d, float radius, float hardness) {
+    float feather = max(radius * (1.0 - hardness), 0.7);
+    float inner   = max(radius - feather, 0.0);
+    if (d <= inner)           return 1.0;
+    if (d >= inner + feather) return 0.0;
+    return 1.0 - (d - inner) / feather;
+}
+
+void main() {
+    ivec2 lp = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 c  = ivec2(P.origin.x + lp.x, P.origin.y + lp.y);
+    if (c.x < P.clipBox.x || c.y < P.clipBox.y ||
+        c.x >= P.clipBox.z || c.y >= P.clipBox.w) return;
+
+    uint idx = P.head.y * 65536u + uint(lp.y) * 256u + uint(lp.x);
+    uvec4 dst = unpackRgba(arena[idx]);
+    uvec4 start = dst;
+
+    bool preserve = P.head.z != 0u;
+    uint count = min(P.head.x, uint(kMaxDabs));
+    for (uint i = 0u; i < count; ++i) {
+        vec4 g = P.geom[i];
+
+        // The CPU clips each dab to floor(x-r)..ceil(x+r) before testing
+        // coverage. For a brush smaller than the anti-aliasing width the
+        // feather reaches past that box, so dropping the test here would
+        // paint pixels the reference does not.
+        if (float(c.x) < floor(g.x - g.z) || float(c.x) > ceil(g.x + g.z) ||
+            float(c.y) < floor(g.y - g.z) || float(c.y) > ceil(g.y + g.z)) continue;
+
+        float ddx = (float(c.x) + 0.5) - g.x;
+        float ddy = (float(c.y) + 0.5) - g.y;
+        float cov = coverage(sqrt(ddx * ddx + ddy * ddy), g.z, g.w);
+        if (cov <= 0.0) continue;
+        if (preserve) cov *= float(dst.w) / 255.0;
+
+        uvec4 col = unpackRgba(P.paint[i].x);
+        if (P.paint[i].y != 0u) {
+            float keep = 1.0 - cov * (float(col.w) / 255.0);
+            dst = scale8v(dst, keep);
+        } else {
+            dst = overPremul(scale8v(col, cov), dst);
+        }
+    }
+
+    if (dst != start) arena[idx] = packRgba(dst);
+}

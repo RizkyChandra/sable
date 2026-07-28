@@ -20,15 +20,16 @@ namespace sbl {
 
 /// Present from the first release so v1 files stay loadable.
 ///
-/// 2 added `vanishing_points`. Everything it adds is optional, so a v1 file
-/// still loads unchanged — the bump exists so an OLDER Sable refuses a file
-/// whose perspective guides it would silently drop on the next save.
+/// 2 added `vanishing_points`. 3 added `selection`, and `selection.png` beside
+/// the tiles for the coverage mask of a lasso or wand selection. 4 added text
+/// layers: `"kind": "text"` and a `text` object beside it.
 ///
-/// 3 added text layers: `"kind": "text"` and a `text` object beside it. Same
-/// bargain — older files load untouched, and an older Sable refuses a v3 file
-/// rather than opening it, dropping the words, and saving back a picture the
-/// artist can no longer edit.
-inline constexpr int SABLE_FORMAT_VERSION = 3;
+/// Everything each bump adds is optional, so v1, v2 and v3 files still load
+/// unchanged — the bumps exist so an OLDER Sable refuses a file whose contents
+/// it would silently drop on the next save. For text that matters most: an
+/// older Sable would open a v4 file, drop the words, and write back a picture
+/// the artist can no longer edit.
+inline constexpr int SABLE_FORMAT_VERSION = 4;
 
 /// Undo history is deliberately not saved.
 [[nodiscard]] std::expected<void, Error> saveProject(

@@ -39,6 +39,7 @@ if(SABLE_ASAN)
   endif()
 endif()
 
+include(CMakeDependentOption)
 include(FetchContent)
 
 # ---------------------------------------------------------------- third party
@@ -121,24 +122,44 @@ target_include_directories(nlohmann_json SYSTEM INTERFACE
 # D-022: the engine may link SDL3, but never ImGui, and nothing under engine/
 # may open a window, an event queue or an input device. The headless
 # engine_tests below are what enforces that now the link error no longer can.
+#
+# SDL3 is looked for once, here, and it is not required. The `engine` CI job
+# builds with -DSABLE_BUILD_APP=OFF on a machine with no graphics stack at all
+# (D-025): there, SABLE_GPU turns itself off and engine/src/gpu.cpp compiles to
+# the stub that says "no GPU", which is the same answer a machine with a driver
+# SDL cannot use gives at runtime.
+find_package(SDL3 QUIET CONFIG)
+if(SABLE_BUILD_APP AND NOT SDL3_FOUND)
+  message(FATAL_ERROR "SDL3 is required for -DSABLE_BUILD_APP=ON")
+endif()
+cmake_dependent_option(SABLE_GPU "Build the GPU paint backend" ON "SDL3_FOUND" OFF)
+
 add_library(engine STATIC
   engine/src/backend.cpp
   engine/src/canvas.cpp
+  engine/src/gpu.cpp
   engine/src/input.cpp
   engine/src/paint.cpp
+  engine/src/select.cpp
   engine/src/io.cpp
   engine/src/project.cpp
   engine/src/format.cpp
+  engine/src/kra.cpp
+  engine/src/openraster.cpp
+  engine/src/xml.cpp
   engine/src/psd.cpp
   engine/src/text.cpp)
 target_include_directories(engine PUBLIC engine/include)
 target_link_libraries(engine PRIVATE lodepng miniz nlohmann_json stb_truetype)
 target_compile_options(engine PRIVATE ${SABLE_WARNINGS})
+if(SABLE_GPU)
+  target_link_libraries(engine PUBLIC SDL3::SDL3)
+  target_compile_definitions(engine PUBLIC SABLE_HAVE_GPU)
+endif()
 add_library(sable::engine ALIAS engine)
 
 # ------------------------------------------------------------------------ app
 if(SABLE_BUILD_APP)
-  find_package(SDL3 REQUIRED CONFIG)
 
   # D-016 answers D-104: the docking branch, pinned to a COMMIT rather than to
   # the moving branch head. Docking is still not in master as of v1.92.1.
@@ -245,15 +266,18 @@ if(SABLE_BUILD_TESTS)
   # differential.cpp is the CPU/GPU harness (#14); it is a suite of its own and
   # tests.cpp is quite long enough.
   add_executable(engine_tests tests/tests.cpp tests/differential.cpp)
-  target_link_libraries(engine_tests PRIVATE sable::engine doctest miniz nlohmann_json)
+  target_link_libraries(engine_tests PRIVATE sable::engine doctest lodepng miniz
+                                             nlohmann_json)
   # app/src for view_transform.hpp only — the screen<->canvas maths is app-side
   # but SDL-free, and a rotation dropped on one path is not something to check
   # by eye. Nothing else from app/ may be included here (D-003).
   target_include_directories(engine_tests PRIVATE app/src)
-  # The committed fixtures (tests/data). Read from the source tree rather than
-  # copied into the build directory: they are inputs, never written to.
+  # Fixtures come from two places and both are read from the source tree, never
+  # copied: they are inputs. tests/data is the PSD pair, tests/fixtures the
+  # ORA and KRA files written by Krita and GIMP.
   target_compile_definitions(engine_tests PRIVATE
-    SABLE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+    SABLE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data"
+    SABLE_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
   # The allocation counter (US-02.9) replaces global operator new/delete, which
   # both compilers misread as a malloc/delete mismatch. It is not one.
   target_compile_options(engine_tests PRIVATE ${SABLE_WARNINGS})

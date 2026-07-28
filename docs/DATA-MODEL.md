@@ -197,15 +197,26 @@ does perform. Do not cache tile pointers across an undo or a layer operation.
 
 ### Document
 
-A rectangle is the whole of selection in v1 (Milestone 3). Freehand, lasso, and
-per-pixel masks are Stage D; when they arrive this becomes a variant or grows a
-mask, which is why paint code must ask it a question rather than read its
-fields.
+A bounding rectangle that may carry a per-pixel coverage mask (#18). The mask is
+what a lasso or a magic wand produces, and what the add/subtract/intersect
+modifiers combine; an EMPTY mask means "all of the rectangle", which is the fast
+path a plain marquee still takes. Paint code asks it questions and never reads
+its fields — that is what let the representation change underneath without a
+single call site changing shape.
+
+`contains()` is still the yes-or-no interface, and for a rectangle still answers
+exactly what it always did. `coverage()` is beside it because a bool cannot say
+"this pixel is 40% selected", and every writer scales what it lays down by it:
+that fraction is the entire difference between an anti-aliased selection and a
+staircase.
 
 ```cpp
 struct Selection {
     int32_t x = 0, y = 0, w = 0, h = 0;      // canvas pixels, may be negative x/y
-    [[nodiscard]] bool contains(int32_t px, int32_t py) const noexcept;
+    std::vector<uint8_t> mask;               // empty, or exactly w * h coverage bytes
+
+    [[nodiscard]] uint8_t coverage(int32_t px, int32_t py) const noexcept;
+    [[nodiscard]] bool contains(int32_t px, int32_t py) const noexcept;   // >= 128
     [[nodiscard]] bool empty() const noexcept { return w <= 0 || h <= 0; }
 };
 
@@ -569,6 +580,7 @@ compressed and deflating them again wastes save time for nothing.
 ```
 document.json                          manifest
 thumbnail.png                          256 px preview for file browsers
+selection.png                          8-bit greyscale coverage mask, when there is one
 layers/<layerId>/tiles/<tx>_<ty>.png   one PNG per non-empty tile, straight alpha
 ```
 
@@ -597,16 +609,23 @@ layers/<layerId>/tiles/<tx>_<ty>.png   one PNG per non-empty tile, straight alph
       "tiles": [[0, 3]] }
   ],
   "active_layer": 1,
-  "vanishing_points": [ { "x": -320.5, "y": 512.0, "enabled": true } ]
+  "vanishing_points": [ { "x": -320.5, "y": 512.0, "enabled": true } ],
+  "selection": { "x": 100, "y": 80, "w": 240, "h": 300, "mask": true }
 }
 ```
 
 Rules:
 
 - `format_version` is checked on load. Refuse a higher version with a clear
-  message rather than reading it wrong. Version 2 added `vanishing_points`;
-  version 3 added `"kind": "text"` and the `text` object beside it. Everything
-  either adds is optional, so a v1 file still loads unchanged.
+  message rather than reading it wrong. Version 2 added `vanishing_points`,
+  version 3 `selection`, version 4 `"kind": "text"` and the `text` object
+  beside it. Everything each adds is optional, so v1, v2 and v3 files still
+  load unchanged.
+- `"mask": true` means `selection.png` holds the coverage, one byte per pixel of
+  the selection's own w x h. A selection whose mask will not decode, or decodes
+  at the wrong size, is DROPPED rather than downgraded to its rectangle: a
+  bigger selection than the artist drew would send the next fill somewhere they
+  did not ask for.
 - A text layer's **tiles are still the picture**. `text` is what makes it
   editable again; a reader that ignores it sees the finished words anyway.
 - Tile PNGs are **straight alpha** so external tools can open them. Convert on
@@ -650,8 +669,8 @@ at the original path. Never written over `Document::path`.
 
 ## What is deliberately not modelled yet
 
-Selections beyond a rectangle, layer masks, and linework and vector layers. They
-belong to Stage C/D of the PRD. Adding their fields now would be guessing at
-shapes we cannot test. Two cheap hooks keep them affordable later: `LayerKind`
-and `format_version` — which is exactly what perspective rulers (version 2) and
-text (`LayerKind::Text`, version 3) went on to use.
+Layer masks, and linework and vector layers. They belong to Stage D of the PRD.
+Adding their fields now would be guessing at shapes we cannot test. Two cheap
+hooks keep them affordable later: `LayerKind` and `format_version` — which is
+exactly what perspective rulers (version 2), selection masks (version 3) and
+text (`LayerKind::Text`, version 4) went on to use.

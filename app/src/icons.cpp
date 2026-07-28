@@ -97,6 +97,30 @@ void drawIcon(ImDrawList* draw, Icon icon, ImVec2 topLeft, float size, ImU32 col
             p.dashes(0.14f, 0.82f, 0.14f, 0.18f, 4);
             break;
 
+        case Icon::Lasso: {
+            // A dashed loop with a tail, drawn as a closed run of dashes so it
+            // reads as the same "marching ants" idea as the marquee.
+            constexpr int kSteps = 14;
+            for (int i = 0; i < kSteps; i += 2) {
+                const auto angleAt = [](int k) {
+                    return 6.2831853f * static_cast<float>(k) / kSteps;
+                };
+                const float a0 = angleAt(i), a1 = angleAt(i + 1);
+                p.line(0.50f + 0.33f * std::cos(a0), 0.42f + 0.30f * std::sin(a0),
+                       0.50f + 0.33f * std::cos(a1), 0.42f + 0.30f * std::sin(a1), 0.08f);
+            }
+            p.line(0.50f, 0.72f, 0.36f, 0.92f, 0.08f);
+            break;
+        }
+
+        case Icon::Wand:
+            // A wand on the diagonal with a spark at the tip.
+            p.line(0.16f, 0.86f, 0.62f, 0.40f, 0.11f);
+            p.line(0.62f, 0.40f, 0.78f, 0.24f, 0.14f);
+            p.line(0.86f, 0.10f, 0.86f, 0.30f, 0.06f);
+            p.line(0.76f, 0.20f, 0.96f, 0.20f, 0.06f);
+            break;
+
         case Icon::Transform:
             // A frame with corner handles — what you grab, not what it does.
             p.rect(0.22f, 0.22f, 0.78f, 0.78f, 0.07f);

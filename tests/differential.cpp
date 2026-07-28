@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "sbl/backend.hpp"
+#include "sbl/gpu.hpp"
 #include "sbl/canvas.hpp"
 #include "sbl/io.hpp"
 #include "sbl/paint.hpp"
@@ -162,9 +163,24 @@ struct InstalledBackend {
 ///
 /// When #13 lands this one line becomes `static GpuBackend backend;` and
 /// nothing else in this file changes.
-PaintBackend& candidate() {
-    static CpuBackend backend;      // #13: swap for the GPU backend
-    return backend;
+/// The backend under test. #13 landed, so this is the GPU one when a device
+/// can be created.
+///
+/// When it cannot — no Vulkan driver, no SPIR-V support, CI — this returns
+/// null rather than quietly falling back to `cpuBackend()`. A CPU-versus-CPU
+/// run reports zero deviation and proves nothing, and a harness that passes
+/// while testing nothing is worse than one that fails: every scenario below
+/// SKIPs loudly instead.
+PaintBackend* candidate() {
+    static std::string why;
+    static std::unique_ptr<PaintBackend> backend = makeGpuBackend(&why);
+    static bool announced = false;
+    if (backend == nullptr && !announced) {
+        announced = true;
+        MESSAGE("no GPU backend, differential scenarios SKIPPED: "
+                << (why.empty() ? "no device" : why));
+    }
+    return backend.get();
 }
 
 /// Wrong on purpose, by a settable amount, and only in the two places a real
@@ -514,12 +530,20 @@ TEST_CASE("the alpha tolerance's premise: 255-scaling is exact in float too") {
 TEST_CASE("the reference and the candidate backend agree on every scenario") {
     // The acceptance criterion, and the number that matters when #13 lands:
     // not pass or fail, but how far apart the two backends were at their worst.
+    PaintBackend* subject = candidate();
+    if (subject == nullptr) {
+        // Skipping is the honest outcome with no device. Comparing the CPU
+        // against itself would report a perfect score for a backend nobody ran.
+        MESSAGE("no GPU device — every scenario skipped, nothing was compared");
+        return;
+    }
+
     Deviation total;
     std::size_t worstCase = 0;
     for (std::size_t i = 0; i < cases().size(); ++i) {
         const Case& c = cases()[i];
         std::int32_t width = 0;
-        const Deviation dev = differ(cpuBackend(), candidate(), c, width);
+        const Deviation dev = differ(cpuBackend(), *subject, c, width);
         if (dev.colour() > total.colour() || dev.alpha() > total.alpha()) worstCase = i;
         total.mergeWorst(dev);
 
@@ -533,7 +557,7 @@ TEST_CASE("the reference and the candidate backend agree on every scenario") {
             MESSAGE(c.name << ": " << describe(dev, width));
     }
     MESSAGE("differential: " << cases().size() << " scenarios, "
-                             << cpuBackend().name() << " vs " << candidate().name()
+                             << cpuBackend().name() << " vs " << subject->name()
                              << " — worst per-channel deviation R/G/B/A "
                              << total.worst[0] << "/" << total.worst[1] << "/"
                              << total.worst[2] << "/" << total.worst[3]
@@ -544,11 +568,25 @@ TEST_CASE("the reference and the candidate backend agree on every scenario") {
                                      ? std::string{}
                                      : ", worst in \"" + cases()[worstCase].name + "\""));
 
-    // Two CPU backends are the same code over the same integers. Anything but
-    // zero here means the harness itself is not deterministic, and every other
-    // number it reports is worthless.
-    CHECK(total.colour() == 0);
-    CHECK(total.alpha() == 0);
+    // The determinism check this file has always carried, updated for the
+    // candidate no longer being a second copy of the reference.
+    //
+    // It used to read `total.colour() == 0`, which was exact because the
+    // candidate WAS `cpuBackend()` — the same code over the same integers. A
+    // GPU candidate is allowed the one step `kColourTolerance` names, so that
+    // form now contradicts the tolerance twenty lines above rather than
+    // measuring anything. The property worth keeping is the one it was
+    // protecting: a harness whose numbers move between runs is a harness whose
+    // numbers are worthless. So the candidate is run against ITSELF, where the
+    // answer must still be exactly zero — and for a GPU that is the stronger
+    // check, because an uninitialised arena slot or a missing barrier shows up
+    // here and nowhere else.
+    for (const Case& c : cases()) {
+        std::int32_t width = 0;
+        const Deviation twice = differ(*subject, *subject, c, width);
+        CHECK_MESSAGE(twice.colour() == 0, c.name << ": " << describe(twice, width));
+        CHECK_MESSAGE(twice.alpha() == 0, c.name << ": " << describe(twice, width));
+    }
 }
 
 TEST_CASE("the harness catches a backend that composites two steps off") {

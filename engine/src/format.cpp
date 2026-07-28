@@ -7,6 +7,9 @@
 
 #include "miniz.h"
 #include "miniz_zip.h"
+#include "sbl/backend.hpp"
+#include "sbl/kra.hpp"
+#include "sbl/openraster.hpp"
 #include "sbl/project.hpp"
 #include "sbl/psd.hpp"
 
@@ -36,6 +39,15 @@ bool looksLikeSable(const std::filesystem::path& path) {
     return hasZipEntry(path, "document.json");
 }
 
+/// A .kra has a mimetype entry too, so the manifest is what separates them.
+bool looksLikeOpenRaster(const std::filesystem::path& path) {
+    return hasZipEntry(path, "mimetype") && hasZipEntry(path, "stack.xml");
+}
+
+bool looksLikeKrita(const std::filesystem::path& path) {
+    return hasZipEntry(path, "maindoc.xml");
+}
+
 bool looksLikePsd(const std::filesystem::path& path) {
     return readMagic(path, 4) == "8BPS";
 }
@@ -47,6 +59,15 @@ std::vector<Format> builtinFormats() {
         .id = "sable", .label = "Sable project", .extensions = {"sable"},
         .nativeProject = true,
         .read = &loadProject, .write = &saveProject, .sniff = &looksLikeSable});
+    all.push_back(Format{
+        .id = "ora", .label = "OpenRaster image", .extensions = {"ora"},
+        .nativeProject = false,
+        .read = &readOpenRaster, .write = &writeOpenRaster,
+        .sniff = &looksLikeOpenRaster});
+    all.push_back(Format{
+        .id = "kra", .label = "Krita document", .extensions = {"kra"},
+        .nativeProject = false,
+        .read = &readKrita, .write = nullptr, .sniff = &looksLikeKrita});
     all.push_back(Format{
         .id = "png", .label = "PNG image", .extensions = {"png"},
         .nativeProject = false,
@@ -145,6 +166,14 @@ std::expected<void, Error> exportDocument(const Document& doc,
         return fail(ErrorKind::Malformed,
                     "Sable cannot write " + path.string() +
                     ". It writes " + extensionList(FormatUse::Write) + ".");
+
+    // The project writer encodes `Tile::pixels()` directly, so the host copy
+    // has to be the truth first (D-025). Here rather than in `saveProject`,
+    // because the autosave worker calls that one on a thread with no device
+    // context — and it has already read back before handing over its clone.
+    if (const auto ready = paintBackend().readback(doc); !ready.has_value())
+        return std::unexpected(ready.error());
+
     return format->write(doc, path);
 }
 

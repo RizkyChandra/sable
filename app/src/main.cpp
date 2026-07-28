@@ -10,10 +10,12 @@
 #include <SDL3/SDL_main.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <atomic>
+#include <optional>
 #include <mutex>
 #include <thread>
 #include <string>
@@ -35,9 +37,11 @@
 #include "sbl/backend.hpp"
 #include "sbl/canvas.hpp"
 #include "sbl/format.hpp"
+#include "sbl/gpu.hpp"
 #include "sbl/io.hpp"
 #include "sbl/paint.hpp"
 #include "sbl/project.hpp"
+#include "sbl/select.hpp"
 #include "settings.hpp"
 #include "shortcuts.hpp"
 #include "text_tool.hpp"
@@ -54,7 +58,13 @@ constexpr float kDegToRad      = 3.14159265358979323846f / 180.0f;
 /// What to do once the artist answers the "discard unsaved work?" prompt.
 enum class Pending { None, NewCanvas, Quit, Open, Import };
 
-enum class Tool { Brush, Eraser, Fill, Select, Transform, Text };
+enum class Tool { Brush, Eraser, Fill, Select, Lasso, Wand, Transform, Text };
+
+/// True for the three tools that build a selection, which share the modifier
+/// keys, the mode setting, and the rule that a click with no drag deselects.
+[[nodiscard]] constexpr bool selectsRegion(Tool t) noexcept {
+    return t == Tool::Select || t == Tool::Lasso || t == Tool::Wand;
+}
 
 /// How often a recovery copy is written while the document is dirty (D-013).
 constexpr std::uint64_t kAutosaveIntervalMs = 120'000;
@@ -97,6 +107,32 @@ struct App {
     // Selection drag, in canvas coordinates.
     bool   selecting = false;
     double selectAnchorX = 0.0, selectAnchorY = 0.0;
+    int    wandTolerance = 24;
+
+    /// The modifier the panel is set to, and the one this drag is actually
+    /// using — the modifier keys are read once at pen-down, so letting go of
+    /// Shift halfway through a lasso does not change what the loop means.
+    sbl::SelectMode selectMode = sbl::SelectMode::Replace;
+    sbl::SelectMode dragMode   = sbl::SelectMode::Replace;
+    /// What was selected when the drag began. Add and subtract are computed
+    /// against this every motion event, so dragging back and forth does not
+    /// accumulate.
+    std::optional<sbl::Selection> selectBase;
+    std::vector<sbl::Point> lassoPath;
+
+    /// The selection boundary in canvas coordinates, cached because walking a
+    /// megapixel mask at every redraw to draw the same outline is exactly the
+    /// sort of thing modest hardware notices. Rebuilt when the selection it was
+    /// built from stops matching the document's.
+    ///
+    /// ponytail: the staleness check compares the whole mask, so a very large
+    /// selection costs a memcmp per frame — far less than the rebuild it
+    /// avoids. Give Selection a change counter if that ever shows up in a
+    /// profile.
+    struct Ants {
+        sbl::Selection from;
+        std::vector<std::array<double, 4>> segments;   // x0, y0, x1, y1
+    } ants;
 
     sbl::StraightRgba8 foreground{0, 0, 0, 255};
     sbl::StraightRgba8 background{255, 255, 255, 255};
@@ -152,6 +188,11 @@ struct App {
     sbl::Transform pendingTransform;   // edited live, applied as one step
     int undoBudgetMb = 256;            // D-102, mirrored into the document
     char presetName[48] = "My brush";
+
+    // --- the GPU backend (D-021: opt in, CPU is the default and the reference)
+    std::unique_ptr<sbl::PaintBackend> gpu;
+    std::string gpuWhy = "not tried yet";
+    bool useGpu = false;
 
     Shortcuts shortcuts;
     Action    rebinding = Action::Count;   // which row is waiting for a key
@@ -218,6 +259,8 @@ struct App {
         case Tool::Eraser: return "eraser";
         case Tool::Fill:   return "fill";
         case Tool::Select: return "select";
+        case Tool::Lasso:  return "lasso";
+        case Tool::Wand:   return "wand";
         case Tool::Transform: return "transform";
         case Tool::Text:   return "text";
     }
@@ -291,6 +334,8 @@ void applySettings(App& app, const Settings& settings) {
     app.uiScale = std::clamp(settings.getFloat("ui.scale", 1.0f), 0.75f, 2.5f);
     app.lightTheme = settings.getInt("ui.lightTheme", 0) != 0;
     app.undoBudgetMb = std::clamp(settings.getInt("undo.budgetMb", 256), 16, 2048);
+    // D-021: off unless the artist turned it on, on this machine, last time.
+    app.useGpu = settings.getInt("render.gpu", 0) != 0;
     app.shortcuts.load(settings);
 
     // Ruler configuration is a preference; the vanishing points are not, and
@@ -354,6 +399,7 @@ void collectSettings(const App& app, Settings& settings) {
     settings.setFloat("ui.scale", app.uiScale);
     settings.setInt("ui.lightTheme", app.lightTheme ? 1 : 0);
     settings.setInt("undo.budgetMb", app.undoBudgetMb);
+    settings.setInt("render.gpu", app.useGpu ? 1 : 0);
     app.shortcuts.store(settings);
 
     settings.setInt("ruler.symmetry.on",         app.symmetry.enabled ? 1 : 0);
@@ -392,6 +438,35 @@ void collectSettings(const App& app, Settings& settings) {
 void applyUndoBudget(App& app) {
     app.doc.undo.setMemoryBudget(static_cast<std::size_t>(app.undoBudgetMb) *
                                  1024u * 1024u);
+}
+
+void showError(App& app, const sbl::Error& error);
+
+/// Installs or removes the GPU backend, and tells the truth about which one is
+/// running afterwards.
+///
+/// D-021 wants a runtime switch so that "the colours are wrong" is one toggle
+/// away from saying which side is wrong. The device is built on first use and
+/// then kept: creating one costs tens of milliseconds, and a switch the artist
+/// flicks twice should not cost that twice.
+///
+/// Never mid-stroke: the backend holds a batch of dabs for the layer it is
+/// painting, and swapping it out from under that would drop them.
+void applyGpuMode(App& app) {
+    if (app.painting) return;
+    if (app.useGpu && app.gpu == nullptr) {
+        app.gpu = sbl::makeGpuBackend(&app.gpuWhy);
+        if (app.gpu == nullptr) app.useGpu = false;   // no device: stay on the CPU
+        SDL_Log("paint backend: %s", app.gpuWhy.c_str());
+    }
+    if (!app.useGpu && app.gpu != nullptr) {
+        // The host tiles have to be the truth again before the backend that
+        // holds them stops being consulted.
+        if (const auto ready = app.gpu->readback(app.doc); !ready.has_value())
+            showError(app, ready.error());
+    }
+    sbl::setPaintBackend(app.useGpu ? app.gpu.get() : nullptr);
+    if (app.canvas != nullptr) app.canvas->markAllDirty();
 }
 
 void resetDocument(App& app, std::int32_t w, std::int32_t h, bool transparent) {
@@ -704,6 +779,40 @@ void doFill(App& app, double sx, double sy) {
     app.doc.dirty = true;
 }
 
+/// Shift adds, Alt subtracts, both intersect — the modifiers every other
+/// painting application uses, over whatever the panel is set to. Read once, at
+/// pen-down, so a drag means one thing from start to finish.
+[[nodiscard]] sbl::SelectMode modeForDrag(const App& app) {
+    const SDL_Keymod mods = SDL_GetModState();
+    const bool shift = (mods & SDL_KMOD_SHIFT) != 0;
+    const bool alt   = (mods & SDL_KMOD_ALT) != 0;
+    if (shift && alt) return sbl::SelectMode::Intersect;
+    if (shift)        return sbl::SelectMode::Add;
+    if (alt)          return sbl::SelectMode::Subtract;
+    return app.selectMode;
+}
+
+/// Puts a freshly drawn shape into the document, combined with what the drag
+/// started from. One place, so the marquee, the lasso and the wand cannot
+/// disagree about what Shift means.
+void commitSelection(App& app, const sbl::Selection& shape) {
+    const sbl::Selection base =
+        app.selectBase.has_value() ? *app.selectBase : sbl::Selection{};
+    sbl::Selection combined = sbl::combineSelections(base, shape, app.dragMode);
+    if (combined.empty()) app.doc.selection.reset();
+    else                  app.doc.selection = std::move(combined);
+}
+
+void beginSelectDrag(App& app, double sx, double sy) {
+    app.selecting     = true;
+    app.dragMode      = modeForDrag(app);
+    app.selectBase    = app.doc.selection;
+    app.selectAnchorX = toCanvasX(app.view, sx, sy);
+    app.selectAnchorY = toCanvasY(app.view, sx, sy);
+    app.lassoPath.clear();
+    app.lassoPath.push_back(sbl::Point{app.selectAnchorX, app.selectAnchorY});
+}
+
 void updateSelection(App& app, double sx, double sy) {
     const double cx = toCanvasX(app.view, sx, sy);
     const double cy = toCanvasY(app.view, sx, sy);
@@ -722,7 +831,53 @@ void updateSelection(App& app, double sx, double sy) {
     selection.y = std::max(0, selection.y);
     selection.w = std::max(0, x1 - selection.x);
     selection.h = std::max(0, y1 - selection.y);
-    app.doc.selection = selection;
+    commitSelection(app, selection);
+}
+
+/// Appends to the freehand path. Sub-pixel steps are dropped: the pointer
+/// reports far more motion than a polygon edge needs, and the lasso's cost is
+/// per vertex on every scanline.
+void extendLasso(App& app, double sx, double sy) {
+    const sbl::Point p{toCanvasX(app.view, sx, sy), toCanvasY(app.view, sx, sy)};
+    if (!app.lassoPath.empty()) {
+        const sbl::Point& last = app.lassoPath.back();
+        if (std::abs(p.x - last.x) < 1.0 && std::abs(p.y - last.y) < 1.0) return;
+    }
+    app.lassoPath.push_back(p);
+}
+
+void endSelectDrag(App& app, double sx, double sy) {
+    if (!app.selecting) return;
+    app.selecting = false;
+    // The lasso is rasterised once, at pen-up: doing it live would re-scan the
+    // whole loop on every motion event, for a shape that is not finished yet.
+    if (app.tool == Tool::Lasso) {
+        extendLasso(app, sx, sy);
+        commitSelection(app, sbl::lassoSelection(app.lassoPath, app.doc.width,
+                                                 app.doc.height));
+        app.lassoPath.clear();
+    }
+    app.selectBase.reset();
+    // A click with no drag clears the selection rather than leaving a
+    // zero-sized one that silently blocks painting.
+    if (app.doc.selection.has_value() && app.doc.selection->empty())
+        app.doc.selection.reset();
+}
+
+/// The pointer moved while a selection is being drawn. Pen and mouse both.
+void dragSelection(App& app, double sx, double sy) {
+    if (app.tool == Tool::Lasso) extendLasso(app, sx, sy);
+    else                        updateSelection(app, sx, sy);
+}
+
+void wandAt(App& app, double sx, double sy) {
+    const auto x = static_cast<std::int32_t>(std::floor(toCanvasX(app.view, sx, sy)));
+    const auto y = static_cast<std::int32_t>(std::floor(toCanvasY(app.view, sx, sy)));
+
+    app.dragMode   = modeForDrag(app);
+    app.selectBase = app.doc.selection;
+    commitSelection(app, sbl::magicWandSelection(app.doc, x, y, app.wandTolerance));
+    app.selectBase.reset();
 }
 
 void pickColourAt(App& app, double sx, double sy) {
@@ -1026,8 +1181,11 @@ void handleKey(App& app, const SDL_KeyboardEvent& key) {
         // Leaving the text tool commits what was typed. A tool change is an
         // unambiguous "I have finished with this", and the alternative — a
         // session left running under the brush — loses the text on the first
-        // stroke that lands on its layer.
+        // stroke that lands on its layer. Every tool that is not Text has to
+        // say so, so a tool added later cannot quietly skip it.
         case Action::ToolBrush:  app.text.finish(app.window, app.doc); app.tool = Tool::Brush;  break;
+        case Action::ToolLasso:  app.text.finish(app.window, app.doc); app.tool = Tool::Lasso;  break;
+        case Action::ToolWand:   app.text.finish(app.window, app.doc); app.tool = Tool::Wand;   break;
         case Action::ToolEraser: app.text.finish(app.window, app.doc); app.tool = Tool::Eraser; break;
         case Action::ToolFill:   app.text.finish(app.window, app.doc); app.tool = Tool::Fill;   break;
         case Action::ToolSelect: app.text.finish(app.window, app.doc); app.tool = Tool::Select; break;
@@ -1142,9 +1300,20 @@ void handleEvent(App& app, const SDL_Event& e) {
             // Landing on a guide handle moves it instead of painting.
             app.draggingGuide = guideAt(app, e.ptouch.x, e.ptouch.y);
             if (app.draggingGuide != kNoGuide) break;
+            // Text and the selection tools all go through the same helpers
+            // the mouse uses. A tablet is the target input device, so a lasso
+            // reachable only with a mouse would be one most artists never use.
             if (app.tool == Tool::Text) {
                 placeText(app, e.ptouch.x, e.ptouch.y);
                 syncTextures(app, app.text.takeChanged());
+                break;
+            }
+            if (app.tool == Tool::Wand) {
+                wandAt(app, e.ptouch.x, e.ptouch.y);
+                break;
+            }
+            if (selectsRegion(app.tool)) {
+                beginSelectDrag(app, e.ptouch.x, e.ptouch.y);
                 break;
             }
             beginPaint(app);
@@ -1158,12 +1327,15 @@ void handleEvent(App& app, const SDL_Event& e) {
             // paints between PEN_DOWN and PEN_UP.
             if (app.draggingGuide != kNoGuide)
                 moveGuide(app, e.pmotion.x, e.pmotion.y);
+            else if (app.selecting)
+                dragSelection(app, e.pmotion.x, e.pmotion.y);
             else if (app.painting)
                 paintWith(app, penSample(app, e.pmotion.which, e.pmotion.x, e.pmotion.y));
             break;
 
         case SDL_EVENT_PEN_UP:
             app.draggingGuide = kNoGuide;
+            endSelectDrag(app, e.ptouch.x, e.ptouch.y);
             endPaint(app);
             break;
 
@@ -1195,10 +1367,10 @@ void handleEvent(App& app, const SDL_Event& e) {
                 } else if (app.tool == Tool::Text) {
                     placeText(app, e.button.x, e.button.y);
                     syncTextures(app, app.text.takeChanged());
-                } else if (app.tool == Tool::Select) {
-                    app.selecting = true;
-                    app.selectAnchorX = toCanvasX(app.view, e.button.x, e.button.y);
-                    app.selectAnchorY = toCanvasY(app.view, e.button.x, e.button.y);
+                } else if (app.tool == Tool::Wand) {
+                    wandAt(app, e.button.x, e.button.y);
+                } else if (selectsRegion(app.tool)) {
+                    beginSelectDrag(app, e.button.x, e.button.y);
                 } else {
                     beginPaint(app);
                     paintWith(app, mouseSample(app, e.button.x, e.button.y));
@@ -1216,7 +1388,7 @@ void handleEvent(App& app, const SDL_Event& e) {
             } else if (app.draggingGuide != kNoGuide) {
                 moveGuide(app, e.motion.x, e.motion.y);
             } else if (app.selecting) {
-                updateSelection(app, e.motion.x, e.motion.y);
+                dragSelection(app, e.motion.x, e.motion.y);
             } else if (app.painting) {
                 paintWith(app, mouseSample(app, e.motion.x, e.motion.y));
             }
@@ -1228,13 +1400,7 @@ void handleEvent(App& app, const SDL_Event& e) {
             app.panning = false;
             if (e.button.button == SDL_BUTTON_LEFT) {
                 app.draggingGuide = kNoGuide;
-                if (app.selecting) {
-                    app.selecting = false;
-                    // A click with no drag clears the selection rather than
-                    // leaving a zero-sized one that silently blocks painting.
-                    if (app.doc.selection.has_value() && app.doc.selection->empty())
-                        app.doc.selection.reset();
-                }
+                endSelectDrag(app, e.button.x, e.button.y);
                 endPaint(app);
             }
             break;
@@ -1362,6 +1528,22 @@ void drawMenuBar(App& app, float& menuHeight) {
                             false, app.view.rotation != 0.0))
             rotateView(app, -app.view.rotation);
         ImGui::Separator();
+        // D-021: one binary, one toggle, defaulting to the CPU. Disabled
+        // rather than hidden when there is no device, so a bug report can say
+        // "the menu item is greyed out" and the reason is one hover away.
+        const bool haveGpu = sbl::gpuBackendCompiledIn();
+        ImGui::BeginDisabled(!haveGpu || app.painting);
+        if (ImGui::MenuItem("Paint and composite on the GPU", nullptr, &app.useGpu))
+            applyGpuMode(app);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(
+                "%s\n\nThe CPU path is the reference: if the two disagree, the "
+                "CPU is right. Switch back and export again to find out which "
+                "one a colour problem is in.",
+                haveGpu ? app.gpuWhy.c_str() : "This build has no GPU backend.");
+        }
+        ImGui::Separator();
         ImGui::MenuItem("Pressure calibration", nullptr, &app.showCalibration);
         ImGui::MenuItem("Tablet test pad", nullptr, &app.showTestPad);
         ImGui::MenuItem("Keyboard and interface", nullptr, &app.showShortcuts);
@@ -1392,6 +1574,8 @@ void drawToolPanel(App& app) {
         toolRow(Icon::Eraser,    "Eraser",    Tool::Eraser,    Action::ToolEraser);
         toolRow(Icon::Fill,      "Fill",      Tool::Fill,      Action::ToolFill);
         toolRow(Icon::Select,    "Select",    Tool::Select,    Action::ToolSelect);
+        toolRow(Icon::Lasso,     "Lasso",     Tool::Lasso,     Action::ToolLasso);
+        toolRow(Icon::Wand,      "Magic wand", Tool::Wand,     Action::ToolWand);
         toolRow(Icon::Transform, "Transform", Tool::Transform, Action::ToolTransform);
         toolRow(Icon::Text,      "Text",      Tool::Text,      Action::ToolText);
 
@@ -1439,8 +1623,26 @@ void drawToolPanel(App& app) {
             ImGui::SetNextItemWidth(-1.0f);
             ImGui::SliderInt("##tol", &app.fillTolerance, 0, 128, "tolerance %d");
         }
-        if (app.tool == Tool::Select && app.doc.selection.has_value()) {
-            if (ImGui::SmallButton("Deselect")) app.doc.selection.reset();
+        if (selectsRegion(app.tool)) {
+            if (app.tool == Tool::Wand) {
+                ImGui::SetNextItemWidth(-1.0f);
+                ImGui::SliderInt("##wandtol", &app.wandTolerance, 0, 128, "tolerance %d");
+            }
+            // Buttons as well as modifier keys. The keyboard is the only
+            // accessibility affordance Sable has (PRD §6), so a mode that can
+            // only be reached by holding Shift while dragging is a mode some
+            // users do not have.
+            ImGui::TextDisabled("MODE");
+            const auto modeRow = [&](const char* label, sbl::SelectMode mode) {
+                if (ImGui::RadioButton(label, app.selectMode == mode))
+                    app.selectMode = mode;
+            };
+            modeRow("Replace",        sbl::SelectMode::Replace);
+            modeRow("Add (Shift)",    sbl::SelectMode::Add);
+            modeRow("Subtract (Alt)", sbl::SelectMode::Subtract);
+            modeRow("Intersect",      sbl::SelectMode::Intersect);
+            if (app.doc.selection.has_value() &&
+                ImGui::SmallButton("Deselect")) app.doc.selection.reset();
         }
 
         ImGui::Spacing();
@@ -1976,6 +2178,16 @@ void drawStatusBar(const App& app, float windowW, float windowH, float height) {
             ImGui::TextDisabled("   sel %d x %d",
                                 app.doc.selection->w, app.doc.selection->h);
         }
+        // Two memory numbers, because there are two memories. The undo budget
+        // is host RAM and still counts exactly what it always counted (#12);
+        // this is the other one, and leaving it off the bar would make the
+        // first one look like the whole story.
+        if (app.gpu != nullptr && app.useGpu) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("   gpu %.0f MB",
+                                static_cast<double>(sbl::gpuDeviceBytes(*app.gpu)) /
+                                    (1024.0 * 1024.0));
+        }
         // D-102 asks for a VISIBLE policy, not just a cap. Say it plainly, and
         // only once there is something to say.
         if (app.doc.undo.droppedRecords() > 0) {
@@ -2119,25 +2331,83 @@ void drawModals(App& app) {
 /// Marching-ants-ish outline for the selection. A dashed rectangle would be
 /// nicer; a two-tone one reads correctly over both dark and light art and is
 /// four lines.
-void drawSelectionOutline(const App& app) {
+/// Rebuilds the cached boundary of a masked selection: every edge between a
+/// pixel that is in and a neighbour that is not, in canvas coordinates.
+///
+/// Edges rather than a traced contour, because a selection may be several
+/// disjoint islands with holes in them and this handles all of that without
+/// knowing it did.
+void rebuildAnts(App& app) {
+    static const sbl::Selection kNothing;
+    const bool live = app.doc.selection.has_value() && !app.doc.selection->empty();
+    const sbl::Selection& s = live ? *app.doc.selection : kNothing;
+    if (app.ants.from == s) return;
+
+    app.ants.from = s;
+    app.ants.segments.clear();
+    if (s.mask.empty()) return;              // a rectangle draws from its corners
+
+    for (std::int32_t y = s.y; y < s.y + s.h; ++y) {
+        for (std::int32_t x = s.x; x < s.x + s.w; ++x) {
+            if (!s.contains(x, y)) continue;
+            const auto px = static_cast<double>(x);
+            const auto py = static_cast<double>(y);
+            if (!s.contains(x - 1, y)) app.ants.segments.push_back({px, py, px, py + 1});
+            if (!s.contains(x + 1, y))
+                app.ants.segments.push_back({px + 1, py, px + 1, py + 1});
+            if (!s.contains(x, y - 1)) app.ants.segments.push_back({px, py, px + 1, py});
+            if (!s.contains(x, y + 1))
+                app.ants.segments.push_back({px, py + 1, px + 1, py + 1});
+        }
+    }
+}
+
+void drawSelectionOutline(App& app) {
+    rebuildAnts(app);
     if (!app.doc.selection.has_value() || app.doc.selection->empty()) return;
     const sbl::Selection& s = *app.doc.selection;
 
-    // Four corners through the view transform, not a screen-space rectangle:
-    // the selection is axis-aligned on the canvas, so it leans when the canvas
-    // is turned and an upright box would sit over the wrong pixels.
+    // Everything goes through the view transform, never screen-space
+    // arithmetic: the selection is axis-aligned on the CANVAS, so it leans when
+    // the canvas is turned and an upright box would sit over the wrong pixels.
     const auto at = [&](double cx, double cy) {
         return ImVec2(static_cast<float>(toScreenX(app.view, cx, cy)),
                       static_cast<float>(toScreenY(app.view, cx, cy)));
     };
-    const ImVec2 a = at(s.x, s.y);
-    const ImVec2 b = at(s.x + s.w, s.y);
-    const ImVec2 c = at(s.x + s.w, s.y + s.h);
-    const ImVec2 d = at(s.x, s.y + s.h);
-
     ImDrawList* draw = ImGui::GetForegroundDrawList();
-    draw->AddQuad(a, b, c, d, IM_COL32(0, 0, 0, 200), 3.0f);
-    draw->AddQuad(a, b, c, d, IM_COL32(255, 255, 255, 230), 1.0f);
+
+    if (s.mask.empty()) {
+        const ImVec2 a = at(s.x, s.y);
+        const ImVec2 b = at(s.x + s.w, s.y);
+        const ImVec2 c = at(s.x + s.w, s.y + s.h);
+        const ImVec2 d = at(s.x, s.y + s.h);
+        draw->AddQuad(a, b, c, d, IM_COL32(0, 0, 0, 200), 3.0f);
+        draw->AddQuad(a, b, c, d, IM_COL32(255, 255, 255, 230), 1.0f);
+        return;
+    }
+    for (const std::array<double, 4>& e : app.ants.segments) {
+        const ImVec2 a = at(e[0], e[1]);
+        const ImVec2 b = at(e[2], e[3]);
+        draw->AddLine(a, b, IM_COL32(0, 0, 0, 200), 3.0f);
+        draw->AddLine(a, b, IM_COL32(255, 255, 255, 230), 1.0f);
+    }
+}
+
+/// The lasso loop while it is being drawn. Closed visibly, because that is
+/// what releasing will do.
+void drawLassoInProgress(const App& app) {
+    if (!app.selecting || app.tool != Tool::Lasso || app.lassoPath.size() < 2) return;
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    for (std::size_t i = 0; i < app.lassoPath.size(); ++i) {
+        const sbl::Point& a = app.lassoPath[i];
+        const sbl::Point& b = app.lassoPath[(i + 1) % app.lassoPath.size()];
+        const ImVec2 pa(static_cast<float>(toScreenX(app.view, a.x, a.y)),
+                        static_cast<float>(toScreenY(app.view, a.x, a.y)));
+        const ImVec2 pb(static_cast<float>(toScreenX(app.view, b.x, b.y)),
+                        static_cast<float>(toScreenY(app.view, b.x, b.y)));
+        draw->AddLine(pa, pb, IM_COL32(0, 0, 0, 200), 3.0f);
+        draw->AddLine(pa, pb, IM_COL32(255, 255, 255, 230), 1.0f);
+    }
 }
 
 /// The ruler guides.
@@ -2308,6 +2578,7 @@ void renderFrame(App& app) {
     }
     drawRulerGuides(app);
     drawSelectionOutline(app);
+    drawLassoInProgress(app);
     drawBrushCursor(app);
     // Recolouring text is the colour panel, not a control of its own: while a
     // session is live the text simply IS the foreground colour.
@@ -2389,6 +2660,9 @@ int main(int argc, char** argv) {
     }
 
     applySettings(app, loadSettings());
+    // The self-test starts from the documented default whatever this machine's
+    // preferences say, and switches to the GPU itself at the end.
+    if (selfTest) app.useGpu = false;
     syncHsvFromColour(app);
 
     // D-013: restoring is an explicit user action. Offer, never auto-open.
@@ -2406,6 +2680,8 @@ int main(int argc, char** argv) {
                                 sbl::StraightRgba8{255, 255, 255, 255});
     applyUndoBudget(app);
     zoomToActualSize(app.view, app.doc, app.viewport);
+    // After the document exists: switching backends reads the tiles back.
+    applyGpuMode(app);
 
     // `Exec=sable %f` in the .desktop file promises a path argument opens that
     // document, which is what double-clicking a .sable does. A path that will
@@ -2528,6 +2804,63 @@ int main(int argc, char** argv) {
             app.perspective.enabled = true;   // left on for the frames below
         }
 
+        // Lasso and magic wand (#18), driven through the same combine path the
+        // pointer uses. Left in place afterwards, so the frames below draw a
+        // NON-rectangular outline through the rotated view transform and the
+        // project round trip carries a real coverage mask.
+        {
+            const std::vector<sbl::Point> triangle{
+                {700.0, 150.0}, {950.0, 150.0}, {825.0, 380.0}};
+            app.selectBase.reset();
+            app.dragMode = sbl::SelectMode::Replace;
+            commitSelection(app, sbl::lassoSelection(triangle, app.doc.width,
+                                                     app.doc.height));
+            if (!app.doc.selection.has_value() || app.doc.selection->mask.empty()) {
+                SDL_Log("selftest FAILED: the lasso produced no mask");
+                return 1;
+            }
+
+            app.foreground = sbl::StraightRgba8{220, 40, 40, 255};
+            sbl::UndoRecord rec =
+                sbl::fillSelection(app.doc, app.doc.activeLayer, app.foreground);
+            app.canvas->releaseAll();
+            app.doc.undo.push(std::move(rec));
+
+            const auto red = [&](int x, int y) {
+                const sbl::StraightRgba8 c = sbl::pickColour(app.doc, x, y);
+                return c.r > 150 && c.g < 110;
+            };
+            // Inside the loop, and a corner of its bounding box that the loop
+            // does not enclose — a fill that ignored the mask would paint both.
+            if (!red(825, 200) || red(705, 375)) {
+                SDL_Log("selftest FAILED: the fill did not follow the lasso");
+                return 1;
+            }
+
+            const sbl::Selection wand = sbl::magicWandSelection(app.doc, 825, 200, 8);
+            const sbl::Selection& lasso = *app.doc.selection;
+            if (wand.empty() || std::abs(wand.x - lasso.x) > 4 ||
+                std::abs(wand.w - lasso.w) > 8) {
+                SDL_Log("selftest FAILED: the wand found %d,%d %dx%d where the lasso "
+                        "is %d,%d %dx%d", wand.x, wand.y, wand.w, wand.h,
+                        lasso.x, lasso.y, lasso.w, lasso.h);
+                return 1;
+            }
+            // Taking the wand's own region back out of the lasso must leave
+            // little more than the anti-aliased rim.
+            const sbl::Selection remainder =
+                sbl::combineSelections(lasso, wand, sbl::SelectMode::Subtract);
+            if (remainder.contains(825, 200)) {
+                SDL_Log("selftest FAILED: subtract left the middle selected");
+                return 1;
+            }
+            SDL_Log("selftest: lasso clips a fill, wand agrees with it, subtract works");
+
+            app.doc.undo.undo(app.doc);       // put the canvas back
+            app.canvas->releaseAll();
+            app.foreground = sbl::StraightRgba8{0, 0, 0, 255};
+        }
+
         // Rotation, checked where a unit test cannot reach: turning the view
         // must move no pixels (US-05.5's guarantee, extended to rotate), and
         // the app's own screen->canvas path must still land on the pixel the
@@ -2608,6 +2941,13 @@ int main(int argc, char** argv) {
             reloaded->layers[1].blend != sbl::BlendMode::Multiply ||
             reloaded->path != project) {
             SDL_Log("selftest FAILED: project round trip");
+            return 1;
+        }
+        // The lasso selection left in place above, back off disk with its
+        // coverage mask intact (#18).
+        if (!reloaded->selection.has_value() || reloaded->selection->mask.empty() ||
+            reloaded->selection->mask != app.doc.selection->mask) {
+            SDL_Log("selftest FAILED: the selection mask did not survive the file");
             return 1;
         }
         SDL_Log("selftest: project round trip ok, %zu layers, %zu bytes",
@@ -2831,12 +3171,43 @@ int main(int argc, char** argv) {
             SDL_Log("selftest FAILED");
             return 1;
         }
+        // The GPU backend through the real application path, if this machine
+        // has one. In CI it almost never does, and "no GPU" is a pass — the
+        // engine tests are where the two backends are compared pixel for
+        // pixel. What this checks is the wiring: that flicking the switch
+        // mid-session repaints the same canvas rather than a different one.
+        const std::vector<sbl::StraightRgba8> onCpu = sbl::flatten(app.doc);
+        app.useGpu = true;
+        applyGpuMode(app);
+        if (app.useGpu) {
+            const std::vector<sbl::StraightRgba8> onGpu = sbl::flatten(app.doc);
+            int worst = 0;
+            for (std::size_t i = 0; i < onCpu.size() && i < onGpu.size(); ++i)
+                worst = std::max({worst, std::abs(onCpu[i].r - onGpu[i].r),
+                                  std::abs(onCpu[i].g - onGpu[i].g),
+                                  std::abs(onCpu[i].b - onGpu[i].b),
+                                  std::abs(onCpu[i].a - onGpu[i].a)});
+            renderFrame(app);                     // one frame with tiles in VRAM
+            app.useGpu = false;
+            applyGpuMode(app);
+            if (worst > 1 || onGpu.size() != onCpu.size()) {
+                SDL_Log("selftest FAILED: the GPU backend differs by %d levels", worst);
+                return 1;
+            }
+            SDL_Log("selftest: %s, agrees with the CPU within %d level(s)",
+                    app.gpuWhy.c_str(), worst);
+        } else {
+            SDL_Log("selftest: no GPU backend here (%s); CPU only",
+                    app.gpuWhy.c_str());
+        }
         SDL_Log("selftest OK");
 
         // Exit before the settings write below. The self-test drives the app
         // with synthetic values, and persisting those would edit the real
         // user's preferences — which is how a test run silently changed
         // someone's stabilizer setting.
+        sbl::setPaintBackend(nullptr);
+        app.gpu.reset();
         canvas.releaseAll();
         ImGui_ImplSDLRenderer3_Shutdown();
         ImGui_ImplSDL3_Shutdown();
@@ -2876,6 +3247,11 @@ int main(int argc, char** argv) {
     Settings settings = loadSettings();
     collectSettings(app, settings);
     saveSettings(settings);
+
+    // Before `app.gpu` is destroyed: the process default must never point at a
+    // backend that has gone.
+    sbl::setPaintBackend(nullptr);
+    app.gpu.reset();
 
     canvas.releaseAll();
     ImGui_ImplSDLRenderer3_Shutdown();

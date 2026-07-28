@@ -52,12 +52,22 @@ inline constexpr int TILE_SIZE   = 256;
 inline constexpr int TILE_PIXELS = TILE_SIZE * TILE_SIZE;
 inline constexpr int TILE_BYTES  = TILE_PIXELS * 4;   // 262'144
 
+/// Ticks once for every handle to a tile's pixels that could write to them.
+///
+/// Process-wide rather than a counter inside each Tile, and never reset: undo
+/// destroys a tile and builds another, often at the same address, so anything
+/// caching a tile's contents elsewhere (D-025's GPU arena) needs a value that
+/// two different sets of pixels can never share. Not atomic — tiles belong to
+/// the thread that owns the document, which is the same discipline
+/// `cloneDocument` already relies on for the autosave hand-off.
+inline std::uint64_t g_tileStamp = 0;
+
 /// Premultiplied RGBA8, row-major, no padding.
 /// Heap-allocated deliberately: 256 KiB must never land on the stack, and
 /// moving a Tile must stay a pointer move rather than a memcpy.
 class Tile {
 public:
-    Tile() : px_(std::make_unique<PremulRgba8[]>(TILE_PIXELS)) {}
+    Tile() : px_(std::make_unique<PremulRgba8[]>(TILE_PIXELS)), stamp_(++g_tileStamp) {}
     Tile(Tile&&) noexcept            = default;   // move-only, by design
     Tile& operator=(Tile&&) noexcept = default;
     Tile(const Tile&)                = delete;    // copy must be explicit
@@ -66,21 +76,35 @@ public:
     /// The only way to copy 256 KiB. Make it a thing you have to type.
     [[nodiscard]] Tile clone() const;
 
-    [[nodiscard]] PremulRgba8*       pixels() noexcept       { return px_.get(); }
+    /// Non-const, so handing it out is indistinguishable from writing through
+    /// it. That is the whole of the invalidation story for a backend that
+    /// keeps its own copy: it cannot be told about a write it did not make, so
+    /// instead nobody can obtain the means to write without moving the stamp.
+    [[nodiscard]] PremulRgba8* pixels() noexcept {
+        stamp_ = ++g_tileStamp;
+        return px_.get();
+    }
     [[nodiscard]] const PremulRgba8* pixels() const noexcept { return px_.get(); }
 
     [[nodiscard]] PremulRgba8 pixel(int x, int y) const noexcept {
         return px_[static_cast<std::size_t>(y) * TILE_SIZE + x];
     }
     void setPixel(int x, int y, PremulRgba8 c) noexcept {
+        stamp_ = ++g_tileStamp;
         px_[static_cast<std::size_t>(y) * TILE_SIZE + x] = c;
     }
+
+    /// What the host pixels are, as a value. Equal stamps mean equal contents;
+    /// unequal stamps mean no more than "assume they differ". Measured cost of
+    /// keeping it: none — a 4-megapixel flood fill times the same either way.
+    [[nodiscard]] std::uint64_t stamp() const noexcept { return stamp_; }
 
     void fill(PremulRgba8 c) noexcept;
     [[nodiscard]] bool isFullyTransparent() const noexcept;
 
 private:
     std::unique_ptr<PremulRgba8[]> px_;
+    std::uint64_t stamp_ = 0;
 };
 
 // -------------------------------------------------------------------- layer
@@ -211,14 +235,50 @@ struct Layer {
 
 // ----------------------------------------------------------------- selection
 
-/// A rectangle is the whole of selection in v1 (Milestone 3). Ask it questions
-/// rather than reading its fields — freehand and masks arrive in Stage D.
+/// A bounding rectangle, optionally carrying a per-pixel coverage mask for the
+/// shapes a rectangle cannot say: lasso, magic wand, and whatever the
+/// add/subtract/intersect modifiers built out of them (#18).
+///
+/// Ask it questions rather than reading its fields. An EMPTY `mask` means "all
+/// of the rectangle, fully covered" — that is the fast path, and the reason a
+/// plain marquee still costs four comparisons per pixel instead of a megabyte
+/// of 255s and a cache miss.
+///
+/// See `sbl/select.hpp` for the things that build one.
 struct Selection {
     std::int32_t x = 0, y = 0, w = 0, h = 0;
+
+    /// Empty, or exactly w * h bytes, row-major from (x, y). Nothing else is a
+    /// valid state; `coverage()` would read past a short one.
+    ///
+    /// The `{}` is load-bearing: it keeps `Selection{x, y, w, h}` a warning-free
+    /// aggregate initialisation, which is how every existing call site and test
+    /// builds one.
+    std::vector<std::uint8_t> mask{};
+
     [[nodiscard]] bool empty() const noexcept { return w <= 0 || h <= 0; }
-    [[nodiscard]] bool contains(std::int32_t px, std::int32_t py) const noexcept {
-        return px >= x && py >= y && px < x + w && py < y + h;
+
+    /// 0 outside, 255 fully inside, and the values between are the
+    /// anti-aliased edge. Writers scale what they lay down by this rather than
+    /// treating the boundary as in-or-out, which is what stops a lasso fill
+    /// coming out with a staircase along its edge.
+    [[nodiscard]] std::uint8_t coverage(std::int32_t px,
+                                        std::int32_t py) const noexcept {
+        if (px < x || py < y || px >= x + w || py >= y + h) return 0;
+        if (mask.empty()) return 255;
+        return mask[static_cast<std::size_t>(py - y) * static_cast<std::size_t>(w) +
+                    static_cast<std::size_t>(px - x)];
     }
+
+    /// The yes-or-no question every caller already asks, and still the whole
+    /// interface for anything that cannot express a fraction. Half coverage
+    /// counts as inside, so a shape's edge pixels belong to it; for a
+    /// rectangle the answer is exactly what it always was.
+    [[nodiscard]] bool contains(std::int32_t px, std::int32_t py) const noexcept {
+        return coverage(px, py) >= 128;
+    }
+
+    friend bool operator==(const Selection&, const Selection&) = default;
 };
 
 // ---------------------------------------------------------------------- undo
