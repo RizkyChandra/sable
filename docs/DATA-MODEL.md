@@ -237,8 +237,18 @@ struct Document {
     // Perspective guides (D-025). The ruler that uses them is view state; the
     // points are part of the drawing and are saved with it.
     std::vector<VanishingPoint> vanishingPoints;
+
+    // What an importer had to drop, worded for the artist (#40). The engine
+    // cannot show anything (D-003), so it leaves the sentence here and the app
+    // puts it in the status bar. Empty for anything Sable wrote itself.
+    std::vector<std::string> warnings;
 };
 ```
+
+Everything in `Document` is deep-copied by `cloneDocument` for the autosave
+worker (D-013). A field added here and forgotten there is the trap this project
+keeps falling into — the rulers, the selection and the warnings all had to be
+added in both places, and each has a test that fails if only one is done.
 
 **Design rule for the paint path.** The engine's paint functions take the pieces
 they need, never the whole document:

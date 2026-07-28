@@ -424,6 +424,17 @@ struct Document {
     /// back with it, while "is the ruler on" is a preference.
     std::vector<VanishingPoint> vanishingPoints;
 
+    /// What an importer had to drop or could not read, worded for the artist
+    /// (#40). Empty for anything Sable wrote itself.
+    ///
+    /// This is the whole of the engine's channel to the UI: the engine has no
+    /// SDL and no ImGui (D-003), so it cannot show anything — it can only leave
+    /// the sentence where the app will find it. Silently handing back a
+    /// different picture from the one in the file is the failure this exists to
+    /// prevent, and stderr is nowhere for an application started from a desktop
+    /// icon.
+    std::vector<std::string> warnings;
+
     [[nodiscard]] Layer*       layerById(LayerId id) noexcept;
     [[nodiscard]] const Layer* layerById(LayerId id) const noexcept;
     [[nodiscard]] Layer*       active() noexcept { return layerById(activeLayer); }
