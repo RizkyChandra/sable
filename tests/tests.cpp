@@ -3391,6 +3391,109 @@ TEST_CASE("a malformed .ora fails with a message rather than a crash") {
     std::filesystem::remove(path);
 }
 
+// ------------------------------------------------------------------ Krita (#9)
+
+TEST_CASE("a .kra written by Krita imports with its layer stack intact") {
+    // tests/fixtures/krita.kra was saved by Krita 6.0.3. It holds, bottom to
+    // top: an empty Background, an opaque red Base, a half-opacity Group with
+    // a blue square inside it, a multiply layer at 60%, a hidden layer, a
+    // half-alpha layer, and an invert FILTER layer that Sable cannot read.
+    const auto doc = importDocument(fixture("krita.kra"));
+    REQUIRE(doc.has_value());
+    CHECK(doc->path.empty());          // never the artist's file (D-024)
+    CHECK(doc->width == 64);
+    CHECK(doc->height == 48);
+    CHECK(doc->dpi == 72);
+
+    // Seven layers arrived; the filter layer was skipped rather than sinking
+    // the load.
+    CHECK(doc->layers.size() == 7);
+    CHECK(byName(*doc, "Invert") == nullptr);
+
+    // Krita's layers are unbounded, and the tiles it stores are only what
+    // differs from the layer's default pixel. Krita's own Background layer
+    // stores NO tiles at all and is opaque white purely by that default, so
+    // ignoring it would quietly drop the white background out of every
+    // document an artist brings over.
+    const Layer* background = byName(*doc, "Background");
+    REQUIRE(background != nullptr);
+    const Tile* backgroundTile = background->find(TileKey{0, 0});
+    REQUIRE(backgroundTile != nullptr);
+    CHECK(backgroundTile->pixel(40, 40) == PremulRgba8{255, 255, 255, 255});
+
+    const Layer* group  = byName(*doc, "Group");
+    const Layer* inside = byName(*doc, "Inside");
+    const Layer* top    = byName(*doc, "Top");
+    const Layer* fade   = byName(*doc, "Fade");
+    const Layer* hidden = byName(*doc, "Hidden");
+    const Layer* base   = byName(*doc, "Base");
+    REQUIRE(group != nullptr);
+    REQUIRE(inside != nullptr);
+    REQUIRE(top != nullptr);
+    REQUIRE(fade != nullptr);
+    REQUIRE(hidden != nullptr);
+    REQUIRE(base != nullptr);
+
+    CHECK(group->kind == LayerKind::Folder);
+    CHECK(group->opacity == doctest::Approx(128.0 / 255.0));
+    CHECK(inside->parent == group->id);
+    CHECK(!base->parent.has_value());
+    CHECK(top->blend == BlendMode::Multiply);
+    CHECK(top->opacity == doctest::Approx(153.0 / 255.0));
+    CHECK(hidden->visible == false);
+
+    // The pixels, which is what the tiled, LZF-compressed, plane-separated
+    // layer data is for. Krita stores B, G, R, A planes with straight alpha;
+    // any of those three read wrongly and these three checks fail.
+    const Tile* baseTile = base->find(TileKey{0, 0});
+    REQUIRE(baseTile != nullptr);
+    CHECK(baseTile->pixel(2, 2) == PremulRgba8{255, 0, 0, 255});
+
+    const Tile* insideTile = inside->find(TileKey{0, 0});
+    REQUIRE(insideTile != nullptr);
+    CHECK(insideTile->pixel(16, 16) == PremulRgba8{0, 0, 255, 255});
+    CHECK(insideTile->pixel(2, 2) == PremulRgba8{0, 0, 0, 0});
+
+    const Tile* fadeTile = fade->find(TileKey{0, 0});
+    REQUIRE(fadeTile != nullptr);
+    CHECK(fadeTile->pixel(5, 30) == PremulRgba8{128, 0, 0, 128});
+
+    // The same document exported to ORA by Krita must import to the same
+    // picture — two readers, two containers, one answer.
+    const auto viaOra = importDocument(fixture("krita.ora"));
+    REQUIRE(viaOra.has_value());
+    CHECK(hashCanvas(*doc) == hashCanvas(*viaOra));
+}
+
+TEST_CASE("a misnamed .kra is still read as one") {
+    const auto path = scratchFile("misnamed_kra.sable");
+    std::filesystem::copy_file(fixture("krita.kra"), path);
+
+    const auto doc = importDocument(path);
+    REQUIRE(doc.has_value());
+    CHECK(doc->width == 64);
+    CHECK(doc->path.empty());
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("a malformed .kra fails with a message rather than a crash") {
+    const auto path = scratchFile("broken.kra");
+    { FILE* out = std::fopen(path.string().c_str(), "wb");
+      REQUIRE(out != nullptr);
+      std::fwrite("PK\x03\x04 not really a Krita document", 1, 33, out);
+      std::fclose(out); }
+
+    const auto doc = importDocument(path);
+    REQUIRE(!doc.has_value());
+    CHECK(!doc.error().detail.empty());
+    std::filesystem::remove(path);
+
+    // Sable writes no .kra: reading someone else's format is interop, writing
+    // it is a promise about fidelity we have not made.
+    const auto written = exportDocument(oraSampleDocument(), scratchFile("nope.kra"));
+    REQUIRE(!written.has_value());
+}
+
 // -------------------------------------------------------------- paint backend
 // D-021: the CPU path is the default and the reference. What these check is
 // the seam itself — that every pixel writer really goes through it, that a

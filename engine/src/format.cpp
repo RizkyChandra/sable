@@ -7,6 +7,7 @@
 
 #include "miniz.h"
 #include "miniz_zip.h"
+#include "sbl/kra.hpp"
 #include "sbl/openraster.hpp"
 #include "sbl/project.hpp"
 #include "sbl/psd.hpp"
@@ -42,6 +43,10 @@ bool looksLikeOpenRaster(const std::filesystem::path& path) {
     return hasZipEntry(path, "mimetype") && hasZipEntry(path, "stack.xml");
 }
 
+bool looksLikeKrita(const std::filesystem::path& path) {
+    return hasZipEntry(path, "maindoc.xml");
+}
+
 bool looksLikePsd(const std::filesystem::path& path) {
     return readMagic(path, 4) == "8BPS";
 }
@@ -58,6 +63,10 @@ std::vector<Format> builtinFormats() {
         .nativeProject = false,
         .read = &readOpenRaster, .write = &writeOpenRaster,
         .sniff = &looksLikeOpenRaster});
+    all.push_back(Format{
+        .id = "kra", .label = "Krita document", .extensions = {"kra"},
+        .nativeProject = false,
+        .read = &readKrita, .write = nullptr, .sniff = &looksLikeKrita});
     all.push_back(Format{
         .id = "png", .label = "PNG image", .extensions = {"png"},
         .nativeProject = false,

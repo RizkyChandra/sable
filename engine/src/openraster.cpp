@@ -8,6 +8,7 @@
 #include <system_error>
 #include <vector>
 
+#include "blit.hpp"
 #include "lodepng.h"
 #include "miniz.h"
 #include "miniz_zip.h"
@@ -91,54 +92,6 @@ struct Rect {
 
 // ------------------------------------------------------------------- import
 
-/// Blits one straight-alpha RGBA image into a layer's sparse tile map.
-///
-/// Clipped to the canvas: Sable's canvas is fixed, the compositor draws
-/// nothing outside it, and an ORA written with a wild offset would otherwise
-/// allocate tiles no one can ever see.
-void blitImage(Layer& layer, const std::vector<unsigned char>& straight,
-               std::int32_t imageW, std::int32_t imageH,
-               std::int32_t offsetX, std::int32_t offsetY,
-               std::int32_t canvasW, std::int32_t canvasH) {
-    const std::int32_t x0 = std::max<std::int32_t>(0, offsetX);
-    const std::int32_t y0 = std::max<std::int32_t>(0, offsetY);
-    const std::int32_t x1 = std::min(canvasW, offsetX + imageW);
-    const std::int32_t y1 = std::min(canvasH, offsetY + imageH);
-    if (x1 <= x0 || y1 <= y0) return;
-
-    for (std::int32_t ty = tileIndex(y0); ty <= tileIndex(y1 - 1); ++ty) {
-        for (std::int32_t tx = tileIndex(x0); tx <= tileIndex(x1 - 1); ++tx) {
-            const std::int32_t originX = tx * TILE_SIZE;
-            const std::int32_t originY = ty * TILE_SIZE;
-            const std::int32_t left   = std::max(x0, originX);
-            const std::int32_t top    = std::max(y0, originY);
-            const std::int32_t right  = std::min(x1, originX + TILE_SIZE);
-            const std::int32_t bottom = std::min(y1, originY + TILE_SIZE);
-
-            Tile& tile = layer.tileFor(TileKey{tx, ty});
-            for (std::int32_t y = top; y < bottom; ++y) {
-                for (std::int32_t x = left; x < right; ++x) {
-                    const std::size_t at =
-                        (static_cast<std::size_t>(y - offsetY) *
-                             static_cast<std::size_t>(imageW) +
-                         static_cast<std::size_t>(x - offsetX)) * 4;
-                    tile.setPixel(x - originX, y - originY,
-                                  StraightRgba8{straight[at + 0], straight[at + 1],
-                                                straight[at + 2], straight[at + 3]}
-                                      .premultiply());
-                }
-            }
-        }
-    }
-
-    // An ORA layer is a rectangle, so most of what was just written may be
-    // transparent. Keep the map sparse (D-005) rather than carrying blank
-    // 256 KiB tiles around for the life of the document.
-    std::erase_if(layer.tiles, [](const auto& entry) {
-        return entry.second.isFullyTransparent();
-    });
-}
-
 struct Importer {
     mz_zip_archive& zip;
     Document& doc;
@@ -177,11 +130,14 @@ struct Importer {
                 lodepng::decode(straight, w, h,
                                 reinterpret_cast<const unsigned char*>(png.data()),
                                 png.size()) == 0) {
-                blitImage(layer, straight, static_cast<std::int32_t>(w),
-                          static_cast<std::int32_t>(h),
-                          offsetX + parseInt(element.attributeOr("x", "0")),
-                          offsetY + parseInt(element.attributeOr("y", "0")),
-                          doc.width, doc.height);
+                blitStraightImage(layer, straight.data(), static_cast<std::int32_t>(w),
+                                  static_cast<std::int32_t>(h),
+                                  offsetX + parseInt(element.attributeOr("x", "0")),
+                                  offsetY + parseInt(element.attributeOr("y", "0")),
+                                  doc.width, doc.height);
+                // An ORA layer is a rectangle, so much of what was written may
+                // be transparent.
+                dropBlankTiles(layer);
             }
         }
 
