@@ -10,11 +10,12 @@ PaintTool SAI's feel, built from original code.
 
 **Status: v2 — competing with PaintTool SAI 2 directly.**
 
-Canvas with pan, zoom and rotation. Pencil, opaque, airbrush, marker,
-watercolour and smudge brushes. Pen pressure with editable curves, per-device
-calibration and a pulled-string stabilizer. Layers with 13 blend modes,
-clipping, groups, linework and text. Rectangle, lasso and magic-wand selection.
-Bucket fill, transform, perspective and symmetry rulers.
+Canvas with pan, zoom and rotation, in 8-bit or 16-bit colour. Pencil, opaque,
+airbrush, marker, watercolour and smudge brushes. Pen pressure with editable
+curves, per-device calibration and a pulled-string stabilizer. Layers with 13
+blend modes, clipping, groups, linework and text. Rectangle, lasso and
+magic-wand selection. Bucket fill, transform, perspective and symmetry
+rulers.
 
 **Reads and writes other applications' files:** PSD (layered, both directions,
 with layer masks), OpenRaster, and Krita `.kra` (read). Its own `.sable` is a

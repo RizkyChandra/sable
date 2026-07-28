@@ -14,8 +14,10 @@ SAI's feel, built from original code.
 | 3 | [DATA-MODEL.md](DATA-MODEL.md) | The types the engine owns and the `.sable` file format |
 | 4 | [USER-STORIES.md](USER-STORIES.md) | Milestone 1–2 stories with testable acceptance criteria |
 
-**Where the code is:** all four milestones are built — see the root
-`README.md` for how to build and run it. `engine/` and `app/` are the D-003 split; `tests/` holds the doctest
+**Where the code is:** v2 is built — see the root `README.md`. The four
+milestones this specification describes were finished at v1.0.0; v2 dropped the
+scope limits it set (D-019 to D-023) and added file-format interoperability, an
+opt-in GPU backend, and the feature parity work in Workstream 4. `engine/` and `app/` are the D-003 split; `tests/` holds the doctest
 suite the cross-cutting requirements ask for.
 
 Three decisions were added while implementing. Two of them record something
