@@ -53,7 +53,10 @@ the hardware. Run it before promising anyone that the pen works.
   `imgui_impl_sdlrenderer3`. Native file dialogs come from SDL3, not ImGui.
 - **CPU-first tiled renderer**, 256 × 256 sparse tiles, premultiplied RGBA8, one
   streaming texture per visible tile. CPU compositing is the default and the
-  reference; a GPU backend is opt-in at runtime (D-021).
+  reference; a GPU backend is opt-in at runtime (D-021). That backend is
+  SDL_GPU compute shaders over an arena of tiles in VRAM, and it is off unless
+  the artist turns it on in View — D-025 has the reasoning, the limits and the
+  measurements.
 - **Event-driven loop**, not a game loop. Near-zero CPU when nobody is drawing.
 - **Milestone 1** is a window, a canvas, a brush, undo, and PNG export. Nothing
   else.

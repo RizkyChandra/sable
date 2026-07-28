@@ -504,6 +504,11 @@ std::vector<bool> floodRegion(const std::vector<StraightRgba8>& composite,
 
 UndoRecord CpuBackend::bucketFill(Document& doc, LayerId target, std::int32_t x,
                                   std::int32_t y, StraightRgba8 colour, int tolerance) {
+    return floodFill(doc, target, x, y, colour, tolerance);
+}
+
+UndoRecord PaintBackend::floodFill(Document& doc, LayerId target, std::int32_t x,
+                                   std::int32_t y, StraightRgba8 colour, int tolerance) {
     UndoRecord rec;
     Layer* layer = doc.layerById(target);
     if (layer == nullptr || layer->locked || layer->kind != LayerKind::Raster) return rec;
@@ -515,8 +520,8 @@ UndoRecord CpuBackend::bucketFill(Document& doc, LayerId target, std::int32_t x,
 
     // Match against what the artist sees, so a fill inside line art on another
     // layer works. One flatten per fill is affordable; per pixel would not be.
-    // *this, not the process default: a GPU backend delegating its fill to
-    // the CPU one must not have the match run somewhere else.
+    // *this, not the process default: whichever backend was asked for the fill
+    // is the one whose compositing the artist is looking at.
     const std::vector<StraightRgba8> composite = flatten(doc, *this);
     if (composite.empty()) return rec;
 

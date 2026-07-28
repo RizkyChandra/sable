@@ -17,6 +17,19 @@ constexpr std::uint8_t mul255(std::uint32_t c, std::uint32_t a) noexcept {
     return static_cast<std::uint8_t>((t + (t >> 8)) >> 8);
 }
 
+/// Makes `Tile::pixels()` the truth before host code moves tiles about.
+///
+/// The layer operations below read and move pixels without going through the
+/// backend, so each of them has to say so — that is the rule D-025 puts in
+/// place of an audit. A no-op on the CPU. The `std::expected` is dropped
+/// deliberately: none of these callers can do anything useful with a failure,
+/// and `PaintBackend::takeError` carries it to the app for them.
+void ensureHostTiles(const Document& doc) {
+    if (const auto ready = paintBackend().readback(doc); !ready.has_value()) {
+        // Recorded on the backend; see PaintBackend::readback.
+    }
+}
+
 }  // namespace
 
 // ------------------------------------------------------------------- colour
@@ -170,6 +183,7 @@ Tile Tile::clone() const {
 }
 
 void Tile::fill(PremulRgba8 c) noexcept {
+    stamp_ = ++g_tileStamp;
     std::fill_n(px_.get(), TILE_PIXELS, c);
 }
 
@@ -212,6 +226,12 @@ namespace {
 /// leaves the record holding what was replaced. Applying it twice is the
 /// identity — which is exactly why undo and redo are the same call.
 std::vector<std::pair<LayerId, TileKey>> swapRecord(Document& doc, UndoRecord& rec) {
+    // The tiles this is about to move around must be the ones the artist last
+    // saw. A backend holding a newer copy somewhere else cannot be asked
+    // afterwards — by then the tiles have swapped and there is nothing left to
+    // put the pixels back into.
+    ensureHostTiles(doc);
+
     std::vector<std::pair<LayerId, TileKey>> changed;
     changed.reserve(rec.tiles.size());
 
@@ -488,6 +508,10 @@ UndoRecord deleteLayer(Document& doc, LayerId id) {
     // dead end the artist has no obvious way out of.
     if (it == doc.layers.end() || doc.layers.size() <= 1) return rec;
 
+    // The whole layer, tiles and all, goes into the undo record; undoing puts
+    // it back. Anything a backend was still holding has to be in it.
+    ensureHostTiles(doc);
+
     const auto at = static_cast<std::size_t>(it - doc.layers.begin());
     rec.label = "Delete layer";
     rec.structure = LayerStructureDelta{LayerChange::Existence, id, at,
@@ -503,6 +527,8 @@ UndoRecord duplicateLayer(Document& doc, LayerId id) {
     UndoRecord rec;
     const Layer* source = doc.layerById(id);
     if (source == nullptr) return rec;
+
+    ensureHostTiles(doc);      // the clone below copies host pixels only
 
     Layer copy;
     copy.id   = doc.nextLayerId++;
