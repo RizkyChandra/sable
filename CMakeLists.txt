@@ -111,6 +111,7 @@ add_library(engine STATIC
   engine/src/canvas.cpp
   engine/src/input.cpp
   engine/src/paint.cpp
+  engine/src/select.cpp
   engine/src/io.cpp
   engine/src/project.cpp
   engine/src/format.cpp

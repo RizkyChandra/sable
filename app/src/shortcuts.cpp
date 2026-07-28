@@ -52,6 +52,8 @@ constexpr std::array<Entry, static_cast<std::size_t>(Action::Count)> kDefaults{{
     {Action::ToolEraser,    "Eraser tool",    SDLK_E, SDL_KMOD_NONE},
     {Action::ToolFill,      "Fill tool",      SDLK_G, SDL_KMOD_NONE},
     {Action::ToolSelect,    "Select tool",    SDLK_M, SDL_KMOD_NONE},
+    {Action::ToolLasso,     "Lasso tool",     SDLK_L, SDL_KMOD_NONE},
+    {Action::ToolWand,      "Magic wand",     SDLK_W, SDL_KMOD_NONE},
     {Action::ToolTransform, "Transform tool", SDLK_T, SDL_KMOD_NONE},
     {Action::SizeDown,      "Smaller brush",  SDLK_LEFTBRACKET,  SDL_KMOD_NONE},
     {Action::SizeUp,        "Larger brush",   SDLK_RIGHTBRACKET, SDL_KMOD_NONE},

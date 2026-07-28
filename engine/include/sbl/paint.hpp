@@ -173,6 +173,19 @@ std::size_t paintSample(Stroke& s, PaintTarget& t, const InputSample& sample,
                                     std::int32_t x, std::int32_t y,
                                     StraightRgba8 colour, int tolerance);
 
+/// Every pixel of the contiguous region of similar colour containing (x, y),
+/// as a width * height flag buffer over `composite` (which must be that size).
+/// `clip`, when given, stops the flood at the selection edge.
+///
+/// Exposed rather than kept private to the bucket because the magic wand needs
+/// the same answer (#18). Two floods would be two definitions of "close enough
+/// in colour" and of where a region stops, and the day they drift the artist
+/// finds out by selecting a region and filling something else.
+[[nodiscard]] std::vector<bool> floodRegion(
+    const std::vector<StraightRgba8>& composite, std::int32_t width,
+    std::int32_t height, std::int32_t x, std::int32_t y, int tolerance,
+    const Selection* clip);
+
 /// Fills the selection, or the whole layer when there is none.
 [[nodiscard]] UndoRecord fillSelection(Document& doc, LayerId target,
                                        StraightRgba8 colour);

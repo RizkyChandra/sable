@@ -299,10 +299,19 @@ void CpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
                 const double ddy = (static_cast<double>(y) + 0.5) - dab.y;
                 PremulRgba8* row = px + static_cast<std::size_t>(y - oy) * TILE_SIZE;
                 for (std::int32_t x = x0; x <= x1; ++x) {
-                    if (t.selection != nullptr && !t.selection->contains(x, y)) continue;
+                    // Scaled by the selection, not gated on it: a lasso edge is
+                    // a fraction of a pixel, and rounding it to in-or-out is
+                    // what makes a clipped stroke look sawn off. A rectangle
+                    // answers 255 everywhere and pays one multiply.
+                    float clip = 1.0f;
+                    if (t.selection != nullptr) {
+                        const std::uint8_t inside = t.selection->coverage(x, y);
+                        if (inside == 0) continue;
+                        clip = static_cast<float>(inside) * (1.0f / 255.0f);
+                    }
                     const double ddx = (static_cast<double>(x) + 0.5) - dab.x;
                     float cov = coverage(std::sqrt(ddx * ddx + ddy * ddy),
-                                         dab.radius, dab.hardness);
+                                         dab.radius, dab.hardness) * clip;
                     if (cov <= 0.0f) continue;
 
                     PremulRgba8& dst = row[x - ox];
@@ -397,6 +406,23 @@ struct PixelWriter {
     UndoRecord&   undo;
     TouchedTiles& touched;
 
+    [[nodiscard]] PremulRgba8 get(std::int32_t x, std::int32_t y) {
+        const TileKey key{tileIndex(x), tileIndex(y)};
+        const Tile* tile = layer.find(key);
+        if (tile == nullptr) return PremulRgba8{};
+        return tile->pixel(x - key.first * TILE_SIZE, y - key.second * TILE_SIZE);
+    }
+
+    /// Lays `colour` down at `cov`/255 strength. Full coverage is a plain
+    /// write — which is what every rectangular selection still gets — and
+    /// anything less is the anti-aliased edge of a lasso or a wand fading out
+    /// rather than stepping.
+    void blendIn(std::int32_t x, std::int32_t y, PremulRgba8 colour,
+                 std::uint8_t cov) {
+        if (cov == 255) { set(x, y, colour); return; }
+        set(x, y, lerpPremul(get(x, y), colour, static_cast<float>(cov) / 255.0f));
+    }
+
     void set(std::int32_t x, std::int32_t y, PremulRgba8 colour) {
         const TileKey key{tileIndex(x), tileIndex(y)};
         Tile* tile = layer.find(key);
@@ -421,6 +447,60 @@ bool withinTolerance(StraightRgba8 a, StraightRgba8 b, int tolerance) noexcept {
 }
 
 }  // namespace
+
+std::vector<bool> floodRegion(const std::vector<StraightRgba8>& composite,
+                              std::int32_t width, std::int32_t height,
+                              std::int32_t x, std::int32_t y, int tolerance,
+                              const Selection* clip) {
+    std::vector<bool> done(static_cast<std::size_t>(width) *
+                           static_cast<std::size_t>(height), false);
+    if (x < 0 || y < 0 || x >= width || y >= height) return done;
+    if (composite.size() != done.size()) return done;
+
+    const auto index = [width](std::int32_t px, std::int32_t py) {
+        return static_cast<std::size_t>(py) * static_cast<std::size_t>(width) + px;
+    };
+    const StraightRgba8 seed = composite[index(x, y)];
+    tolerance = std::clamp(tolerance, 0, 255);
+
+    const auto matches = [&](std::int32_t px, std::int32_t py) {
+        if (px < 0 || py < 0 || px >= width || py >= height) return false;
+        if (done[index(px, py)]) return false;
+        // Any coverage at all counts as inside, so a soft selection edge does
+        // not saw a region in half. For a rectangle this is `contains`.
+        if (clip != nullptr && clip->coverage(px, py) == 0) return false;
+        return withinTolerance(composite[index(px, py)], seed, tolerance);
+    };
+    if (!matches(x, y)) return done;
+
+    // Scanline flood fill: pushes spans rather than pixels, so a 4000 x 4000
+    // fill does not put four million entries on the stack.
+    std::vector<std::pair<std::int32_t, std::int32_t>> pending;
+    pending.emplace_back(x, y);
+
+    while (!pending.empty()) {
+        const auto [sx, sy] = pending.back();
+        pending.pop_back();
+        if (!matches(sx, sy)) continue;
+
+        std::int32_t left = sx;
+        while (matches(left - 1, sy)) --left;
+        std::int32_t right = sx;
+        while (matches(right + 1, sy)) ++right;
+
+        for (std::int32_t px = left; px <= right; ++px) done[index(px, sy)] = true;
+        // Seed the rows above and below once per contiguous run, not per pixel.
+        for (const std::int32_t ny : {sy - 1, sy + 1}) {
+            bool inRun = false;
+            for (std::int32_t px = left; px <= right; ++px) {
+                const bool ok = matches(px, ny);
+                if (ok && !inRun) pending.emplace_back(px, ny);
+                inRun = ok;
+            }
+        }
+    }
+    return done;
+}
 
 UndoRecord CpuBackend::bucketFill(Document& doc, LayerId target, std::int32_t x,
                                   std::int32_t y, StraightRgba8 colour, int tolerance) {
@@ -448,51 +528,24 @@ UndoRecord CpuBackend::bucketFill(Document& doc, LayerId target, std::int32_t x,
 
     const StraightRgba8 seed = composite[index(x, y)];
     const PremulRgba8 fill = colour.premultiply();
-    tolerance = std::clamp(tolerance, 0, 255);
 
     // Already the target colour and nothing to spread into: filling would be a
     // no-op that still costs an undo step.
-    if (withinTolerance(seed, colour, 0) && tolerance == 0) return rec;
+    if (withinTolerance(seed, colour, 0) && std::clamp(tolerance, 0, 255) == 0)
+        return rec;
+
+    // The shared flood — the magic wand runs this same call (#18).
+    const std::vector<bool> region =
+        floodRegion(composite, w, h, x, y, tolerance, selection);
 
     rec.label = "Fill";
     TouchedTiles touched;
     PixelWriter writer{*layer, rec, touched};
-
-    // Scanline flood fill: pushes spans rather than pixels, so a 4000 x 4000
-    // fill does not put four million entries on the stack.
-    std::vector<bool> done(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), false);
-    std::vector<std::pair<std::int32_t, std::int32_t>> pending;
-    pending.emplace_back(x, y);
-
-    const auto matches = [&](std::int32_t px, std::int32_t py) {
-        if (px < 0 || py < 0 || px >= w || py >= h) return false;
-        if (done[index(px, py)]) return false;
-        if (selection != nullptr && !selection->contains(px, py)) return false;
-        return withinTolerance(composite[index(px, py)], seed, tolerance);
-    };
-
-    while (!pending.empty()) {
-        const auto [sx, sy] = pending.back();
-        pending.pop_back();
-        if (!matches(sx, sy)) continue;
-
-        std::int32_t left = sx;
-        while (matches(left - 1, sy)) --left;
-        std::int32_t right = sx;
-        while (matches(right + 1, sy)) ++right;
-
-        for (std::int32_t px = left; px <= right; ++px) {
-            done[index(px, sy)] = true;
-            writer.set(px, sy, fill);
-        }
-        // Seed the rows above and below once per contiguous run, not per pixel.
-        for (const std::int32_t ny : {sy - 1, sy + 1}) {
-            bool inRun = false;
-            for (std::int32_t px = left; px <= right; ++px) {
-                const bool ok = matches(px, ny);
-                if (ok && !inRun) pending.emplace_back(px, ny);
-                inRun = ok;
-            }
+    for (std::int32_t py = 0; py < h; ++py) {
+        for (std::int32_t px = 0; px < w; ++px) {
+            if (!region[index(px, py)]) continue;
+            writer.blendIn(px, py, fill,
+                           selection != nullptr ? selection->coverage(px, py) : 255);
         }
     }
 
@@ -506,8 +559,11 @@ UndoRecord CpuBackend::fillSelection(Document& doc, LayerId target,
     Layer* layer = doc.layerById(target);
     if (layer == nullptr || layer->locked || layer->kind != LayerKind::Raster) return rec;
 
-    Selection area{0, 0, doc.width, doc.height};
-    if (doc.selection.has_value() && !doc.selection->empty()) area = *doc.selection;
+    // Referenced, not copied: a mask is up to a byte per canvas pixel, and
+    // "fill what is selected" has no business duplicating it.
+    const Selection whole{0, 0, doc.width, doc.height};
+    const Selection& area = doc.selection.has_value() && !doc.selection->empty()
+                                ? *doc.selection : whole;
 
     const std::int32_t x0 = std::max(0, area.x);
     const std::int32_t y0 = std::max(0, area.y);
@@ -519,8 +575,13 @@ UndoRecord CpuBackend::fillSelection(Document& doc, LayerId target,
     TouchedTiles touched;
     PixelWriter writer{*layer, rec, touched};
     const PremulRgba8 fill = colour.premultiply();
-    for (std::int32_t y = y0; y < y1; ++y)
-        for (std::int32_t x = x0; x < x1; ++x) writer.set(x, y, fill);
+    for (std::int32_t y = y0; y < y1; ++y) {
+        for (std::int32_t x = x0; x < x1; ++x) {
+            const std::uint8_t cov = area.coverage(x, y);
+            if (cov != 0) writer.blendIn(x, y, fill, cov);
+        }
+    }
+    if (rec.tiles.empty()) rec.label.clear();
     return rec;
 }
 
@@ -542,15 +603,28 @@ UndoRecord CpuBackend::transformRegion(Document& doc, LayerId target,
     const auto srcH = static_cast<std::size_t>(sy1 - sy0);
 
     // 1. Read the region out first. Everything after this writes.
+    //
+    // Coverage decides how much of each pixel travels, so a lasso moves its own
+    // shape rather than the box around it. A rectangle covers everything it
+    // spans and this is the old behaviour exactly.
     std::vector<PremulRgba8> lifted(srcW * srcH);
     for (std::size_t row = 0; row < srcH; ++row) {
         for (std::size_t col = 0; col < srcW; ++col) {
             const std::int32_t px = sx0 + static_cast<std::int32_t>(col);
             const std::int32_t py = sy0 + static_cast<std::int32_t>(row);
+            const std::uint8_t cov = source.coverage(px, py);
+            if (cov == 0) continue;
             const TileKey key{tileIndex(px), tileIndex(py)};
-            if (const Tile* tile = layer->find(key); tile != nullptr)
-                lifted[row * srcW + col] =
-                    tile->pixel(px - key.first * TILE_SIZE, py - key.second * TILE_SIZE);
+            const Tile* tile = layer->find(key);
+            if (tile == nullptr) continue;
+            PremulRgba8 c =
+                tile->pixel(px - key.first * TILE_SIZE, py - key.second * TILE_SIZE);
+            if (cov != 255) {
+                const float f = static_cast<float>(cov) / 255.0f;
+                c = PremulRgba8{scale8(c.r, f), scale8(c.g, f), scale8(c.b, f),
+                                scale8(c.a, f)};
+            }
+            lifted[row * srcW + col] = c;
         }
     }
 
@@ -584,10 +658,16 @@ UndoRecord CpuBackend::transformRegion(Document& doc, LayerId target,
     TouchedTiles touched;
     PixelWriter writer{*layer, rec, touched};
 
-    // 3. Clear the source. Snapshots happen through the same writer, so the
-    // undo record covers the source and the destination alike.
-    for (std::int32_t y = sy0; y < sy1; ++y)
-        for (std::int32_t x = sx0; x < sx1; ++x) writer.set(x, y, PremulRgba8{});
+    // 3. Clear the source, by however much of it was lifted. Snapshots happen
+    // through the same writer, so the undo record covers the source and the
+    // destination alike.
+    for (std::int32_t y = sy0; y < sy1; ++y) {
+        for (std::int32_t x = sx0; x < sx1; ++x) {
+            const std::uint8_t cov = source.coverage(x, y);
+            if (cov == 0) continue;
+            writer.blendIn(x, y, PremulRgba8{}, cov);
+        }
+    }
 
     // 4. Inverse-map each destination pixel back into the lifted buffer.
     const double invCos =  cosA;

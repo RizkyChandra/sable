@@ -24,6 +24,7 @@
 #include "sbl/io.hpp"
 #include "sbl/paint.hpp"
 #include "sbl/project.hpp"
+#include "sbl/select.hpp"
 
 #include "lodepng.h"
 // App-side, but deliberately SDL-free so the view transform is testable here.
@@ -1910,6 +1911,302 @@ TEST_CASE("transforming an empty or locked region does nothing") {
                           Transform{}).empty());
 }
 
+// ------------------------------------------- lasso and magic wand (#18)
+
+namespace {
+
+/// A square as a lasso path, corners on pixel boundaries so the expected
+/// coverage is exactly 0 or 255 and a test can be strict about it.
+std::vector<Point> squarePath(double x, double y, double side) {
+    return {{x, y}, {x + side, y}, {x + side, y + side}, {x, y + side}};
+}
+
+}  // namespace
+
+TEST_CASE("a lasso selects the inside of its loop and nothing else") {
+    const Selection sel = lassoSelection(squarePath(20.0, 20.0, 40.0), 100, 100);
+    REQUIRE(!sel.empty());
+    CHECK(sel.x == 20);
+    CHECK(sel.y == 20);
+    CHECK(sel.w == 40);
+    CHECK(sel.h == 40);
+    CHECK(sel.contains(20, 20));
+    CHECK(sel.contains(59, 59));
+    CHECK(!sel.contains(19, 40));
+    CHECK(!sel.contains(60, 40));
+    // Axis- and pixel-aligned, so there is no partial coverage anywhere: the
+    // rectangle it happens to be is recognised and the mask dropped.
+    CHECK(sel.mask.empty());
+}
+
+TEST_CASE("a lasso edge is anti-aliased rather than stepped") {
+    // A triangle, so the long edge crosses pixels at an angle. A hard-edged
+    // rasteriser answers only 0 and 255; this must answer in between.
+    const std::vector<Point> triangle{{10.0, 10.0}, {90.0, 10.0}, {10.0, 90.0}};
+    const Selection sel = lassoSelection(triangle, 100, 100);
+    REQUIRE(!sel.mask.empty());
+
+    int partial = 0;
+    for (const std::uint8_t v : sel.mask)
+        if (v != 0 && v != 255) ++partial;
+    CHECK(partial > 20);
+
+    CHECK(sel.contains(15, 15));                     // well inside
+    CHECK(!sel.contains(80, 80));                    // beyond the diagonal
+    // The hypotenuse runs along x + y = 100, so this pixel straddles it.
+    CHECK(sel.coverage(45, 54) > 0);
+    CHECK(sel.coverage(45, 54) < 255);
+}
+
+TEST_CASE("a self-crossing lasso encloses everything it went round") {
+    // A path that doubles back over itself. Even-odd winding punches the
+    // overlap out; non-zero keeps it, which is what an artist scribbling a
+    // loop means by it.
+    const std::vector<Point> eight{{10.0, 10.0}, {50.0, 10.0}, {50.0, 50.0},
+                                   {10.0, 50.0}, {10.0, 30.0}, {50.0, 30.0},
+                                   {50.0, 40.0}, {10.0, 40.0}};
+    const Selection sel = lassoSelection(eight, 100, 100);
+    CHECK(sel.contains(30, 35));
+}
+
+TEST_CASE("a lasso with too few points, or off the canvas, selects nothing") {
+    CHECK(lassoSelection(squarePath(10.0, 10.0, 20.0), 0, 0).empty());
+    const std::vector<Point> two{{1.0, 1.0}, {5.0, 5.0}};
+    CHECK(lassoSelection(two, 50, 50).empty());
+    CHECK(lassoSelection(squarePath(-90.0, -90.0, 40.0), 50, 50).empty());
+}
+
+TEST_CASE("painting is clipped to a lasso, not to its bounding box") {
+    Document doc = makeDocument(100, 100, StraightRgba8{255, 255, 255, 255});
+    const std::vector<Point> triangle{{10.0, 10.0}, {90.0, 10.0}, {10.0, 90.0}};
+    const Selection selection = lassoSelection(triangle, 100, 100);
+    REQUIRE(!selection.mask.empty());
+
+    Layer* layer = doc.active();
+    BrushPreset p = defaultOpaque();
+    p.size     = 200.0f;                // covers the whole bounding box
+    p.hardness = 1.0f;
+    p.pressure = PressureMapping{};
+
+    Stroke s;
+    std::vector<Dab> scratch;
+    beginStroke(s, p, StraightRgba8{0, 0, 0, 255}, layer->id);
+    PaintTarget t{*layer, s.pending, s.touched, doc.width, doc.height, &selection};
+    paintSample(s, t, at(50.0, 50.0), scratch);
+
+    CHECK(pickColour(doc, 15, 15) == StraightRgba8{0, 0, 0, 255});
+    // Inside the bounding box but past the diagonal: a rectangle-only
+    // selection would have painted here.
+    CHECK(pickColour(doc, 80, 80) == StraightRgba8{255, 255, 255, 255});
+}
+
+TEST_CASE("filling a lasso selection fades at the edge instead of stepping") {
+    Document doc = makeDocument(100, 100, StraightRgba8{255, 255, 255, 255});
+    const std::vector<Point> triangle{{10.0, 10.0}, {90.0, 10.0}, {10.0, 90.0}};
+    doc.selection = lassoSelection(triangle, 100, 100);
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{0, 0, 0, 255}));
+
+    CHECK(pickColour(doc, 15, 15) == StraightRgba8{0, 0, 0, 255});
+    CHECK(pickColour(doc, 85, 85) == StraightRgba8{255, 255, 255, 255});
+
+    // Somewhere along the diagonal there are grey pixels. Without coverage
+    // there would be only black and white, and the edge would be a staircase.
+    int greys = 0;
+    for (std::int32_t i = 12; i < 88; ++i) {
+        const StraightRgba8 c = pickColour(doc, i, 99 - i);
+        if (c.r > 20 && c.r < 235) ++greys;
+    }
+    CHECK(greys > 5);
+}
+
+TEST_CASE("the magic wand finds the same region the bucket fill would") {
+    Document doc = makeDocument(120, 120, StraightRgba8{255, 255, 255, 255});
+    doc.selection = Selection{30, 30, 50, 40};
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{0, 90, 200, 255}));
+    doc.selection.reset();
+
+    const Selection wand = magicWandSelection(doc, 50, 50, 0);
+    REQUIRE(!wand.empty());
+    CHECK(wand.contains(30, 30));
+    CHECK(wand.contains(79, 69));
+    CHECK(!wand.contains(29, 50));
+    CHECK(!wand.contains(80, 50));
+
+    // The same boundary the bucket's own flood reports — they run the same
+    // code, and this is the test that says so out loud.
+    const std::vector<StraightRgba8> composite = flatten(doc);
+    const std::vector<bool> region =
+        floodRegion(composite, doc.width, doc.height, 50, 50, 0, nullptr);
+    for (std::int32_t y = 0; y < doc.height; ++y)
+        for (std::int32_t x = 0; x < doc.width; ++x)
+            REQUIRE(region[static_cast<std::size_t>(y) * 120 + x] == wand.contains(x, y));
+}
+
+TEST_CASE("the magic wand is bounded by tolerance and by the canvas") {
+    Document doc = makeDocument(60, 60, StraightRgba8{255, 255, 255, 255});
+    doc.selection = Selection{0, 0, 30, 60};
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{250, 250, 250, 255}));
+    doc.selection.reset();
+
+    // Five apart: outside tolerance 2, inside tolerance 16. Asked with
+    // `contains` rather than by width, because the bounding box also holds the
+    // one-pixel soft rim.
+    CHECK(!magicWandSelection(doc, 10, 10, 2).contains(30, 10));
+    CHECK(magicWandSelection(doc, 10, 10, 16).contains(30, 10));
+    CHECK(magicWandSelection(doc, 10, 10, 16).contains(59, 59));
+    // A click off the canvas selects nothing rather than clamping to an edge
+    // the artist did not click on.
+    CHECK(magicWandSelection(doc, -1, 10, 0).empty());
+    CHECK(magicWandSelection(doc, 60, 10, 0).empty());
+}
+
+TEST_CASE("a magic wand selection constrains painting and bucket fill") {
+    Document doc = makeDocument(120, 120, StraightRgba8{255, 255, 255, 255});
+    doc.selection = Selection{20, 20, 40, 40};
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{0, 200, 0, 255}));
+    doc.selection = magicWandSelection(doc, 40, 40, 0);
+    REQUIRE(!doc.selection->empty());
+
+    doc.undo.push(bucketFill(doc, doc.activeLayer, 40, 40,
+                             StraightRgba8{200, 0, 0, 255}, 0));
+    CHECK(pickColour(doc, 40, 40) == StraightRgba8{200, 0, 0, 255});
+    CHECK(pickColour(doc, 100, 100) == StraightRgba8{255, 255, 255, 255});
+    // Clicking outside the wand's region still fills nothing.
+    CHECK(bucketFill(doc, doc.activeLayer, 100, 100,
+                     StraightRgba8{0, 0, 255, 255}, 0).empty());
+}
+
+TEST_CASE("transforming a lasso region moves the shape, not its bounding box") {
+    Document doc = makeDocument(120, 120, StraightRgba8{255, 255, 255, 255});
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{0, 0, 0, 255}));
+
+    const std::vector<Point> triangle{{20.0, 20.0}, {80.0, 20.0}, {20.0, 80.0}};
+    const Selection region = lassoSelection(triangle, 120, 120);
+    doc.undo.push(transformRegion(doc, doc.activeLayer, region, Transform{}));
+
+    // A pixel inside the loop was lifted and put straight back.
+    CHECK(pickColour(doc, 30, 30) == StraightRgba8{0, 0, 0, 255});
+    // A pixel in the bounding box but outside the loop was never lifted, so it
+    // is still black rather than cleared.
+    CHECK(pickColour(doc, 75, 75) == StraightRgba8{0, 0, 0, 255});
+}
+
+TEST_CASE("add, subtract and intersect combine coverage") {
+    const Selection a{0, 0, 40, 40};
+    const Selection b{20, 20, 40, 40};
+
+    const Selection sum = combineSelections(a, b, SelectMode::Add);
+    CHECK(sum.x == 0);
+    CHECK(sum.w == 60);
+    CHECK(sum.contains(5, 5));
+    CHECK(sum.contains(55, 55));
+    CHECK(!sum.contains(55, 5));       // the corner neither rectangle covers
+
+    const Selection cut = combineSelections(a, b, SelectMode::Subtract);
+    CHECK(cut.contains(5, 5));
+    CHECK(!cut.contains(30, 30));
+
+    const Selection both = combineSelections(a, b, SelectMode::Intersect);
+    CHECK(both.x == 20);
+    CHECK(both.y == 20);
+    CHECK(both.w == 20);
+    CHECK(both.h == 20);
+    // Two rectangles intersected are a rectangle: the mask must be dropped, or
+    // every selection stays a mask for the rest of the session.
+    CHECK(both.mask.empty());
+
+    CHECK(combineSelections(a, b, SelectMode::Replace) == b);
+}
+
+TEST_CASE("combining with nothing is not a way to lose a selection") {
+    const Selection a{10, 10, 20, 20};
+    CHECK(combineSelections(a, Selection{}, SelectMode::Add) == a);
+    CHECK(combineSelections(a, Selection{}, SelectMode::Subtract) == a);
+    CHECK(combineSelections(a, Selection{}, SelectMode::Intersect).empty());
+    CHECK(combineSelections(Selection{}, a, SelectMode::Add) == a);
+    // Nothing to subtract from, and nothing to intersect with.
+    CHECK(combineSelections(Selection{}, a, SelectMode::Subtract).empty());
+    CHECK(combineSelections(Selection{}, a, SelectMode::Intersect).empty());
+
+    // Subtracting a region from itself leaves nothing at all, not an empty box
+    // that still blocks painting.
+    CHECK(combineSelections(a, a, SelectMode::Subtract).empty());
+}
+
+TEST_CASE("subtracting keeps the anti-aliased edge of what remains") {
+    const std::vector<Point> triangle{{10.0, 10.0}, {90.0, 10.0}, {10.0, 90.0}};
+    const Selection lasso = lassoSelection(triangle, 100, 100);
+    const Selection cut =
+        combineSelections(lasso, Selection{10, 10, 20, 20}, SelectMode::Subtract);
+    REQUIRE(!cut.mask.empty());
+    CHECK(!cut.contains(15, 15));                    // taken out
+    CHECK(cut.contains(60, 15));                     // still in
+    int partial = 0;
+    for (const std::uint8_t v : cut.mask)
+        if (v != 0 && v != 255) ++partial;
+    CHECK(partial > 20);                             // the diagonal survived
+}
+
+TEST_CASE("a rectangular selection carries no mask") {
+    // The fast path, stated as a test: the common case must not start paying
+    // for the feature that made the uncommon one possible.
+    Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+    doc.selection = Selection{8, 8, 16, 16};
+    CHECK(doc.selection->mask.empty());
+    CHECK(doc.selection->coverage(8, 8) == 255);
+    CHECK(doc.selection->coverage(7, 8) == 0);
+}
+
+TEST_CASE("a selection with a mask survives a save, a load and a clone") {
+    Document doc = makeDocument(120, 120, StraightRgba8{255, 255, 255, 255});
+    const std::vector<Point> triangle{{10.0, 10.0}, {100.0, 10.0}, {10.0, 100.0}};
+    doc.selection = lassoSelection(triangle, 120, 120);
+    REQUIRE(!doc.selection->mask.empty());
+
+    const auto path = scratchFile("sable_selection.sable");
+    REQUIRE(saveProject(doc, path).has_value());
+    const auto loaded = loadProject(path);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->selection.has_value());
+    CHECK(*loaded->selection == *doc.selection);
+
+    // The clone the background save hands its worker must carry it too, or a
+    // recovered file comes back without the selection (D-013).
+    const Document copy = cloneDocument(*loaded);
+    REQUIRE(copy.selection.has_value());
+    CHECK(*copy.selection == *doc.selection);
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("a rectangular selection round-trips without a mask file") {
+    Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+    doc.selection = Selection{5, 6, 20, 21};
+
+    const auto path = scratchFile("sable_selection_rect.sable");
+    REQUIRE(saveProject(doc, path).has_value());
+
+    mz_zip_archive zip{};
+    REQUIRE(mz_zip_reader_init_file(&zip, path.string().c_str(), 0));
+    CHECK(mz_zip_reader_locate_file(&zip, "selection.png", nullptr, 0) < 0);
+    mz_zip_reader_end(&zip);
+
+    const auto loaded = loadProject(path);
+    REQUIRE(loaded.has_value());
+    REQUIRE(loaded->selection.has_value());
+    CHECK(*loaded->selection == Selection{5, 6, 20, 21});
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("a document with nothing selected saves no selection at all") {
+    Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+    const auto path = scratchFile("sable_selection_none.sable");
+    REQUIRE(saveProject(doc, path).has_value());
+    const auto loaded = loadProject(path);
+    REQUIRE(loaded.has_value());
+    CHECK(!loaded->selection.has_value());
+    std::filesystem::remove(path);
+}
+
 // ------------------------------------------------- project format (M3)
 
 namespace {
@@ -2083,20 +2380,24 @@ TEST_CASE("vanishing points survive a save and load") {
     std::filesystem::remove(path);
 }
 
-TEST_CASE("a file from before the version bump still opens") {
-    // A v1 document is exactly a v2 one with no vanishing_points, so nothing
-    // about the bump may cost an existing file its contents.
-    Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
-    const auto path = scratchFile("sable_v1.sable");
-    REQUIRE(saveProject(doc, path).has_value());
-    rewriteFormatVersion(path, 1);
+TEST_CASE("files from before the version bumps still open") {
+    // A v1 document is a v2 one with no vanishing_points, and a v2 one is a v3
+    // with no selection. Everything each bump added is optional, so no bump may
+    // cost an existing file its contents.
+    for (const int version : {1, 2}) {
+        Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+        const auto path = scratchFile("sable_old.sable");
+        REQUIRE(saveProject(doc, path).has_value());
+        rewriteFormatVersion(path, version);
 
-    const auto loaded = loadProject(path);
-    REQUIRE(loaded.has_value());
-    CHECK(loaded->width == 64);
-    CHECK(loaded->layers.size() == 1);
-    CHECK(loaded->vanishingPoints.empty());
-    std::filesystem::remove(path);
+        const auto loaded = loadProject(path);
+        REQUIRE(loaded.has_value());
+        CHECK(loaded->width == 64);
+        CHECK(loaded->layers.size() == 1);
+        CHECK(loaded->vanishingPoints.empty());
+        CHECK(!loaded->selection.has_value());
+        std::filesystem::remove(path);
+    }
 }
 
 TEST_CASE("malformed and missing files fail with a message, never a crash") {
