@@ -224,7 +224,9 @@ if(SABLE_BUILD_TESTS)
   target_include_directories(doctest SYSTEM INTERFACE ${doctest_SOURCE_DIR})
 
   # Headless by design (D-003) — these run in CI with no display server.
-  add_executable(engine_tests tests/tests.cpp)
+  # differential.cpp is the CPU/GPU harness (#14); it is a suite of its own and
+  # tests.cpp is quite long enough.
+  add_executable(engine_tests tests/tests.cpp tests/differential.cpp)
   target_link_libraries(engine_tests PRIVATE sable::engine doctest miniz nlohmann_json)
   # app/src for view_transform.hpp only — the screen<->canvas maths is app-side
   # but SDL-free, and a rotation dropped on one path is not something to check
