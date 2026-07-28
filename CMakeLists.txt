@@ -113,7 +113,8 @@ add_library(engine STATIC
   engine/src/paint.cpp
   engine/src/io.cpp
   engine/src/project.cpp
-  engine/src/format.cpp)
+  engine/src/format.cpp
+  engine/src/psd.cpp)
 target_include_directories(engine PUBLIC engine/include)
 target_link_libraries(engine PRIVATE lodepng miniz nlohmann_json)
 target_compile_options(engine PRIVATE ${SABLE_WARNINGS})
@@ -230,6 +231,10 @@ if(SABLE_BUILD_TESTS)
   # but SDL-free, and a rotation dropped on one path is not something to check
   # by eye. Nothing else from app/ may be included here (D-003).
   target_include_directories(engine_tests PRIVATE app/src)
+  # The committed fixtures (tests/data). Read from the source tree rather than
+  # copied into the build directory: they are inputs, never written to.
+  target_compile_definitions(engine_tests PRIVATE
+    SABLE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
   # The allocation counter (US-02.9) replaces global operator new/delete, which
   # both compilers misread as a malloc/delete mismatch. It is not one.
   target_compile_options(engine_tests PRIVATE ${SABLE_WARNINGS})

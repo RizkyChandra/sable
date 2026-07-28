@@ -2022,6 +2022,190 @@ TEST_CASE("the dialog filters come from the registry") {
     }));
 }
 
+// ------------------------------------------------------------------ PSD (#6)
+//
+// The fixtures come from tests/data/make_psd_fixtures.py, which composites the
+// same artwork independently in floating point. flat.psd is therefore ground
+// truth for what Photoshop, Krita and GIMP show, and comparing Sable's
+// flatten() of layered.psd against it is a check against another
+// implementation rather than against Sable itself.
+
+namespace {
+
+std::filesystem::path testData(const char* name) {
+    return std::filesystem::path(SABLE_TEST_DATA_DIR) / name;
+}
+
+const Layer* layerNamed(const Document& doc, std::string_view name) {
+    for (const Layer& layer : doc.layers)
+        if (layer.name == name) return &layer;
+    return nullptr;
+}
+
+/// A 26-byte PSD header and three empty sections. Enough to reach — and be
+/// rejected by — every check readPsd() makes before it looks at any pixels.
+std::filesystem::path writePsdHeader(const char* file, std::uint16_t depth,
+                                     std::uint16_t colourMode) {
+    const auto path = scratchFile(file);
+    const auto be16 = [](std::vector<unsigned char>& out, std::uint16_t v) {
+        out.push_back(static_cast<unsigned char>(v >> 8));
+        out.push_back(static_cast<unsigned char>(v & 0xFF));
+    };
+    const auto be32 = [&](std::vector<unsigned char>& out, std::uint32_t v) {
+        be16(out, static_cast<std::uint16_t>(v >> 16));
+        be16(out, static_cast<std::uint16_t>(v & 0xFFFF));
+    };
+
+    std::vector<unsigned char> bytes{'8', 'B', 'P', 'S'};
+    be16(bytes, 1);
+    bytes.insert(bytes.end(), 6, 0);
+    be16(bytes, 4);
+    be32(bytes, 8);            // height
+    be32(bytes, 8);            // width
+    be16(bytes, depth);
+    be16(bytes, colourMode);
+    be32(bytes, 0);            // colour mode data
+    be32(bytes, 0);            // image resources
+    be32(bytes, 0);            // layer and mask information
+
+    FILE* out = std::fopen(path.string().c_str(), "wb");
+    REQUIRE(out != nullptr);
+    std::fwrite(bytes.data(), 1, bytes.size(), out);
+    std::fclose(out);
+    return path;
+}
+
+}  // namespace
+
+TEST_CASE("a layered PSD imports its stack, groups, names and modes") {
+    const auto doc = importDocument(testData("layered.psd"));
+    REQUIRE(doc.has_value());
+
+    CHECK(doc->width == 64);
+    CHECK(doc->height == 48);
+    // PSD has no document background, so nothing may be composited underneath
+    // or a file with transparency stops matching what Photoshop shows.
+    CHECK(doc->background.a == 0);
+    CHECK(doc->path.empty());
+    CHECK(!doc->dirty);
+
+    // Bottom to top, a folder ahead of its own children — Sable's order, which
+    // PSD writes the other way round.
+    REQUIRE(doc->layers.size() == 6);
+    CHECK(doc->layers[0].name == "Base");
+    CHECK(doc->layers[1].name == "Sky");
+    CHECK(doc->layers[2].name == "Fill");
+    CHECK(doc->layers[3].name == "Tint");
+    CHECK(doc->layers[4].name == "Shadow");
+    CHECK(doc->layers[5].name == "Ink");
+
+    const Layer* group = layerNamed(*doc, "Sky");
+    REQUIRE(group != nullptr);
+    CHECK(group->kind == LayerKind::Folder);
+    CHECK(group->tiles.empty());
+    CHECK(group->opacity == doctest::Approx(200.0f / 255.0f).epsilon(0.005));
+    for (const char* child : {"Fill", "Tint", "Shadow"}) {
+        const Layer* layer = layerNamed(*doc, child);
+        REQUIRE(layer != nullptr);
+        CHECK(layer->kind == LayerKind::Raster);
+        CHECK(layer->parent == group->id);
+    }
+    for (const char* top : {"Base", "Ink"})
+        CHECK(!layerNamed(*doc, top)->parent.has_value());
+
+    CHECK(layerNamed(*doc, "Ink")->blend == BlendMode::Multiply);
+    CHECK(layerNamed(*doc, "Ink")->opacity == doctest::Approx(128.0f / 255.0f).epsilon(0.005));
+    CHECK(!layerNamed(*doc, "Shadow")->visible);
+    CHECK(layerNamed(*doc, "Tint")->clipToBelow);
+    CHECK(!layerNamed(*doc, "Fill")->clipToBelow);
+
+    // Both compression schemes: "Fill" is stored raw, the rest PackBits.
+    CHECK(!layerNamed(*doc, "Fill")->tiles.empty());
+    CHECK(!layerNamed(*doc, "Base")->tiles.empty());
+}
+
+TEST_CASE("a PSD flattens to the composite the file itself carries") {
+    // The acceptance criterion for #6: what Sable draws matches what every
+    // other application shows for the same file, within 8-bit tolerance.
+    const auto layered = importDocument(testData("layered.psd"));
+    const auto flat    = importDocument(testData("flat.psd"));
+    REQUIRE(layered.has_value());
+    REQUIRE(flat.has_value());
+
+    // A PSD with no layer section is a real case, not a corner: it is what
+    // most exporters produce.
+    REQUIRE(flat->layers.size() == 1);
+
+    const std::vector<StraightRgba8> ours   = flatten(*layered);
+    const std::vector<StraightRgba8> theirs = flatten(*flat);
+    REQUIRE(ours.size() == theirs.size());
+
+    int worst = 0;
+    for (std::size_t i = 0; i < ours.size(); ++i) {
+        worst = std::max({worst,
+            std::abs(ours[i].r - theirs[i].r), std::abs(ours[i].g - theirs[i].g),
+            std::abs(ours[i].b - theirs[i].b), std::abs(ours[i].a - theirs[i].a)});
+    }
+    CHECK(worst <= 2);
+}
+
+TEST_CASE("an imported PSD round-trips through .sable") {
+    const auto imported = importDocument(testData("layered.psd"));
+    REQUIRE(imported.has_value());
+    const std::uint64_t before = hashCanvas(*imported);
+
+    const auto path = scratchFile("psd_import_roundtrip.sable");
+    REQUIRE(saveProject(*imported, path).has_value());
+    const auto reloaded = loadProject(path);
+    REQUIRE(reloaded.has_value());
+
+    REQUIRE(reloaded->layers.size() == imported->layers.size());
+    for (std::size_t i = 0; i < reloaded->layers.size(); ++i) {
+        CHECK(reloaded->layers[i].name   == imported->layers[i].name);
+        CHECK(reloaded->layers[i].blend  == imported->layers[i].blend);
+        CHECK(reloaded->layers[i].parent == imported->layers[i].parent);
+    }
+    CHECK(hashCanvas(*reloaded) == before);
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("a PSD is recognised by content even when the extension lies") {
+    const auto path = scratchFile("psd_misnamed.sable");
+    std::filesystem::copy_file(testData("layered.psd"), path);
+
+    const auto doc = importDocument(path);
+    REQUIRE(doc.has_value());
+    CHECK(doc->layers.size() == 6);
+    CHECK(doc->path.empty());
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("PSDs Sable cannot read are refused, not read wrong") {
+    // Until 16-bit lands (D-023), the honest answer is a message naming what
+    // the file actually is — never a canvas full of garbage.
+    const auto deep = writePsdHeader("psd_16bit.psd", 16, 3);
+    const auto wide = importDocument(deep);
+    REQUIRE(!wide.has_value());
+    CHECK(wide.error().detail.find("16 bits") != std::string::npos);
+
+    const auto cmyk = writePsdHeader("psd_cmyk.psd", 8, 4);
+    const auto inky = importDocument(cmyk);
+    REQUIRE(!inky.has_value());
+    CHECK(inky.error().detail.find("CMYK") != std::string::npos);
+
+    // Truncation is the common form of corruption, and must not crash.
+    const auto stub = scratchFile("psd_truncated.psd");
+    { FILE* out = std::fopen(stub.string().c_str(), "wb");
+      REQUIRE(out != nullptr);
+      std::fwrite("8BPS\0\1", 1, 6, out);
+      std::fclose(out); }
+    CHECK(!importDocument(stub).has_value());
+
+    std::filesystem::remove(deep);
+    std::filesystem::remove(cmyk);
+    std::filesystem::remove(stub);
+}
+
 TEST_CASE("recovery never writes over the artist's own file") {
     // D-013, and the one failure mode that destroys work permanently.
     const auto userFile = scratchFile("sable_precious.sable");
