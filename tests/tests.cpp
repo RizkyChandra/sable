@@ -18,6 +18,7 @@
 #endif
 #include <vector>
 
+#include "sbl/backend.hpp"
 #include "sbl/canvas.hpp"
 #include "sbl/format.hpp"
 #include "sbl/io.hpp"
@@ -2222,4 +2223,168 @@ TEST_CASE("a failed write returns an error rather than terminating") {
     REQUIRE(!result.has_value());
     CHECK(!result.error().detail.empty());
     CHECK(!describe(result.error().kind).empty());
+}
+
+// -------------------------------------------------------------- paint backend
+// D-021: the CPU path is the default and the reference. What these check is
+// the seam itself — that every pixel writer really goes through it, that a
+// backend can be swapped in without the callers knowing, and that a failure
+// reaches somebody instead of vanishing into a noexcept.
+
+namespace {
+
+/// What #12-#15 will subclass, with a counter where the device would go. It
+/// forwards to the reference implementation, which is also how a real GPU
+/// backend falls back — CpuBackend never looks at PaintTarget::backend, so
+/// forwarding cannot recurse.
+class SpyBackend final : public PaintBackend {
+public:
+    int writes = 0, reads = 0, readbacks = 0;
+    bool failNextDab = false;
+
+    std::string_view name() const noexcept override { return "spy"; }
+
+    void applyDab(PaintTarget& t, const Dab& dab) override {
+        ++writes;
+        if (failNextDab) {
+            failNextDab = false;
+            recordFailure(Error{ErrorKind::Io, "device lost"});
+            return;
+        }
+        cpuBackend().applyDab(t, dab);
+    }
+    UndoRecord bucketFill(Document& doc, LayerId target, std::int32_t x, std::int32_t y,
+                          StraightRgba8 colour, int tolerance) override {
+        ++writes;
+        return cpuBackend().bucketFill(doc, target, x, y, colour, tolerance);
+    }
+    UndoRecord fillSelection(Document& doc, LayerId target, StraightRgba8 c) override {
+        ++writes;
+        return cpuBackend().fillSelection(doc, target, c);
+    }
+    UndoRecord transformRegion(Document& doc, LayerId target, const Selection& source,
+                               const Transform& transform) override {
+        ++writes;
+        return cpuBackend().transformRegion(doc, target, source, transform);
+    }
+    UndoRecord clearLayer(Layer& layer) override {
+        ++writes;
+        return cpuBackend().clearLayer(layer);
+    }
+    UndoRecord mergeLayerDown(Document& doc, LayerId id) override {
+        ++writes;
+        return cpuBackend().mergeLayerDown(doc, id);
+    }
+    std::vector<PremulRgba8> compositeRect(const Document& doc, std::int32_t x,
+                                           std::int32_t y, std::int32_t w,
+                                           std::int32_t h) override {
+        ++reads;
+        return cpuBackend().compositeRect(doc, x, y, w, h);
+    }
+    StraightRgba8 pickColour(const Document& doc, std::int32_t x,
+                             std::int32_t y) override {
+        ++reads;
+        return cpuBackend().pickColour(doc, x, y);
+    }
+    std::expected<void, Error> readback(const Document& doc) override {
+        ++readbacks;
+        return cpuBackend().readback(doc);
+    }
+};
+
+/// The default backend is process-wide state, so putting it back is not
+/// optional — a leaked one would paint the rest of the suite.
+struct InstalledBackend {
+    explicit InstalledBackend(PaintBackend& b) noexcept { setPaintBackend(&b); }
+    ~InstalledBackend() { setPaintBackend(nullptr); }
+};
+
+}  // namespace
+
+TEST_CASE("the CPU backend is the default, and it is the one with no device") {
+    CHECK(paintBackend().name() == "cpu");
+    CHECK(&paintBackend() == &cpuBackend());
+    // The reference implementation has nothing to fetch, so a readback on it
+    // always succeeds — which is why the headless tests need no device.
+    Document doc = makeDocument(8, 8, StraightRgba8{255, 255, 255, 255});
+    CHECK(cpuBackend().readback(doc).has_value());
+}
+
+TEST_CASE("every pixel writer and reader goes through the backend") {
+    SpyBackend spy;
+    Document doc = makeDocument(300, 300, StraightRgba8{255, 255, 255, 255});
+    const LayerId lower = doc.activeLayer;
+    const LayerId upper = doc.addLayer("upper").id;
+
+    std::uint64_t hash = 0;
+    {
+        const InstalledBackend installed{spy};
+
+        Stroke s;
+        std::vector<Dab> scratch;
+        Layer& layer = *doc.layerById(upper);
+        beginStroke(s, defaultPencil(), StraightRgba8{0, 0, 0, 255}, upper);
+        PaintTarget target{layer, s.pending, s.touched, doc.width, doc.height};
+        paintSample(s, target, at(40.0, 40.0), scratch);
+
+        (void)bucketFill(doc, lower, 200, 200, StraightRgba8{255, 0, 0, 255}, 0);
+        (void)fillSelection(doc, lower, StraightRgba8{0, 255, 0, 255});
+        (void)transformRegion(doc, lower, Selection{10, 10, 20, 20}, Transform{.dx = 5.0});
+        (void)mergeLayerDown(doc, upper);
+        (void)clearLayer(*doc.layerById(lower));
+        (void)pickColour(doc, 1, 1);
+        hash = hashCanvas(doc);          // flatten -> compositeRect
+    }
+
+    CHECK(spy.writes == 6);
+    CHECK(spy.reads >= 2);               // pickColour, and flatten's composite
+    CHECK(spy.readbacks == 0);           // nothing asked for the pixels back
+
+    // Delegating to the CPU backend must produce exactly the CPU answer: that
+    // equality is the whole basis of D-021's "the CPU defines the right one".
+    CHECK(paintBackend().name() == "cpu");
+    CHECK(hashCanvas(doc) == hash);
+}
+
+TEST_CASE("a stroke can name its own backend without moving the default") {
+    SpyBackend spy;
+    Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+    Layer& layer = *doc.active();
+
+    Stroke s;
+    std::vector<Dab> scratch;
+    beginStroke(s, defaultOpaque(), StraightRgba8{0, 0, 0, 255}, layer.id);
+    PaintTarget target{layer, s.pending, s.touched, doc.width, doc.height, nullptr, &spy};
+    paintSample(s, target, at(32.0, 32.0), scratch);
+
+    CHECK(spy.writes > 0);
+    CHECK(paintBackend().name() == "cpu");     // the process default never moved
+    CHECK(pickColour(doc, 32, 32) == StraightRgba8{0, 0, 0, 255});
+}
+
+TEST_CASE("a backend failure reaches the caller instead of vanishing") {
+    // The reason applyDab stopped being noexcept. A dab a backend could not
+    // draw used to be indistinguishable from one it drew perfectly.
+    SpyBackend spy;
+    Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+    Layer& layer = *doc.active();
+
+    Stroke s;
+    std::vector<Dab> scratch;
+    beginStroke(s, defaultOpaque(), StraightRgba8{0, 0, 0, 255}, layer.id);
+    PaintTarget target{layer, s.pending, s.touched, doc.width, doc.height, nullptr, &spy};
+
+    CHECK(!spy.takeError().has_value());       // nothing has gone wrong yet
+    spy.failNextDab = true;
+    paintSample(s, target, at(32.0, 32.0), scratch);
+
+    const std::optional<Error> failure = spy.takeError();
+    REQUIRE(failure.has_value());
+    CHECK(failure->kind == ErrorKind::Io);
+    CHECK(!failure->detail.empty());
+    CHECK(!spy.takeError().has_value());       // taking it clears it
+
+    // The stroke carries on after a failed dab rather than dying mid-line.
+    paintSample(s, target, at(33.0, 33.0), scratch);
+    CHECK(!spy.takeError().has_value());
 }

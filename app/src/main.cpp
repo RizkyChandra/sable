@@ -32,6 +32,7 @@
 
 #include "canvas_view.hpp"
 #include "icons.hpp"
+#include "sbl/backend.hpp"
 #include "sbl/canvas.hpp"
 #include "sbl/format.hpp"
 #include "sbl/io.hpp"
@@ -432,6 +433,13 @@ void maybeAutosave(App& app, std::uint64_t nowMs) {
 
     if (app.autosaveWorker.joinable()) app.autosaveWorker.join();
 
+    // The worker gets host pixels or it gets nothing: it has no device
+    // context, so a backend holding tiles elsewhere must put them back first.
+    // Skipping one autosave beats writing a file of stale art.
+    if (const auto ready = sbl::paintBackend().readback(app.doc); !ready.has_value()) {
+        showError(app, ready.error());
+        return;
+    }
     sbl::Document snapshot = sbl::cloneDocument(app.doc);   // main thread
     const std::filesystem::path original = app.doc.path;
     app.autosaveBusy.store(true);
@@ -579,6 +587,12 @@ void endPaint(App& app) {
         app.doc.dirty = true;
     }
     app.stroke.samples.clear();
+
+    // The stroke, not the dab, is where a backend failure is worth reporting:
+    // the paint path records it and this is the one place that asks. Silence
+    // here is what "noexcept and silently wrong" used to look like.
+    if (const auto failed = sbl::paintBackend().takeError(); failed.has_value())
+        showError(app, *failed);
 }
 
 void doFill(App& app, double sx, double sy) {
