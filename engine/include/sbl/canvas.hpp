@@ -2,6 +2,7 @@
 // See docs/DATA-MODEL.md — this file is that document in compilable form.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -103,16 +104,38 @@ using TouchedTiles = std::unordered_set<TileKey, TileKeyHash>;
     return px >= 0 ? px / TILE_SIZE : -((-px + TILE_SIZE - 1) / TILE_SIZE);
 }
 
-enum class BlendMode : std::uint8_t { Normal, Multiply, Screen, Add, Overlay };
+/// Separable modes only — each channel is blended independently. The
+/// non-separable HSL modes (Hue, Saturation, Colour, Luminosity) need the
+/// whole pixel at once and do not fit `blendChannel`; they are deliberately
+/// absent rather than approximated per channel, which would be wrong in a way
+/// that looks nearly right.
+///
+/// Append only. The order is what the layer panel's dropdown indexes into,
+/// and reordering would silently change every artist's layer.
+enum class BlendMode : std::uint8_t {
+    Normal, Multiply, Screen, Add, Overlay,
+    Darken, Lighten, ColourDodge, ColourBurn, HardLight, SoftLight,
+    Difference, Exclusion,
+};
 enum class LayerKind : std::uint8_t { Raster, Folder };
+
+/// Every mode, in enum order. One list so a new mode cannot be added to the
+/// enum and forgotten by the name mapping, the dropdown, or the tests.
+inline constexpr std::array<BlendMode, 13> ALL_BLEND_MODES{
+    BlendMode::Normal,      BlendMode::Multiply,  BlendMode::Screen,
+    BlendMode::Add,         BlendMode::Overlay,   BlendMode::Darken,
+    BlendMode::Lighten,     BlendMode::ColourDodge, BlendMode::ColourBurn,
+    BlendMode::HardLight,   BlendMode::SoftLight, BlendMode::Difference,
+    BlendMode::Exclusion,
+};
 
 [[nodiscard]] std::string_view blendModeName(BlendMode) noexcept;
 [[nodiscard]] BlendMode blendModeFromName(std::string_view) noexcept;
 
 /// Composites `src` onto `dst` through a blend mode.
 ///
-/// Multiply, Screen, Add and Overlay are defined on straight-alpha colour, so
-/// this unpremultiplies, blends, and re-premultiplies in ONE place. Done inline
+/// Every mode but Normal is defined on straight-alpha colour, so this
+/// unpremultiplies, blends, and re-premultiplies in ONE place. Done inline
 /// at each call site it drifts, and inconsistent unpremultiply is the other
 /// classic source of dark fringes.
 [[nodiscard]] PremulRgba8 blendOver(BlendMode mode, PremulRgba8 src,

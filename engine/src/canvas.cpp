@@ -48,17 +48,55 @@ PremulRgba8 over(PremulRgba8 src, PremulRgba8 dst) noexcept {
 
 namespace {
 
+/// Hard light: multiply where the source is dark, screen where it is bright.
+/// Overlay is the same function with the operands swapped, so it lives here
+/// once rather than being written out twice and drifting.
+constexpr float hardLight(float cs, float cb) noexcept {
+    return cs <= 0.5f ? 2.0f * cs * cb
+                      : 1.0f - 2.0f * (1.0f - cs) * (1.0f - cb);
+}
+
 /// The blend functions, on straight-alpha channels in 0..1.
+/// Formulae are the W3C compositing separable set, which is what Photoshop,
+/// Krita and the PSD/ORA files we will import all agree on.
 float blendChannel(BlendMode mode, float cs, float cb) noexcept {
     switch (mode) {
         case BlendMode::Normal:   return cs;
         case BlendMode::Multiply: return cs * cb;
         case BlendMode::Screen:   return cs + cb - cs * cb;
         case BlendMode::Add:      return std::min(1.0f, cs + cb);
-        case BlendMode::Overlay:
-            // Hard-light with the operands swapped, which is what Overlay is.
-            return cb <= 0.5f ? 2.0f * cs * cb
-                              : 1.0f - 2.0f * (1.0f - cs) * (1.0f - cb);
+        case BlendMode::Overlay:  return hardLight(cb, cs);
+        case BlendMode::Darken:   return std::min(cs, cb);
+        case BlendMode::Lighten:  return std::max(cs, cb);
+
+        case BlendMode::ColourDodge:
+            // The two guards are not tidiness: a black backdrop must stay
+            // black however bright the source, and cs == 1 would divide by
+            // zero and hand an infinity to the compositor.
+            if (cb <= 0.0f) return 0.0f;
+            if (cs >= 1.0f) return 1.0f;
+            return std::min(1.0f, cb / (1.0f - cs));
+
+        case BlendMode::ColourBurn:
+            // Mirror of dodge, and the same two degenerate cases.
+            if (cb >= 1.0f) return 1.0f;
+            if (cs <= 0.0f) return 0.0f;
+            return 1.0f - std::min(1.0f, (1.0f - cb) / cs);
+
+        case BlendMode::HardLight: return hardLight(cs, cb);
+
+        case BlendMode::SoftLight: {
+            // W3C's soft light. The quartic below the quarter point is what
+            // keeps the curve continuous where sqrt() would kink it, and a
+            // kink in a shading mode shows up as a visible band.
+            if (cs <= 0.5f) return cb - (1.0f - 2.0f * cs) * cb * (1.0f - cb);
+            const float d = cb <= 0.25f ? ((16.0f * cb - 12.0f) * cb + 4.0f) * cb
+                                        : std::sqrt(cb);
+            return cb + (2.0f * cs - 1.0f) * (d - cb);
+        }
+
+        case BlendMode::Difference: return std::abs(cs - cb);
+        case BlendMode::Exclusion:  return cs + cb - 2.0f * cs * cb;
     }
     return cs;
 }
@@ -67,20 +105,28 @@ float blendChannel(BlendMode mode, float cs, float cb) noexcept {
 
 std::string_view blendModeName(BlendMode mode) noexcept {
     switch (mode) {
-        case BlendMode::Normal:   return "normal";
-        case BlendMode::Multiply: return "multiply";
-        case BlendMode::Screen:   return "screen";
-        case BlendMode::Add:      return "add";
-        case BlendMode::Overlay:  return "overlay";
+        case BlendMode::Normal:      return "normal";
+        case BlendMode::Multiply:    return "multiply";
+        case BlendMode::Screen:      return "screen";
+        case BlendMode::Add:         return "add";
+        case BlendMode::Overlay:     return "overlay";
+        case BlendMode::Darken:      return "darken";
+        case BlendMode::Lighten:     return "lighten";
+        case BlendMode::ColourDodge: return "colour-dodge";
+        case BlendMode::ColourBurn:  return "colour-burn";
+        case BlendMode::HardLight:   return "hard-light";
+        case BlendMode::SoftLight:   return "soft-light";
+        case BlendMode::Difference:  return "difference";
+        case BlendMode::Exclusion:   return "exclusion";
     }
     return "normal";
 }
 
 BlendMode blendModeFromName(std::string_view name) noexcept {
-    if (name == "multiply") return BlendMode::Multiply;
-    if (name == "screen")   return BlendMode::Screen;
-    if (name == "add")      return BlendMode::Add;
-    if (name == "overlay")  return BlendMode::Overlay;
+    // Reading the table above backwards, rather than keeping a second copy of
+    // it that can disagree with the first.
+    for (const BlendMode mode : ALL_BLEND_MODES)
+        if (name == blendModeName(mode)) return mode;
     return BlendMode::Normal;      // unknown modes degrade, they do not fail
 }
 
