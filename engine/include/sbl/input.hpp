@@ -112,4 +112,89 @@ private:
     bool         primed_ = false;
 };
 
+// ---------------------------------------------------------------------- rulers
+//
+// A ruler is a function from a proposed sample to a constrained one — the same
+// shape as the stabilizer, and it sits in the same place in the pipeline. The
+// order is stabilizer first, then perspective: smoothing a projected point
+// would drag it off its own guide line, so the projection has to come last.
+//
+// Symmetry is the exception. It does not move a sample, it multiplies the dabs
+// the sample produces, so it applies one step further down — after the
+// interpolator has decided where the dabs go.
+
+/// A perspective guide, in canvas pixels.
+///
+/// Saved with the document: the geometry of a scene belongs to the drawing.
+/// Whether the ruler is switched on does not, and is not saved.
+struct VanishingPoint {
+    double x = 0.0, y = 0.0;
+    bool   enabled = true;
+};
+
+/// Constrains a stroke to the line through where it started and a vanishing
+/// point, so every mark converges on the same horizon.
+///
+/// Which point is used is decided from the stroke's own opening direction
+/// rather than from a mode the artist has to set: with two or three points on
+/// the canvas, "the one I am drawing towards" is unambiguous and needs no UI.
+class PerspectiveRuler {
+public:
+    std::vector<VanishingPoint> points;   ///< 1, 2 or 3 in practice
+    bool enabled = false;
+
+    /// Call at pen-down. The guide is anchored to the first sample.
+    void reset() noexcept { primed_ = false; chosen_ = -1; }
+
+    /// Which point the live stroke locked onto, or -1 before it has committed.
+    [[nodiscard]] int chosen() const noexcept { return chosen_; }
+    [[nodiscard]] bool usable() const noexcept;
+
+    [[nodiscard]] InputSample apply(const InputSample& in) noexcept;
+
+private:
+    /// True once a guide has been picked. The first few pixels of a stroke are
+    /// direction noise, so choosing from them would lock onto the wrong point
+    /// and there is no undoing that mid-stroke.
+    bool choose(double x, double y) noexcept;
+
+    double anchorX_ = 0.0, anchorY_ = 0.0;
+    double dirX_ = 1.0, dirY_ = 0.0;   // unit vector along the chosen guide
+    int    chosen_ = -1;
+    bool   primed_ = false;
+};
+
+/// One image of a dab under symmetry: where it lands and how it leans.
+struct SymmetryImage {
+    double x = 0.0, y = 0.0;
+    float  angle = 0.0f;
+};
+
+/// Mirrors dabs about a centre. Positions and configuration are independent of
+/// `enabled`, so switching the ruler off and on again keeps the guides where
+/// the artist put them.
+struct SymmetryRuler {
+    double centreX = 0.0, centreY = 0.0;
+    bool   vertical   = false;   ///< mirror across the vertical axis x = centreX
+    bool   horizontal = false;   ///< mirror across the horizontal axis y = centreY
+    int    radial     = 1;       ///< rotational copies about the centre; 1 = none
+    bool   enabled    = false;
+
+    /// More than this and the copies are closer together than a dab is wide,
+    /// which costs paint time and shows nothing.
+    static constexpr int kMaxRadial = 32;
+
+    [[nodiscard]] bool active() const noexcept {
+        return enabled && (vertical || horizontal || radial > 1);
+    }
+
+    /// Every image of (x, y), the ORIGINAL FIRST, into `out` (cleared).
+    ///
+    /// A point sitting exactly on an axis maps onto itself and is emitted
+    /// twice, so the seam is painted twice. That is inherent to mirroring —
+    /// the artist is drawing on the axis — and de-duplicating it would cost a
+    /// comparison per dab pair for a case nobody notices.
+    void map(double x, double y, float angle, std::vector<SymmetryImage>& out) const;
+};
+
 }  // namespace sbl

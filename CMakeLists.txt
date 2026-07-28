@@ -103,17 +103,22 @@ target_include_directories(nlohmann_json SYSTEM INTERFACE
   ${nlohmann_json_SOURCE_DIR}/single_include)
 
 # --------------------------------------------------------------------- engine
-# D-003: links NO SDL, NO ImGui. A stray SDL include here fails to build.
+# D-022: the engine may link SDL3, but never ImGui, and nothing under engine/
+# may open a window, an event queue or an input device. The headless
+# engine_tests below are what enforces that now the link error no longer can.
 add_library(engine STATIC
+  engine/src/backend.cpp
   engine/src/canvas.cpp
   engine/src/input.cpp
   engine/src/paint.cpp
+  engine/src/select.cpp
   engine/src/io.cpp
   engine/src/project.cpp
   engine/src/format.cpp
   engine/src/kra.cpp
   engine/src/openraster.cpp
-  engine/src/xml.cpp)
+  engine/src/xml.cpp
+  engine/src/psd.cpp)
 target_include_directories(engine PUBLIC engine/include)
 target_link_libraries(engine PRIVATE lodepng miniz nlohmann_json)
 target_compile_options(engine PRIVATE ${SABLE_WARNINGS})
@@ -224,12 +229,20 @@ if(SABLE_BUILD_TESTS)
   target_include_directories(doctest SYSTEM INTERFACE ${doctest_SOURCE_DIR})
 
   # Headless by design (D-003) — these run in CI with no display server.
-  add_executable(engine_tests tests/tests.cpp)
+  # differential.cpp is the CPU/GPU harness (#14); it is a suite of its own and
+  # tests.cpp is quite long enough.
+  add_executable(engine_tests tests/tests.cpp tests/differential.cpp)
   target_link_libraries(engine_tests PRIVATE sable::engine doctest lodepng miniz
                                              nlohmann_json)
-  # Interop fixtures are real files written by other applications; the tests
-  # read them from the source tree rather than copying them into the build.
+  # app/src for view_transform.hpp only — the screen<->canvas maths is app-side
+  # but SDL-free, and a rotation dropped on one path is not something to check
+  # by eye. Nothing else from app/ may be included here (D-003).
+  target_include_directories(engine_tests PRIVATE app/src)
+  # Fixtures come from two places and both are read from the source tree, never
+  # copied: they are inputs. tests/data is the PSD pair, tests/fixtures the
+  # ORA and KRA files written by Krita and GIMP.
   target_compile_definitions(engine_tests PRIVATE
+    SABLE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data"
     SABLE_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
   # The allocation counter (US-02.9) replaces global operator new/delete, which
   # both compilers misread as a malloc/delete mismatch. It is not one.

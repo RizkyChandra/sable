@@ -776,6 +776,38 @@ function; plain function pointers keep the table allocation-free).
 
 ---
 
+## D-025 — Rulers sit beside the stabilizer, and symmetry one step below it
+
+**Status:** Decided
+**Affects:** `engine/include/sbl/input.hpp`, `engine/src/input.cpp`,
+`paintWith` in `app/src/main.cpp`, `.sable` format version 2
+
+A perspective ruler is a function from a proposed sample to a constrained one —
+the same shape as `Stabilizer::apply` — so it goes in the same place in the
+pipeline and nothing downstream of the interpolator changes.
+
+**The order is stabilizer, then perspective.** Smoothing a point that has
+already been projected drags it back off its own guide line, so the two would
+fight; projecting the smoothed point cannot. That ordering is what the
+"stabilised stroke under symmetry" test pins down.
+
+**Symmetry is not in that chain.** It does not move a sample, it multiplies the
+dabs a sample produces, so it applies after the interpolator has decided where
+the dabs go, and every image is stamped into the stroke's existing
+`UndoRecord`. One stroke stays one undo step however many copies it painted.
+
+**Vanishing points are document state; the rulers are not.** A scene's horizon
+belongs to the drawing and comes back with the file (`vanishing_points`, format
+version 2 — optional, so v1 files load unchanged). Whether a ruler is switched
+on, and where the symmetry axes sit, are preferences.
+
+**Alternative rejected:** running a whole mirrored `Stroke` per axis. Each copy
+would carry its own spacing carry-over and its own `UndoRecord`, so undo would
+need N records collapsed into one, and the spacing walks would drift apart at
+speed — two problems bought in exchange for reusing `paintSample`.
+
+---
+
 ## Open decisions
 
 These blocked the milestone named. They have all been answered — the entries

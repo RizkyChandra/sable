@@ -29,3 +29,6 @@ layout.ini
 
 # CI builds SDL3 into the workspace
 .sdl3/
+
+# Agent worktrees and local Claude Code state
+.claude/

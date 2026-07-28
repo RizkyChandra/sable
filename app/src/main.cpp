@@ -10,10 +10,12 @@
 #include <SDL3/SDL_main.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <atomic>
+#include <optional>
 #include <mutex>
 #include <thread>
 #include <string>
@@ -32,11 +34,13 @@
 
 #include "canvas_view.hpp"
 #include "icons.hpp"
+#include "sbl/backend.hpp"
 #include "sbl/canvas.hpp"
 #include "sbl/format.hpp"
 #include "sbl/io.hpp"
 #include "sbl/paint.hpp"
 #include "sbl/project.hpp"
+#include "sbl/select.hpp"
 #include "settings.hpp"
 #include "shortcuts.hpp"
 #include "widgets.hpp"
@@ -52,10 +56,21 @@ constexpr float kDegToRad      = 3.14159265358979323846f / 180.0f;
 /// What to do once the artist answers the "discard unsaved work?" prompt.
 enum class Pending { None, NewCanvas, Quit, Open, Import };
 
-enum class Tool { Brush, Eraser, Fill, Select, Transform };
+enum class Tool { Brush, Eraser, Fill, Select, Lasso, Wand, Transform };
+
+/// True for the three tools that build a selection, which share the modifier
+/// keys, the mode setting, and the rule that a click with no drag deselects.
+[[nodiscard]] constexpr bool selectsRegion(Tool t) noexcept {
+    return t == Tool::Select || t == Tool::Lasso || t == Tool::Wand;
+}
 
 /// How often a recovery copy is written while the document is dirty (D-013).
 constexpr std::uint64_t kAutosaveIntervalMs = 120'000;
+
+/// What `App::draggingGuide` holds when it is not an index into the document's
+/// vanishing points.
+constexpr int kNoGuide       = -1;
+constexpr int kSymmetryGuide = -2;
 
 struct NewCanvasForm {
     int  width  = kDefaultCanvas;
@@ -90,6 +105,32 @@ struct App {
     // Selection drag, in canvas coordinates.
     bool   selecting = false;
     double selectAnchorX = 0.0, selectAnchorY = 0.0;
+    int    wandTolerance = 24;
+
+    /// The modifier the panel is set to, and the one this drag is actually
+    /// using — the modifier keys are read once at pen-down, so letting go of
+    /// Shift halfway through a lasso does not change what the loop means.
+    sbl::SelectMode selectMode = sbl::SelectMode::Replace;
+    sbl::SelectMode dragMode   = sbl::SelectMode::Replace;
+    /// What was selected when the drag began. Add and subtract are computed
+    /// against this every motion event, so dragging back and forth does not
+    /// accumulate.
+    std::optional<sbl::Selection> selectBase;
+    std::vector<sbl::Point> lassoPath;
+
+    /// The selection boundary in canvas coordinates, cached because walking a
+    /// megapixel mask at every redraw to draw the same outline is exactly the
+    /// sort of thing modest hardware notices. Rebuilt when the selection it was
+    /// built from stops matching the document's.
+    ///
+    /// ponytail: the staleness check compares the whole mask, so a very large
+    /// selection costs a memcmp per frame — far less than the rebuild it
+    /// avoids. Give Selection a change counter if that ever shows up in a
+    /// profile.
+    struct Ants {
+        sbl::Selection from;
+        std::vector<std::array<double, 4>> segments;   // x0, y0, x1, y1
+    } ants;
 
     sbl::StraightRgba8 foreground{0, 0, 0, 255};
     sbl::StraightRgba8 background{255, 255, 255, 255};
@@ -106,6 +147,14 @@ struct App {
     sbl::TabletProfile  profile;              // see D-015: one profile, all pens
     sbl::PressureFilter pressureFilter;
     sbl::Stabilizer     stabilizer;
+
+    // --- rulers. The vanishing points themselves live in the document, which
+    // is what saves them; `perspective.points` is a per-stroke snapshot of it.
+    sbl::PerspectiveRuler perspective;
+    sbl::SymmetryRuler    symmetry;
+    std::vector<sbl::SymmetryImage> mirrors;   // scratch, one dab's images
+    int draggingGuide = kNoGuide;
+
     SDL_PenID activePen = 0;
     bool      penSeen   = false;
     bool      lastFromMouse = true;
@@ -201,9 +250,39 @@ struct App {
         case Tool::Eraser: return "eraser";
         case Tool::Fill:   return "fill";
         case Tool::Select: return "select";
+        case Tool::Lasso:  return "lasso";
+        case Tool::Wand:   return "wand";
         case Tool::Transform: return "transform";
     }
     return "brush";
+}
+
+// -------------------------------------------------------------------- rulers
+
+/// The symmetry axes start down the middle, which is where a mirrored figure
+/// is drawn from. Not saved with the document — the ruler is a way of working,
+/// not part of the picture.
+void centreSymmetry(App& app) {
+    app.symmetry.centreX = app.doc.width  * 0.5;
+    app.symmetry.centreY = app.doc.height * 0.5;
+}
+
+/// Lays out `count` vanishing points as a starting arrangement.
+///
+/// Deliberately just inside the canvas rather than at the far-off positions a
+/// finished perspective usually wants: a point the artist can see is a point
+/// they can drag, and dragging it out is easier than hunting for one parked
+/// three canvas widths off screen.
+void setVanishingPoints(App& app, int count) {
+    const double w = app.doc.width, h = app.doc.height;
+    app.doc.vanishingPoints.clear();
+    if (count >= 1) app.doc.vanishingPoints.push_back({w * 0.05, h * 0.5, true});
+    if (count >= 2) app.doc.vanishingPoints.push_back({w * 0.95, h * 0.5, true});
+    // The third is vertical: the one that makes a building lean away.
+    if (count >= 3) app.doc.vanishingPoints.push_back({w * 0.5, h * 0.95, true});
+    // One-point perspective has one point, and it belongs in the middle.
+    if (count == 1) app.doc.vanishingPoints[0].x = w * 0.5;
+    app.doc.dirty = true;
 }
 
 // --------------------------------------------------------------- persistence
@@ -246,6 +325,15 @@ void applySettings(App& app, const Settings& settings) {
     app.lightTheme = settings.getInt("ui.lightTheme", 0) != 0;
     app.undoBudgetMb = std::clamp(settings.getInt("undo.budgetMb", 256), 16, 2048);
     app.shortcuts.load(settings);
+
+    // Ruler configuration is a preference; the vanishing points are not, and
+    // come back with the document instead.
+    app.symmetry.enabled    = settings.getInt("ruler.symmetry.on", 0) != 0;
+    app.symmetry.vertical   = settings.getInt("ruler.symmetry.vertical", 1) != 0;
+    app.symmetry.horizontal = settings.getInt("ruler.symmetry.horizontal", 0) != 0;
+    app.symmetry.radial     = std::clamp(settings.getInt("ruler.symmetry.radial", 1),
+                                         1, sbl::SymmetryRuler::kMaxRadial);
+    app.perspective.enabled = settings.getInt("ruler.perspective.on", 0) != 0;
 
     // Custom presets are appended after the built-ins, which always come first
     // so a new Sable version can add one without renumbering the artist's.
@@ -301,6 +389,12 @@ void collectSettings(const App& app, Settings& settings) {
     settings.setInt("undo.budgetMb", app.undoBudgetMb);
     app.shortcuts.store(settings);
 
+    settings.setInt("ruler.symmetry.on",         app.symmetry.enabled ? 1 : 0);
+    settings.setInt("ruler.symmetry.vertical",   app.symmetry.vertical ? 1 : 0);
+    settings.setInt("ruler.symmetry.horizontal", app.symmetry.horizontal ? 1 : 0);
+    settings.setInt("ruler.symmetry.radial",     app.symmetry.radial);
+    settings.setInt("ruler.perspective.on",      app.perspective.enabled ? 1 : 0);
+
     const std::size_t builtIn = sbl::defaultBrushes().size();
     int custom = 0;
     for (std::size_t i = builtIn; i < app.brushes.size(); ++i, ++custom) {
@@ -339,6 +433,7 @@ void resetDocument(App& app, std::int32_t w, std::int32_t h, bool transparent) {
         w, h, transparent ? sbl::StraightRgba8{0, 0, 0, 0}
                           : sbl::StraightRgba8{255, 255, 255, 255});
     applyUndoBudget(app);
+    centreSymmetry(app);
     fitToViewport(app.view, app.doc, app.viewport);
     if (app.view.zoom > 1.0f) zoomToActualSize(app.view, app.doc, app.viewport);
 }
@@ -416,6 +511,7 @@ void doOpenDocument(App& app, const std::filesystem::path& path) {
     refreshAllTextures(app);
     app.doc = std::move(*loaded);
     applyUndoBudget(app);
+    centreSymmetry(app);
     fitToViewport(app.view, app.doc, app.viewport);
 }
 
@@ -432,6 +528,13 @@ void maybeAutosave(App& app, std::uint64_t nowMs) {
 
     if (app.autosaveWorker.joinable()) app.autosaveWorker.join();
 
+    // The worker gets host pixels or it gets nothing: it has no device
+    // context, so a backend holding tiles elsewhere must put them back first.
+    // Skipping one autosave beats writing a file of stale art.
+    if (const auto ready = sbl::paintBackend().readback(app.doc); !ready.has_value()) {
+        showError(app, ready.error());
+        return;
+    }
     sbl::Document snapshot = sbl::cloneDocument(app.doc);   // main thread
     const std::filesystem::path original = app.doc.path;
     app.autosaveBusy.store(true);
@@ -491,9 +594,39 @@ void beginPaint(App& app) {
     sbl::beginStroke(app.stroke, activeBrush(app), app.foreground, layer->id);
     app.stabilizer.setLevel(activeBrush(app).stabilizerLevel);
     app.stabilizer.reset();
+    // A snapshot for the stroke, so dragging a guide mid-stroke cannot bend a
+    // line that has already committed to it. The document keeps the originals.
+    app.perspective.points = app.doc.vanishingPoints;
+    app.perspective.reset();
     app.pressureFilter.reset();
     app.painting = true;
     SDL_CaptureMouse(true);      // so a release outside the window still arrives
+}
+
+/// Stamps every mirrored image of the dabs just produced, and marks the tiles
+/// of originals and images alike.
+///
+/// The images go into the SAME PaintTarget the stroke is already using, so
+/// they land in the one pending UndoRecord: symmetry multiplies dabs, never
+/// undo steps. Live, per sample — an artist has to see the mirror while they
+/// draw, not discover it at pen-up.
+void applyRulerImages(App& app, sbl::PaintTarget& target) {
+    const bool mirroring = app.symmetry.active();
+    for (const sbl::Dab& dab : app.scratch) {
+        app.canvas->markDabArea(dab.x, dab.y, dab.radius, app.doc);
+        if (!mirroring) continue;
+
+        app.symmetry.map(dab.x, dab.y, dab.angle, app.mirrors);
+        // Index 0 is the original, which paintSample has already applied.
+        for (std::size_t i = 1; i < app.mirrors.size(); ++i) {
+            sbl::Dab image = dab;
+            image.x     = app.mirrors[i].x;
+            image.y     = app.mirrors[i].y;
+            image.angle = app.mirrors[i].angle;
+            sbl::applyDab(target, image);
+            app.canvas->markDabArea(image.x, image.y, image.radius, app.doc);
+        }
+    }
 }
 
 void paintWith(App& app, sbl::InputSample sample) {
@@ -505,6 +638,9 @@ void paintWith(App& app, sbl::InputSample sample) {
 
     // Positions only — the stabilizer never touches pressure (US-11.6).
     sample = app.stabilizer.apply(sample);
+    // The ruler sees the SMOOTHED point. The other order smooths a point that
+    // was already on the guide and drags it back off, so the two would fight.
+    sample = app.perspective.apply(sample);
 
     const sbl::Selection* selection =
         app.doc.selection.has_value() && !app.doc.selection->empty()
@@ -512,15 +648,13 @@ void paintWith(App& app, sbl::InputSample sample) {
     sbl::PaintTarget target{*layer, app.stroke.pending, app.stroke.touched,
                             app.doc.width, app.doc.height, selection};
     sbl::paintSample(app.stroke, target, sample, app.scratch);
-
-    for (const sbl::Dab& d : app.scratch)
-        app.canvas->markDabArea(d.x, d.y, d.radius, app.doc);
+    applyRulerImages(app, target);
 }
 
 sbl::InputSample mouseSample(App& app, double sx, double sy) {
     sbl::InputSample sample;
-    sample.x = toCanvasX(app.view, sx);
-    sample.y = toCanvasY(app.view, sy);
+    sample.x = toCanvasX(app.view, sx, sy);
+    sample.y = toCanvasY(app.view, sx, sy);
     sample.pressure    = 1.0f;          // mouse: full pressure, synthetic
     sample.fromMouse   = true;
     sample.timestampMs = SDL_GetTicks();
@@ -535,8 +669,8 @@ sbl::InputSample penSample(App& app, SDL_PenID which, float sx, float sy) {
     const PenAxisState& axes = app.penAxes[which];
 
     sbl::InputSample sample;
-    sample.x = toCanvasX(app.view, sx);
-    sample.y = toCanvasY(app.view, sy);
+    sample.x = toCanvasX(app.view, sx, sy);
+    sample.y = toCanvasY(app.view, sx, sy);
     // The fixed normalisation order lives in the engine, not here: deadzone,
     // rescale, smoothing, then the artist's curve (US-09.7).
     sample.pressure = app.pressureFilter.apply(app.profile, axes.pressure);
@@ -564,13 +698,12 @@ void endPaint(App& app) {
     if (!app.stroke.samples.empty() && activeBrush(app).stabilizerLevel > 0) {
         sbl::Layer* layer = app.doc.active();
         if (layer != nullptr) {
-            const sbl::InputSample last =
-                app.stabilizer.finish(app.stroke.samples.back());
+            const sbl::InputSample last = app.perspective.apply(
+                app.stabilizer.finish(app.stroke.samples.back()));
             sbl::PaintTarget target{*layer, app.stroke.pending, app.stroke.touched,
                                     app.doc.width, app.doc.height};
             sbl::paintSample(app.stroke, target, last, app.scratch);
-            for (const sbl::Dab& d : app.scratch)
-                app.canvas->markDabArea(d.x, d.y, d.radius, app.doc);
+            applyRulerImages(app, target);
         }
     }
 
@@ -579,11 +712,17 @@ void endPaint(App& app) {
         app.doc.dirty = true;
     }
     app.stroke.samples.clear();
+
+    // The stroke, not the dab, is where a backend failure is worth reporting:
+    // the paint path records it and this is the one place that asks. Silence
+    // here is what "noexcept and silently wrong" used to look like.
+    if (const auto failed = sbl::paintBackend().takeError(); failed.has_value())
+        showError(app, *failed);
 }
 
 void doFill(App& app, double sx, double sy) {
-    const auto x = static_cast<std::int32_t>(std::floor(toCanvasX(app.view, sx)));
-    const auto y = static_cast<std::int32_t>(std::floor(toCanvasY(app.view, sy)));
+    const auto x = static_cast<std::int32_t>(std::floor(toCanvasX(app.view, sx, sy)));
+    const auto y = static_cast<std::int32_t>(std::floor(toCanvasY(app.view, sx, sy)));
 
     sbl::UndoRecord rec =
         sbl::bucketFill(app.doc, app.doc.activeLayer, x, y, app.foreground,
@@ -595,9 +734,43 @@ void doFill(App& app, double sx, double sy) {
     app.doc.dirty = true;
 }
 
+/// Shift adds, Alt subtracts, both intersect — the modifiers every other
+/// painting application uses, over whatever the panel is set to. Read once, at
+/// pen-down, so a drag means one thing from start to finish.
+[[nodiscard]] sbl::SelectMode modeForDrag(const App& app) {
+    const SDL_Keymod mods = SDL_GetModState();
+    const bool shift = (mods & SDL_KMOD_SHIFT) != 0;
+    const bool alt   = (mods & SDL_KMOD_ALT) != 0;
+    if (shift && alt) return sbl::SelectMode::Intersect;
+    if (shift)        return sbl::SelectMode::Add;
+    if (alt)          return sbl::SelectMode::Subtract;
+    return app.selectMode;
+}
+
+/// Puts a freshly drawn shape into the document, combined with what the drag
+/// started from. One place, so the marquee, the lasso and the wand cannot
+/// disagree about what Shift means.
+void commitSelection(App& app, const sbl::Selection& shape) {
+    const sbl::Selection base =
+        app.selectBase.has_value() ? *app.selectBase : sbl::Selection{};
+    sbl::Selection combined = sbl::combineSelections(base, shape, app.dragMode);
+    if (combined.empty()) app.doc.selection.reset();
+    else                  app.doc.selection = std::move(combined);
+}
+
+void beginSelectDrag(App& app, double sx, double sy) {
+    app.selecting     = true;
+    app.dragMode      = modeForDrag(app);
+    app.selectBase    = app.doc.selection;
+    app.selectAnchorX = toCanvasX(app.view, sx, sy);
+    app.selectAnchorY = toCanvasY(app.view, sx, sy);
+    app.lassoPath.clear();
+    app.lassoPath.push_back(sbl::Point{app.selectAnchorX, app.selectAnchorY});
+}
+
 void updateSelection(App& app, double sx, double sy) {
-    const double cx = toCanvasX(app.view, sx);
-    const double cy = toCanvasY(app.view, sy);
+    const double cx = toCanvasX(app.view, sx, sy);
+    const double cy = toCanvasY(app.view, sx, sy);
 
     sbl::Selection selection;
     selection.x = static_cast<std::int32_t>(std::floor(std::min(app.selectAnchorX, cx)));
@@ -613,17 +786,101 @@ void updateSelection(App& app, double sx, double sy) {
     selection.y = std::max(0, selection.y);
     selection.w = std::max(0, x1 - selection.x);
     selection.h = std::max(0, y1 - selection.y);
-    app.doc.selection = selection;
+    commitSelection(app, selection);
+}
+
+/// Appends to the freehand path. Sub-pixel steps are dropped: the pointer
+/// reports far more motion than a polygon edge needs, and the lasso's cost is
+/// per vertex on every scanline.
+void extendLasso(App& app, double sx, double sy) {
+    const sbl::Point p{toCanvasX(app.view, sx, sy), toCanvasY(app.view, sx, sy)};
+    if (!app.lassoPath.empty()) {
+        const sbl::Point& last = app.lassoPath.back();
+        if (std::abs(p.x - last.x) < 1.0 && std::abs(p.y - last.y) < 1.0) return;
+    }
+    app.lassoPath.push_back(p);
+}
+
+void endSelectDrag(App& app, double sx, double sy) {
+    if (!app.selecting) return;
+    app.selecting = false;
+    // The lasso is rasterised once, at pen-up: doing it live would re-scan the
+    // whole loop on every motion event, for a shape that is not finished yet.
+    if (app.tool == Tool::Lasso) {
+        extendLasso(app, sx, sy);
+        commitSelection(app, sbl::lassoSelection(app.lassoPath, app.doc.width,
+                                                 app.doc.height));
+        app.lassoPath.clear();
+    }
+    app.selectBase.reset();
+    // A click with no drag clears the selection rather than leaving a
+    // zero-sized one that silently blocks painting.
+    if (app.doc.selection.has_value() && app.doc.selection->empty())
+        app.doc.selection.reset();
+}
+
+/// The pointer moved while a selection is being drawn. Pen and mouse both.
+void dragSelection(App& app, double sx, double sy) {
+    if (app.tool == Tool::Lasso) extendLasso(app, sx, sy);
+    else                        updateSelection(app, sx, sy);
+}
+
+void wandAt(App& app, double sx, double sy) {
+    const auto x = static_cast<std::int32_t>(std::floor(toCanvasX(app.view, sx, sy)));
+    const auto y = static_cast<std::int32_t>(std::floor(toCanvasY(app.view, sx, sy)));
+
+    app.dragMode   = modeForDrag(app);
+    app.selectBase = app.doc.selection;
+    commitSelection(app, sbl::magicWandSelection(app.doc, x, y, app.wandTolerance));
+    app.selectBase.reset();
 }
 
 void pickColourAt(App& app, double sx, double sy) {
-    const auto x = static_cast<std::int32_t>(std::floor(toCanvasX(app.view, sx)));
-    const auto y = static_cast<std::int32_t>(std::floor(toCanvasY(app.view, sy)));
+    const auto x = static_cast<std::int32_t>(std::floor(toCanvasX(app.view, sx, sy)));
+    const auto y = static_cast<std::int32_t>(std::floor(toCanvasY(app.view, sx, sy)));
     if (x < 0 || y < 0 || x >= app.doc.width || y >= app.doc.height) return;
 
     const sbl::StraightRgba8 picked = sbl::pickColour(app.doc, x, y);
     app.foreground = sbl::StraightRgba8{picked.r, picked.g, picked.b, 255};
     syncHsvFromColour(app);
+}
+
+/// Which guide handle is under a screen point, or kNoGuide.
+///
+/// Hit-tested in SCREEN space through toScreenX/Y rather than by comparing
+/// canvas distances: the grab area has to stay the same size under the pointer
+/// at any zoom, and it has to be in the right place once the canvas is turned.
+[[nodiscard]] int guideAt(const App& app, double sx, double sy) {
+    const double reach = 10.0 * app.uiScale;
+    const auto grabbed = [&](double cx, double cy) {
+        const double dx = toScreenX(app.view, cx, cy) - sx;
+        const double dy = toScreenY(app.view, cx, cy) - sy;
+        return dx * dx + dy * dy <= reach * reach;
+    };
+    // Vanishing points first: they are the smaller, fiddlier target.
+    if (app.perspective.enabled) {
+        for (std::size_t i = 0; i < app.doc.vanishingPoints.size(); ++i)
+            if (grabbed(app.doc.vanishingPoints[i].x, app.doc.vanishingPoints[i].y))
+                return static_cast<int>(i);
+    }
+    if (app.symmetry.enabled && grabbed(app.symmetry.centreX, app.symmetry.centreY))
+        return kSymmetryGuide;
+    return kNoGuide;
+}
+
+void moveGuide(App& app, double sx, double sy) {
+    const double cx = toCanvasX(app.view, sx, sy);
+    const double cy = toCanvasY(app.view, sx, sy);
+    if (app.draggingGuide == kSymmetryGuide) {
+        app.symmetry.centreX = cx;
+        app.symmetry.centreY = cy;      // not document state, so nothing dirties
+    } else if (app.draggingGuide >= 0 &&
+               static_cast<std::size_t>(app.draggingGuide) <
+                   app.doc.vanishingPoints.size()) {
+        app.doc.vanishingPoints[app.draggingGuide].x = cx;
+        app.doc.vanishingPoints[app.draggingGuide].y = cy;
+        app.doc.dirty = true;           // it is saved, so moving it is a change
+    }
 }
 
 void stepSizePreset(App& app, int direction) {
@@ -784,6 +1041,13 @@ bool overCanvas(const App& app, float x, float y) {
            x < app.viewport.x + app.viewport.w && y < app.viewport.y + app.viewport.h;
 }
 
+/// Rotation changes the mapping only — no dirty flag, no undo entry, no tile
+/// upload, the same guarantee US-05.5 makes for pan and zoom.
+void rotateView(App& app, double delta) {
+    rotateAbout(app.view, app.viewport.x + app.viewport.w * 0.5,
+                app.viewport.y + app.viewport.h * 0.5, delta);
+}
+
 void handleKey(App& app, const SDL_KeyboardEvent& key) {
     if (key.key == SDLK_SPACE) { app.spaceHeld = key.down; return; }
     if (!key.down) return;
@@ -834,8 +1098,15 @@ void handleKey(App& app, const SDL_KeyboardEvent& key) {
                       app.viewport.y + app.viewport.h * 0.5f, factor);
             break;
         }
+        // Turning about the middle of the viewport, not the canvas origin:
+        // whatever the artist is looking at stays where they are looking.
+        case Action::RotateLeft:  rotateView(app, -kRotateStep); break;
+        case Action::RotateRight: rotateView(app, +kRotateStep); break;
+        case Action::ResetRotation: rotateView(app, -app.view.rotation); break;
 
         case Action::ToolBrush:  app.tool = Tool::Brush;  break;
+        case Action::ToolLasso:  app.tool = Tool::Lasso;  break;
+        case Action::ToolWand:   app.tool = Tool::Wand;   break;
         case Action::ToolEraser: app.tool = Tool::Eraser; break;
         case Action::ToolFill:   app.tool = Tool::Fill;   break;
         case Action::ToolSelect: app.tool = Tool::Select; break;
@@ -851,6 +1122,15 @@ void handleKey(App& app, const SDL_KeyboardEvent& key) {
             app.foreground = sbl::StraightRgba8{0, 0, 0, 255};
             app.background = sbl::StraightRgba8{255, 255, 255, 255};
             syncHsvFromColour(app);
+            break;
+
+        // Toggling only. The axes and the points stay exactly where they were,
+        // so a ruler can be switched off to check the drawing and back on.
+        case Action::ToggleSymmetry:
+            app.symmetry.enabled = !app.symmetry.enabled;
+            break;
+        case Action::TogglePerspective:
+            app.perspective.enabled = !app.perspective.enabled;
             break;
 
         case Action::Count: break;   // not bound to anything
@@ -916,6 +1196,20 @@ void handleEvent(App& app, const SDL_Event& e) {
             // The eraser end is a different tool, not a modifier (US-08.6).
             if (e.ptouch.eraser) app.tool = Tool::Eraser;
             else if (app.tool == Tool::Eraser) app.tool = Tool::Brush;
+            // Landing on a guide handle moves it instead of painting.
+            app.draggingGuide = guideAt(app, e.ptouch.x, e.ptouch.y);
+            if (app.draggingGuide != kNoGuide) break;
+            // The selection tools go through the same helpers the mouse uses.
+            // A tablet is the target input device, so a lasso reachable only
+            // with a mouse would be a lasso most artists never get to use.
+            if (app.tool == Tool::Wand) {
+                wandAt(app, e.ptouch.x, e.ptouch.y);
+                break;
+            }
+            if (selectsRegion(app.tool)) {
+                beginSelectDrag(app, e.ptouch.x, e.ptouch.y);
+                break;
+            }
             beginPaint(app);
             paintWith(app, penSample(app, e.ptouch.which, e.ptouch.x, e.ptouch.y));
             break;
@@ -925,11 +1219,17 @@ void handleEvent(App& app, const SDL_Event& e) {
             ++app.motionThisFrame;
             // Hovering without contact does not paint (US-08.8) — the pen only
             // paints between PEN_DOWN and PEN_UP.
-            if (app.painting)
+            if (app.draggingGuide != kNoGuide)
+                moveGuide(app, e.pmotion.x, e.pmotion.y);
+            else if (app.selecting)
+                dragSelection(app, e.pmotion.x, e.pmotion.y);
+            else if (app.painting)
                 paintWith(app, penSample(app, e.pmotion.which, e.pmotion.x, e.pmotion.y));
             break;
 
         case SDL_EVENT_PEN_UP:
+            app.draggingGuide = kNoGuide;
+            endSelectDrag(app, e.ptouch.x, e.ptouch.y);
             endPaint(app);
             break;
 
@@ -944,17 +1244,24 @@ void handleEvent(App& app, const SDL_Event& e) {
             if (e.button.button == SDL_BUTTON_MIDDLE ||
                 (e.button.button == SDL_BUTTON_LEFT && app.spaceHeld)) {
                 app.panning    = true;
+                // Screen space on both sides, so this stays right at any
+                // rotation: pan translates the whole mapping, it does not
+                // travel along the canvas axes.
                 app.panAnchorX = e.button.x - app.view.panX;
                 app.panAnchorY = e.button.y - app.view.panY;
             } else if (e.button.button == SDL_BUTTON_LEFT) {
+                // A guide handle takes the press before any tool does, so the
+                // artist never has to switch tools to move a ruler.
+                app.draggingGuide = guideAt(app, e.button.x, e.button.y);
+                if (app.draggingGuide != kNoGuide) break;
                 if ((SDL_GetModState() & SDL_KMOD_ALT) != 0) {
                     pickColourAt(app, e.button.x, e.button.y);   // US-13.3
                 } else if (app.tool == Tool::Fill) {
                     doFill(app, e.button.x, e.button.y);
-                } else if (app.tool == Tool::Select) {
-                    app.selecting = true;
-                    app.selectAnchorX = toCanvasX(app.view, e.button.x);
-                    app.selectAnchorY = toCanvasY(app.view, e.button.y);
+                } else if (app.tool == Tool::Wand) {
+                    wandAt(app, e.button.x, e.button.y);
+                } else if (selectsRegion(app.tool)) {
+                    beginSelectDrag(app, e.button.x, e.button.y);
                 } else {
                     beginPaint(app);
                     paintWith(app, mouseSample(app, e.button.x, e.button.y));
@@ -969,8 +1276,10 @@ void handleEvent(App& app, const SDL_Event& e) {
                 // no tile upload (US-05.5).
                 app.view.panX = e.motion.x - app.panAnchorX;
                 app.view.panY = e.motion.y - app.panAnchorY;
+            } else if (app.draggingGuide != kNoGuide) {
+                moveGuide(app, e.motion.x, e.motion.y);
             } else if (app.selecting) {
-                updateSelection(app, e.motion.x, e.motion.y);
+                dragSelection(app, e.motion.x, e.motion.y);
             } else if (app.painting) {
                 paintWith(app, mouseSample(app, e.motion.x, e.motion.y));
             }
@@ -981,13 +1290,8 @@ void handleEvent(App& app, const SDL_Event& e) {
             // must still end the stroke cleanly (US-02.5).
             app.panning = false;
             if (e.button.button == SDL_BUTTON_LEFT) {
-                if (app.selecting) {
-                    app.selecting = false;
-                    // A click with no drag clears the selection rather than
-                    // leaving a zero-sized one that silently blocks painting.
-                    if (app.doc.selection.has_value() && app.doc.selection->empty())
-                        app.doc.selection.reset();
-                }
+                app.draggingGuide = kNoGuide;
+                endSelectDrag(app, e.button.x, e.button.y);
                 endPaint(app);
             }
             break;
@@ -1107,6 +1411,13 @@ void drawMenuBar(App& app, float& menuHeight) {
             fitToViewport(app.view, app.doc, app.viewport);
         if (ImGui::MenuItem("Actual size", app.shortcuts.get(Action::ActualSize).label().c_str()))
             zoomToActualSize(app.view, app.doc, app.viewport);
+        if (ImGui::MenuItem("Rotate left", app.shortcuts.get(Action::RotateLeft).label().c_str()))
+            rotateView(app, -kRotateStep);
+        if (ImGui::MenuItem("Rotate right", app.shortcuts.get(Action::RotateRight).label().c_str()))
+            rotateView(app, +kRotateStep);
+        if (ImGui::MenuItem("Reset rotation", app.shortcuts.get(Action::ResetRotation).label().c_str(),
+                            false, app.view.rotation != 0.0))
+            rotateView(app, -app.view.rotation);
         ImGui::Separator();
         ImGui::MenuItem("Pressure calibration", nullptr, &app.showCalibration);
         ImGui::MenuItem("Tablet test pad", nullptr, &app.showTestPad);
@@ -1135,6 +1446,8 @@ void drawToolPanel(App& app) {
         toolRow(Icon::Eraser,    "Eraser",    Tool::Eraser,    Action::ToolEraser);
         toolRow(Icon::Fill,      "Fill",      Tool::Fill,      Action::ToolFill);
         toolRow(Icon::Select,    "Select",    Tool::Select,    Action::ToolSelect);
+        toolRow(Icon::Lasso,     "Lasso",     Tool::Lasso,     Action::ToolLasso);
+        toolRow(Icon::Wand,      "Magic wand", Tool::Wand,     Action::ToolWand);
         toolRow(Icon::Transform, "Transform", Tool::Transform, Action::ToolTransform);
 
         if (app.tool == Tool::Transform) {
@@ -1176,8 +1489,26 @@ void drawToolPanel(App& app) {
             ImGui::SetNextItemWidth(-1.0f);
             ImGui::SliderInt("##tol", &app.fillTolerance, 0, 128, "tolerance %d");
         }
-        if (app.tool == Tool::Select && app.doc.selection.has_value()) {
-            if (ImGui::SmallButton("Deselect")) app.doc.selection.reset();
+        if (selectsRegion(app.tool)) {
+            if (app.tool == Tool::Wand) {
+                ImGui::SetNextItemWidth(-1.0f);
+                ImGui::SliderInt("##wandtol", &app.wandTolerance, 0, 128, "tolerance %d");
+            }
+            // Buttons as well as modifier keys. The keyboard is the only
+            // accessibility affordance Sable has (PRD §6), so a mode that can
+            // only be reached by holding Shift while dragging is a mode some
+            // users do not have.
+            ImGui::TextDisabled("MODE");
+            const auto modeRow = [&](const char* label, sbl::SelectMode mode) {
+                if (ImGui::RadioButton(label, app.selectMode == mode))
+                    app.selectMode = mode;
+            };
+            modeRow("Replace",        sbl::SelectMode::Replace);
+            modeRow("Add (Shift)",    sbl::SelectMode::Add);
+            modeRow("Subtract (Alt)", sbl::SelectMode::Subtract);
+            modeRow("Intersect",      sbl::SelectMode::Intersect);
+            if (app.doc.selection.has_value() &&
+                ImGui::SmallButton("Deselect")) app.doc.selection.reset();
         }
 
         ImGui::Spacing();
@@ -1242,6 +1573,50 @@ void drawToolPanel(App& app) {
         if (ImGui::Combo("##stab", &level, "Off\0Low\0Medium\0High\0")) {
             // Saved per brush preset (US-11.5).
             brush.stabilizerLevel = static_cast<std::uint8_t>(level);
+        }
+
+        ImGui::Spacing();
+        ImGui::TextDisabled("RULERS");
+        // Bindings shown, not hard-coded, for the same reason as the tool rows.
+        char rulerLabel[64];
+        std::snprintf(rulerLabel, sizeof rulerLabel, "Symmetry  (%s)",
+                      app.shortcuts.get(Action::ToggleSymmetry).label().c_str());
+        ImGui::Checkbox(rulerLabel, &app.symmetry.enabled);
+        if (app.symmetry.enabled) {
+            ImGui::Indent();
+            ImGui::Checkbox("Vertical axis", &app.symmetry.vertical);
+            ImGui::Checkbox("Horizontal axis", &app.symmetry.horizontal);
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::SliderInt("##radial", &app.symmetry.radial, 1,
+                             sbl::SymmetryRuler::kMaxRadial, "radial %d");
+            if (ImGui::SmallButton("Recentre")) centreSymmetry(app);
+            ImGui::TextDisabled("or drag the handle");
+            ImGui::Unindent();
+        }
+
+        std::snprintf(rulerLabel, sizeof rulerLabel, "Perspective  (%s)",
+                      app.shortcuts.get(Action::TogglePerspective).label().c_str());
+        ImGui::Checkbox(rulerLabel, &app.perspective.enabled);
+        if (app.perspective.enabled) {
+            ImGui::Indent();
+            for (int n = 1; n <= 3; ++n) {
+                char button[8];
+                std::snprintf(button, sizeof button, "%d pt", n);
+                if (ImGui::SmallButton(button)) setVanishingPoints(app, n);
+                ImGui::SameLine();
+            }
+            if (ImGui::SmallButton("None")) setVanishingPoints(app, 0);
+            for (std::size_t i = 0; i < app.doc.vanishingPoints.size(); ++i) {
+                ImGui::PushID(static_cast<int>(i));
+                ImGui::Checkbox("##on", &app.doc.vanishingPoints[i].enabled);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::DragScalarN("##xy", ImGuiDataType_Double,
+                                       &app.doc.vanishingPoints[i].x, 2, 1.0f))
+                    app.doc.dirty = true;
+                ImGui::PopID();
+            }
+            ImGui::Unindent();
         }
 
         ImGui::Spacing();
@@ -1639,8 +2014,9 @@ void drawStatusBar(const App& app, float windowW, float windowH, float height) {
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     if (ImGui::Begin("##status", nullptr, kStatusFlags)) {
-        ImGui::Text("%d%%   %d x %d%s",
+        ImGui::Text("%d%%   %ld deg   %d x %d%s",
                     static_cast<int>(std::lround(app.view.zoom * 100.0f)),
+                    std::lround(rotationDegrees(app.view)),
                     app.doc.width, app.doc.height, app.doc.dirty ? "   *" : "");
         ImGui::SameLine();
         ImGui::SameLine();
@@ -1799,18 +2175,157 @@ void drawModals(App& app) {
 /// Marching-ants-ish outline for the selection. A dashed rectangle would be
 /// nicer; a two-tone one reads correctly over both dark and light art and is
 /// four lines.
-void drawSelectionOutline(const App& app) {
+/// Rebuilds the cached boundary of a masked selection: every edge between a
+/// pixel that is in and a neighbour that is not, in canvas coordinates.
+///
+/// Edges rather than a traced contour, because a selection may be several
+/// disjoint islands with holes in them and this handles all of that without
+/// knowing it did.
+void rebuildAnts(App& app) {
+    static const sbl::Selection kNothing;
+    const bool live = app.doc.selection.has_value() && !app.doc.selection->empty();
+    const sbl::Selection& s = live ? *app.doc.selection : kNothing;
+    if (app.ants.from == s) return;
+
+    app.ants.from = s;
+    app.ants.segments.clear();
+    if (s.mask.empty()) return;              // a rectangle draws from its corners
+
+    for (std::int32_t y = s.y; y < s.y + s.h; ++y) {
+        for (std::int32_t x = s.x; x < s.x + s.w; ++x) {
+            if (!s.contains(x, y)) continue;
+            const auto px = static_cast<double>(x);
+            const auto py = static_cast<double>(y);
+            if (!s.contains(x - 1, y)) app.ants.segments.push_back({px, py, px, py + 1});
+            if (!s.contains(x + 1, y))
+                app.ants.segments.push_back({px + 1, py, px + 1, py + 1});
+            if (!s.contains(x, y - 1)) app.ants.segments.push_back({px, py, px + 1, py});
+            if (!s.contains(x, y + 1))
+                app.ants.segments.push_back({px, py + 1, px + 1, py + 1});
+        }
+    }
+}
+
+void drawSelectionOutline(App& app) {
+    rebuildAnts(app);
     if (!app.doc.selection.has_value() || app.doc.selection->empty()) return;
     const sbl::Selection& s = *app.doc.selection;
 
-    const ImVec2 lo(static_cast<float>(app.view.panX + s.x * app.view.zoom),
-                    static_cast<float>(app.view.panY + s.y * app.view.zoom));
-    const ImVec2 hi(static_cast<float>(app.view.panX + (s.x + s.w) * app.view.zoom),
-                    static_cast<float>(app.view.panY + (s.y + s.h) * app.view.zoom));
-
+    // Everything goes through the view transform, never screen-space
+    // arithmetic: the selection is axis-aligned on the CANVAS, so it leans when
+    // the canvas is turned and an upright box would sit over the wrong pixels.
+    const auto at = [&](double cx, double cy) {
+        return ImVec2(static_cast<float>(toScreenX(app.view, cx, cy)),
+                      static_cast<float>(toScreenY(app.view, cx, cy)));
+    };
     ImDrawList* draw = ImGui::GetForegroundDrawList();
-    draw->AddRect(lo, hi, IM_COL32(0, 0, 0, 200), 0.0f, 0, 3.0f);
-    draw->AddRect(lo, hi, IM_COL32(255, 255, 255, 230), 0.0f, 0, 1.0f);
+
+    if (s.mask.empty()) {
+        const ImVec2 a = at(s.x, s.y);
+        const ImVec2 b = at(s.x + s.w, s.y);
+        const ImVec2 c = at(s.x + s.w, s.y + s.h);
+        const ImVec2 d = at(s.x, s.y + s.h);
+        draw->AddQuad(a, b, c, d, IM_COL32(0, 0, 0, 200), 3.0f);
+        draw->AddQuad(a, b, c, d, IM_COL32(255, 255, 255, 230), 1.0f);
+        return;
+    }
+    for (const std::array<double, 4>& e : app.ants.segments) {
+        const ImVec2 a = at(e[0], e[1]);
+        const ImVec2 b = at(e[2], e[3]);
+        draw->AddLine(a, b, IM_COL32(0, 0, 0, 200), 3.0f);
+        draw->AddLine(a, b, IM_COL32(255, 255, 255, 230), 1.0f);
+    }
+}
+
+/// The lasso loop while it is being drawn. Closed visibly, because that is
+/// what releasing will do.
+void drawLassoInProgress(const App& app) {
+    if (!app.selecting || app.tool != Tool::Lasso || app.lassoPath.size() < 2) return;
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    for (std::size_t i = 0; i < app.lassoPath.size(); ++i) {
+        const sbl::Point& a = app.lassoPath[i];
+        const sbl::Point& b = app.lassoPath[(i + 1) % app.lassoPath.size()];
+        const ImVec2 pa(static_cast<float>(toScreenX(app.view, a.x, a.y)),
+                        static_cast<float>(toScreenY(app.view, a.x, a.y)));
+        const ImVec2 pb(static_cast<float>(toScreenX(app.view, b.x, b.y)),
+                        static_cast<float>(toScreenY(app.view, b.x, b.y)));
+        draw->AddLine(pa, pb, IM_COL32(0, 0, 0, 200), 3.0f);
+        draw->AddLine(pa, pb, IM_COL32(255, 255, 255, 230), 1.0f);
+    }
+}
+
+/// The ruler guides.
+///
+/// Everything here is in CANVAS space and goes through toScreenX/Y, the same
+/// transform the art does. A guide drawn with its own screen-space arithmetic
+/// looks right until the canvas is turned, and then quietly points elsewhere
+/// than the ruler it is supposed to be showing.
+void drawRulerGuides(const App& app) {
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    const auto at = [&](double cx, double cy) {
+        return ImVec2(static_cast<float>(toScreenX(app.view, cx, cy)),
+                      static_cast<float>(toScreenY(app.view, cx, cy)));
+    };
+    // Two-tone like the selection outline, so a guide stays readable over both
+    // dark and light art.
+    const auto line = [&](ImVec2 a, ImVec2 b, ImU32 tint) {
+        draw->AddLine(a, b, IM_COL32(0, 0, 0, 90), 3.0f);
+        draw->AddLine(a, b, tint, 1.0f);
+    };
+    const auto handle = [&](ImVec2 p, ImU32 tint) {
+        const float r = 6.0f * app.uiScale;
+        draw->AddCircle(p, r, IM_COL32(0, 0, 0, 160), 0, 3.0f);
+        draw->AddCircle(p, r, tint, 0, 1.5f);
+    };
+
+    const auto w = static_cast<double>(app.doc.width);
+    const auto h = static_cast<double>(app.doc.height);
+
+    if (app.symmetry.enabled) {
+        constexpr ImU32 tint = IM_COL32(120, 220, 255, 200);
+        const double cx = app.symmetry.centreX, cy = app.symmetry.centreY;
+        if (app.symmetry.vertical)   line(at(cx, 0.0), at(cx, h), tint);
+        if (app.symmetry.horizontal) line(at(0.0, cy), at(w, cy), tint);
+        if (app.symmetry.radial > 1) {
+            // Long enough to leave the canvas from any centre inside it.
+            const double reach = std::hypot(w, h);
+            const int n = std::min(app.symmetry.radial, sbl::SymmetryRuler::kMaxRadial);
+            for (int k = 0; k < n; ++k) {
+                const double a = 2.0 * 3.14159265358979323846 * k / n;
+                line(at(cx, cy),
+                     at(cx + reach * std::cos(a), cy + reach * std::sin(a)), tint);
+            }
+        }
+        handle(at(cx, cy), tint);
+    }
+
+    if (!app.perspective.enabled) return;
+    for (std::size_t i = 0; i < app.doc.vanishingPoints.size(); ++i) {
+        const sbl::VanishingPoint& vp = app.doc.vanishingPoints[i];
+        // The guide the live stroke locked onto is lit, so "which point am I
+        // drawing to" is answered on the canvas rather than guessed at.
+        const bool live = app.painting &&
+                          app.perspective.chosen() == static_cast<int>(i);
+        const ImU32 tint = !vp.enabled ? IM_COL32(150, 150, 150, 80)
+                         : live        ? IM_COL32(255, 210, 90, 230)
+                                       : IM_COL32(255, 150, 90, 140);
+
+        // A fan out to points spaced evenly round the canvas edge. That reads
+        // as perspective wherever the point sits, including well off-canvas,
+        // and needs no special case for a point inside the picture.
+        constexpr int kSpokes = 16;
+        for (int k = 0; k < kSpokes; ++k) {
+            const double t = 4.0 * k / kSpokes;           // 0..4 round the edge
+            const double f = t - std::floor(t);
+            switch (static_cast<int>(t)) {
+                case 0:  line(at(vp.x, vp.y), at(w * f, 0.0), tint); break;
+                case 1:  line(at(vp.x, vp.y), at(w, h * f), tint); break;
+                case 2:  line(at(vp.x, vp.y), at(w * (1.0 - f), h), tint); break;
+                default: line(at(vp.x, vp.y), at(0.0, h * (1.0 - f)), tint); break;
+            }
+        }
+        handle(at(vp.x, vp.y), tint);
+    }
 }
 
 void drawBrushCursor(const App& app) {
@@ -1820,6 +2335,9 @@ void drawBrushCursor(const App& app) {
     if (!overCanvas(app, mx, my)) return;
 
     if (!paintingTool(app)) return;
+    // Zoom only: the cursor is a circle about the pointer, and a circle is the
+    // one shape rotation leaves alone. It follows the view because the pointer
+    // does.
     const float radius =
         activeBrush(const_cast<App&>(app)).size * 0.5f * app.view.zoom;
     if (radius < 1.0f) return;
@@ -1902,7 +2420,9 @@ void renderFrame(App& app) {
         app.viewport = SDL_FRect{central->Pos.x, central->Pos.y,
                                  central->Size.x, central->Size.y};
     }
+    drawRulerGuides(app);
     drawSelectionOutline(app);
+    drawLassoInProgress(app);
     drawBrushCursor(app);
 
     ImGui::Render();
@@ -2017,9 +2537,11 @@ int main(int argc, char** argv) {
         app.showShortcuts   = true;
         beginPaint(app);
         for (double t = 0.0; t <= 1.0; t += 0.02) {
+            const double cx = 100.0 + t * 400.0;
+            const double cy = 100.0 + t * 250.0;
             sbl::InputSample sample =
-                mouseSample(app, app.view.panX + 100.0 + t * 400.0,
-                                 app.view.panY + 100.0 + t * 250.0);
+                mouseSample(app, toScreenX(app.view, cx, cy),
+                                 toScreenY(app.view, cx, cy));
             sample.fromMouse = false;
             sample.pressure = static_cast<float>(1.0 - std::abs(0.5 - t) * 2.0);
             paintWith(app, sample);
@@ -2032,10 +2554,215 @@ int main(int argc, char** argv) {
         app.doc.layerById(app.doc.activeLayer)->blend = sbl::BlendMode::Multiply;
         app.foreground = sbl::StraightRgba8{60, 120, 220, 255};
         app.doc.selection = sbl::Selection{200, 200, 300, 300};
-        doFill(app, app.view.panX + 300.0, app.view.panY + 300.0);
+        doFill(app, toScreenX(app.view, 300.0, 300.0),
+                    toScreenY(app.view, 300.0, 300.0));
         app.doc.selection.reset();
 
+        // Rulers, driven through the same path a real stroke takes. Two things
+        // a unit test cannot see: the mirror appears while the stroke is being
+        // drawn rather than at pen-up, and however many dabs symmetry
+        // multiplied it into, it is still ONE undo step.
+        {
+            const std::size_t undoBefore = app.doc.undo.size();
+            app.foreground = sbl::StraightRgba8{20, 20, 20, 255};
+            app.symmetry.enabled  = true;
+            app.symmetry.vertical = true;
+            app.symmetry.radial   = 1;
+            centreSymmetry(app);
+            setVanishingPoints(app, 2);
+            app.perspective.enabled = true;
+
+            beginPaint(app);
+            for (int i = 0; i <= 40; ++i) {
+                // Below everything already drawn, so the only thing in this
+                // band of the canvas is the stroke under test.
+                const double cx = 120.0 + i * 9.0;
+                const double cy = 700.0 + (i % 2 == 0 ? 6.0 : -6.0);
+                paintWith(app, mouseSample(app, toScreenX(app.view, cx, cy),
+                                                toScreenY(app.view, cx, cy)));
+            }
+            // Counted BEFORE endPaint: "live, not on stroke end" is the whole
+            // acceptance criterion, and only this ordering tests it.
+            // Dark, not merely opaque: the background is opaque white, so an
+            // alpha test here would pass without a single dab being painted.
+            const auto painted = [&](int x, int y) {
+                return sbl::pickColour(app.doc, x, y).r < 128;
+            };
+            int mirroredDuringStroke = 0;
+            for (int x = 520; x < 900; x += 7)
+                for (int y = 505; y < 780; y += 7)
+                    if (painted(x, y)) ++mirroredDuringStroke;
+            endPaint(app);
+
+            if (mirroredDuringStroke == 0) {
+                SDL_Log("selftest FAILED: symmetry painted nothing on the far side "
+                        "while the stroke was live");
+                return 1;
+            }
+            if (app.doc.undo.size() != undoBefore + 1) {
+                SDL_Log("selftest FAILED: a mirrored stroke pushed %zu undo steps",
+                        app.doc.undo.size() - undoBefore);
+                return 1;
+            }
+
+            // Mirrored about x = 512, so pixel x pairs with 1023 - x.
+            int probes = 0;
+            for (int x = 120; x < 500; x += 7) {
+                for (int y = 505; y < 780; y += 7) {
+                    const sbl::StraightRgba8 a = sbl::pickColour(app.doc, x, y);
+                    const sbl::StraightRgba8 b = sbl::pickColour(app.doc, 1023 - x, y);
+                    if (a.a != b.a || a.r != b.r) {
+                        SDL_Log("selftest FAILED: %d,%d is not the mirror of %d,%d",
+                                x, y, 1023 - x, y);
+                        return 1;
+                    }
+                    if (painted(x, y)) ++probes;
+                }
+            }
+            if (probes == 0) {
+                SDL_Log("selftest FAILED: the mirrored stroke painted nothing");
+                return 1;
+            }
+            SDL_Log("selftest: symmetry mirrors live over %d probes, one undo step",
+                    probes);
+
+            // Off again, positions kept — the toggle must not cost the artist
+            // the guides they placed.
+            app.symmetry.enabled    = false;
+            app.perspective.enabled = false;
+            if (app.doc.vanishingPoints.size() != 2 ||
+                app.symmetry.centreX != 512.0) {
+                SDL_Log("selftest FAILED: switching a ruler off moved its guides");
+                return 1;
+            }
+            app.perspective.enabled = true;   // left on for the frames below
+        }
+
+        // Lasso and magic wand (#18), driven through the same combine path the
+        // pointer uses. Left in place afterwards, so the frames below draw a
+        // NON-rectangular outline through the rotated view transform and the
+        // project round trip carries a real coverage mask.
+        {
+            const std::vector<sbl::Point> triangle{
+                {700.0, 150.0}, {950.0, 150.0}, {825.0, 380.0}};
+            app.selectBase.reset();
+            app.dragMode = sbl::SelectMode::Replace;
+            commitSelection(app, sbl::lassoSelection(triangle, app.doc.width,
+                                                     app.doc.height));
+            if (!app.doc.selection.has_value() || app.doc.selection->mask.empty()) {
+                SDL_Log("selftest FAILED: the lasso produced no mask");
+                return 1;
+            }
+
+            app.foreground = sbl::StraightRgba8{220, 40, 40, 255};
+            sbl::UndoRecord rec =
+                sbl::fillSelection(app.doc, app.doc.activeLayer, app.foreground);
+            app.canvas->releaseAll();
+            app.doc.undo.push(std::move(rec));
+
+            const auto red = [&](int x, int y) {
+                const sbl::StraightRgba8 c = sbl::pickColour(app.doc, x, y);
+                return c.r > 150 && c.g < 110;
+            };
+            // Inside the loop, and a corner of its bounding box that the loop
+            // does not enclose — a fill that ignored the mask would paint both.
+            if (!red(825, 200) || red(705, 375)) {
+                SDL_Log("selftest FAILED: the fill did not follow the lasso");
+                return 1;
+            }
+
+            const sbl::Selection wand = sbl::magicWandSelection(app.doc, 825, 200, 8);
+            const sbl::Selection& lasso = *app.doc.selection;
+            if (wand.empty() || std::abs(wand.x - lasso.x) > 4 ||
+                std::abs(wand.w - lasso.w) > 8) {
+                SDL_Log("selftest FAILED: the wand found %d,%d %dx%d where the lasso "
+                        "is %d,%d %dx%d", wand.x, wand.y, wand.w, wand.h,
+                        lasso.x, lasso.y, lasso.w, lasso.h);
+                return 1;
+            }
+            // Taking the wand's own region back out of the lasso must leave
+            // little more than the anti-aliased rim.
+            const sbl::Selection remainder =
+                sbl::combineSelections(lasso, wand, sbl::SelectMode::Subtract);
+            if (remainder.contains(825, 200)) {
+                SDL_Log("selftest FAILED: subtract left the middle selected");
+                return 1;
+            }
+            SDL_Log("selftest: lasso clips a fill, wand agrees with it, subtract works");
+
+            app.doc.undo.undo(app.doc);       // put the canvas back
+            app.canvas->releaseAll();
+            app.foreground = sbl::StraightRgba8{0, 0, 0, 255};
+        }
+
+        // Rotation, checked where a unit test cannot reach: turning the view
+        // must move no pixels (US-05.5's guarantee, extended to rotate), and
+        // the app's own screen->canvas path must still land on the pixel the
+        // artist is pointing at. Left turned on, so the frames below also
+        // exercise the rotated blit and the turned outline.
+        {
+            const bool dirtyBefore = app.doc.dirty;
+            const std::size_t undoBefore    = app.doc.undo.size();
+            const std::size_t uploadsBefore = app.canvas->uploadCount();
+            rotateView(app, kRotateStep * 2.0);
+            if (app.doc.dirty != dirtyBefore ||
+                app.doc.undo.size() != undoBefore ||
+                app.canvas->uploadCount() != uploadsBefore) {
+                SDL_Log("selftest FAILED: rotating the view altered the document");
+                return 1;
+            }
+            const sbl::InputSample probe =
+                mouseSample(app, toScreenX(app.view, 400.0, 250.0),
+                                 toScreenY(app.view, 400.0, 250.0));
+            if (std::abs(probe.x - 400.0) > 1e-6 || std::abs(probe.y - 250.0) > 1e-6) {
+                SDL_Log("selftest FAILED: rotated screen->canvas lands at %.6f, %.6f",
+                        probe.x, probe.y);
+                return 1;
+            }
+            SDL_Log("selftest: rotation at %ld deg alters no pixels",
+                    std::lround(rotationDegrees(app.view)));
+        }
+
         for (int frame = 0; frame < 3; ++frame) renderFrame(app);
+
+        // The blit has to agree with the transform. SDL turns each tile about
+        // its own corner, and a sign error there would put the picture
+        // somewhere the screen->canvas maths says it is not — with every unit
+        // test still green. One pixel read back off the rotated frame catches
+        // it: the probe is off-centre and inside the filled region, so the
+        // mirrored point it would land on is a different colour.
+        {
+            SDL_SetRenderDrawColor(app.renderer, 0, 0, 0, 255);
+            SDL_RenderClear(app.renderer);
+            app.canvas->render(app.doc, app.view, app.viewport);
+
+            constexpr int probe = 350;
+            const double centreX = probe + 0.5, centreY = probe + 0.5;
+            const SDL_Rect one{
+                static_cast<int>(std::lround(toScreenX(app.view, centreX, centreY))),
+                static_cast<int>(std::lround(toScreenY(app.view, centreX, centreY))),
+                1, 1};
+            SDL_Surface* shot = SDL_RenderReadPixels(app.renderer, &one);
+            Uint8 r = 0, g = 0, b = 0, a = 0;
+            // A renderer that cannot read back says nothing either way, so it
+            // is not a failure — but a mismatch is.
+            if (shot != nullptr && SDL_ReadSurfacePixel(shot, 0, 0, &r, &g, &b, &a)) {
+                const std::vector<sbl::PremulRgba8> want =
+                    sbl::compositeRect(app.doc, probe, probe, 1, 1);
+                const int dr = std::abs(int{r} - int{want[0].r});
+                const int dg = std::abs(int{g} - int{want[0].g});
+                const int db = std::abs(int{b} - int{want[0].b});
+                if (dr > 8 || dg > 8 || db > 8) {
+                    SDL_Log("selftest FAILED: rotated blit shows %d,%d,%d where the "
+                            "transform says %d,%d,%d", r, g, b,
+                            want[0].r, want[0].g, want[0].b);
+                    SDL_DestroySurface(shot);
+                    return 1;
+                }
+                SDL_Log("selftest: rotated blit lands on the pixel the transform names");
+            }
+            SDL_DestroySurface(shot);
+        }
 
         const auto project = std::filesystem::temp_directory_path() / "sable_selftest.sable";
         std::error_code ec;
@@ -2048,6 +2775,13 @@ int main(int argc, char** argv) {
             reloaded->layers[1].blend != sbl::BlendMode::Multiply ||
             reloaded->path != project) {
             SDL_Log("selftest FAILED: project round trip");
+            return 1;
+        }
+        // The lasso selection left in place above, back off disk with its
+        // coverage mask intact (#18).
+        if (!reloaded->selection.has_value() || reloaded->selection->mask.empty() ||
+            reloaded->selection->mask != app.doc.selection->mask) {
+            SDL_Log("selftest FAILED: the selection mask did not survive the file");
             return 1;
         }
         SDL_Log("selftest: project round trip ok, %zu layers, %zu bytes",
@@ -2109,8 +2843,9 @@ int main(int argc, char** argv) {
                 result.has_value() ? out.string().c_str()
                                    : result.error().detail.c_str());
         app.running = false;
-        // Stroke, new layer, and fill — each exactly one undoable step.
-        if (!result.has_value() || app.doc.undo.size() != 3 ||
+        // Stroke, new layer, fill, and the mirrored stroke — each exactly one
+        // undoable step, however many dabs it took.
+        if (!result.has_value() || app.doc.undo.size() != 4 ||
             app.doc.layers.size() != 2 || app.doc.active()->tiles.empty()) {
             SDL_Log("selftest FAILED");
             return 1;

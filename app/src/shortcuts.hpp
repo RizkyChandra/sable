@@ -22,8 +22,11 @@ enum class Action {
     NewCanvas, OpenProject, Save, SaveAs, ExportPng, Quit,
     Undo, Redo, Clear, FillSelection, Deselect,
     FitToWindow, ActualSize, ZoomIn, ZoomOut,
-    ToolBrush, ToolEraser, ToolFill, ToolSelect, ToolTransform,
+    RotateLeft, RotateRight, ResetRotation,
+    ToolBrush, ToolEraser, ToolFill, ToolSelect, ToolLasso, ToolWand,
+    ToolTransform,
     SizeDown, SizeUp, SwapColours, ResetColours,
+    ToggleSymmetry, TogglePerspective,
     Count,
 };
 
