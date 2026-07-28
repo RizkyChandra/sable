@@ -28,12 +28,14 @@ jobs:
           - name: Windows x86_64
             runner: windows-latest
             artifact: sable-windows-x86_64
-          - name: macOS arm64
+          # One universal binary rather than two jobs. GitHub is retiring the
+          # Intel macos-13 runners and they no longer schedule in reasonable
+          # time; the Apple-silicon runner cross-compiles both architectures,
+          # so Intel Macs are still covered without depending on a queue that
+          # never clears.
+          - name: macOS universal
             runner: macos-14
-            artifact: sable-macos-arm64
-          - name: macOS x86_64
-            runner: macos-13
-            artifact: sable-macos-x86_64
+            artifact: sable-macos-universal
 
     steps:
       - uses: actions/checkout@v4
@@ -47,7 +49,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.sdl3
-          key: sdl3-static-${{ matrix.runner }}-${{ env.SDL_VERSION }}
+          key: sdl3-static-${{ matrix.runner }}-${{ env.SDL_VERSION }}-universal
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -79,12 +81,16 @@ jobs:
         run: |
           git clone --depth 1 --branch "$SDL_VERSION" \
             https://github.com/libsdl-org/SDL.git "${RUNNER_TEMP}/SDL"
+          arch=""
+          # SDL has to be universal too, or the link finds only one slice.
+          [ "${{ runner.os }}" = "macOS" ] && arch='-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64'
           cmake -S "${RUNNER_TEMP}/SDL" -B "${RUNNER_TEMP}/SDL/build" -G Ninja \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/.sdl3" \
                 -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
                 -DSDL_SHARED=OFF -DSDL_STATIC=ON \
-                -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_INSTALL_TESTS=OFF
+                -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_INSTALL_TESTS=OFF \
+                $arch
           cmake --build "${RUNNER_TEMP}/SDL/build"
           cmake --install "${RUNNER_TEMP}/SDL/build"
 
@@ -114,6 +120,7 @@ jobs:
           # are staged from this same build; the window is a fair trade for
           # having any diagnostics at all on a platform nobody has run by hand.
           [ "${{ runner.os }}" = "Windows" ] && extra="-DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER=gcc -DSABLE_CONSOLE=ON"
+          [ "${{ runner.os }}" = "macOS" ]   && extra='-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64'
           cmake -S . -B build -G Ninja \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_PREFIX_PATH="${{ github.workspace }}/.sdl3" \
@@ -156,6 +163,15 @@ jobs:
           else
             ./build/sable --selftest
           fi
+
+      # A universal binary that is quietly single-architecture would only be
+      # discovered by an Intel Mac user, which is exactly who cannot report it.
+      - name: Check both architectures are present
+        if: runner.os == 'macOS'
+        run: |
+          lipo -info build/Sable.app/Contents/MacOS/Sable
+          lipo -info build/Sable.app/Contents/MacOS/Sable | grep -q arm64
+          lipo -info build/Sable.app/Contents/MacOS/Sable | grep -q x86_64
 
       - name: Stage the package
         shell: bash
@@ -233,8 +249,7 @@ jobs:
           | Linux (any distribution) | `Sable-x86_64.AppImage` — self-contained, `chmod +x` and run |
           | Linux (archive) | `sable-linux-x86_64.tar.gz` |
           | Windows 10/11 | `sable-windows-x86_64.zip` |
-          | macOS (Apple silicon) | `sable-macos-arm64.zip` |
-          | macOS (Intel) | `sable-macos-x86_64.zip` |
+          | macOS (Apple silicon and Intel) | `sable-macos-universal.zip` |
 
           Verify a download against `SHA256SUMS`.
 
