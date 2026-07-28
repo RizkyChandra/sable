@@ -39,6 +39,7 @@ if(SABLE_ASAN)
   endif()
 endif()
 
+include(CMakeDependentOption)
 include(FetchContent)
 
 # ---------------------------------------------------------------- third party
@@ -106,9 +107,22 @@ target_include_directories(nlohmann_json SYSTEM INTERFACE
 # D-022: the engine may link SDL3, but never ImGui, and nothing under engine/
 # may open a window, an event queue or an input device. The headless
 # engine_tests below are what enforces that now the link error no longer can.
+#
+# SDL3 is looked for once, here, and it is not required. The `engine` CI job
+# builds with -DSABLE_BUILD_APP=OFF on a machine with no graphics stack at all
+# (D-025): there, SABLE_GPU turns itself off and engine/src/gpu.cpp compiles to
+# the stub that says "no GPU", which is the same answer a machine with a driver
+# SDL cannot use gives at runtime.
+find_package(SDL3 QUIET CONFIG)
+if(SABLE_BUILD_APP AND NOT SDL3_FOUND)
+  message(FATAL_ERROR "SDL3 is required for -DSABLE_BUILD_APP=ON")
+endif()
+cmake_dependent_option(SABLE_GPU "Build the GPU paint backend" ON "SDL3_FOUND" OFF)
+
 add_library(engine STATIC
   engine/src/backend.cpp
   engine/src/canvas.cpp
+  engine/src/gpu.cpp
   engine/src/input.cpp
   engine/src/paint.cpp
   engine/src/io.cpp
@@ -117,11 +131,14 @@ add_library(engine STATIC
 target_include_directories(engine PUBLIC engine/include)
 target_link_libraries(engine PRIVATE lodepng miniz nlohmann_json)
 target_compile_options(engine PRIVATE ${SABLE_WARNINGS})
+if(SABLE_GPU)
+  target_link_libraries(engine PUBLIC SDL3::SDL3)
+  target_compile_definitions(engine PUBLIC SABLE_HAVE_GPU)
+endif()
 add_library(sable::engine ALIAS engine)
 
 # ------------------------------------------------------------------------ app
 if(SABLE_BUILD_APP)
-  find_package(SDL3 REQUIRED CONFIG)
 
   # D-016 answers D-104: the docking branch, pinned to a COMMIT rather than to
   # the moving branch head. Docking is still not in master as of v1.92.1.

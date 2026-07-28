@@ -35,6 +35,7 @@
 #include "sbl/backend.hpp"
 #include "sbl/canvas.hpp"
 #include "sbl/format.hpp"
+#include "sbl/gpu.hpp"
 #include "sbl/io.hpp"
 #include "sbl/paint.hpp"
 #include "sbl/project.hpp"
@@ -136,6 +137,11 @@ struct App {
     sbl::Transform pendingTransform;   // edited live, applied as one step
     int undoBudgetMb = 256;            // D-102, mirrored into the document
     char presetName[48] = "My brush";
+
+    // --- the GPU backend (D-021: opt in, CPU is the default and the reference)
+    std::unique_ptr<sbl::PaintBackend> gpu;
+    std::string gpuWhy = "not tried yet";
+    bool useGpu = false;
 
     Shortcuts shortcuts;
     Action    rebinding = Action::Count;   // which row is waiting for a key
@@ -246,6 +252,8 @@ void applySettings(App& app, const Settings& settings) {
     app.uiScale = std::clamp(settings.getFloat("ui.scale", 1.0f), 0.75f, 2.5f);
     app.lightTheme = settings.getInt("ui.lightTheme", 0) != 0;
     app.undoBudgetMb = std::clamp(settings.getInt("undo.budgetMb", 256), 16, 2048);
+    // D-021: off unless the artist turned it on, on this machine, last time.
+    app.useGpu = settings.getInt("render.gpu", 0) != 0;
     app.shortcuts.load(settings);
 
     // Custom presets are appended after the built-ins, which always come first
@@ -300,6 +308,7 @@ void collectSettings(const App& app, Settings& settings) {
     settings.setFloat("ui.scale", app.uiScale);
     settings.setInt("ui.lightTheme", app.lightTheme ? 1 : 0);
     settings.setInt("undo.budgetMb", app.undoBudgetMb);
+    settings.setInt("render.gpu", app.useGpu ? 1 : 0);
     app.shortcuts.store(settings);
 
     const std::size_t builtIn = sbl::defaultBrushes().size();
@@ -332,6 +341,35 @@ void collectSettings(const App& app, Settings& settings) {
 void applyUndoBudget(App& app) {
     app.doc.undo.setMemoryBudget(static_cast<std::size_t>(app.undoBudgetMb) *
                                  1024u * 1024u);
+}
+
+void showError(App& app, const sbl::Error& error);
+
+/// Installs or removes the GPU backend, and tells the truth about which one is
+/// running afterwards.
+///
+/// D-021 wants a runtime switch so that "the colours are wrong" is one toggle
+/// away from saying which side is wrong. The device is built on first use and
+/// then kept: creating one costs tens of milliseconds, and a switch the artist
+/// flicks twice should not cost that twice.
+///
+/// Never mid-stroke: the backend holds a batch of dabs for the layer it is
+/// painting, and swapping it out from under that would drop them.
+void applyGpuMode(App& app) {
+    if (app.painting) return;
+    if (app.useGpu && app.gpu == nullptr) {
+        app.gpu = sbl::makeGpuBackend(&app.gpuWhy);
+        if (app.gpu == nullptr) app.useGpu = false;   // no device: stay on the CPU
+        SDL_Log("paint backend: %s", app.gpuWhy.c_str());
+    }
+    if (!app.useGpu && app.gpu != nullptr) {
+        // The host tiles have to be the truth again before the backend that
+        // holds them stops being consulted.
+        if (const auto ready = app.gpu->readback(app.doc); !ready.has_value())
+            showError(app, ready.error());
+    }
+    sbl::setPaintBackend(app.useGpu ? app.gpu.get() : nullptr);
+    if (app.canvas != nullptr) app.canvas->markAllDirty();
 }
 
 void resetDocument(App& app, std::int32_t w, std::int32_t h, bool transparent) {
@@ -1144,6 +1182,22 @@ void drawMenuBar(App& app, float& menuHeight) {
                             false, app.view.rotation != 0.0))
             rotateView(app, -app.view.rotation);
         ImGui::Separator();
+        // D-021: one binary, one toggle, defaulting to the CPU. Disabled
+        // rather than hidden when there is no device, so a bug report can say
+        // "the menu item is greyed out" and the reason is one hover away.
+        const bool haveGpu = sbl::gpuBackendCompiledIn();
+        ImGui::BeginDisabled(!haveGpu || app.painting);
+        if (ImGui::MenuItem("Paint and composite on the GPU", nullptr, &app.useGpu))
+            applyGpuMode(app);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(
+                "%s\n\nThe CPU path is the reference: if the two disagree, the "
+                "CPU is right. Switch back and export again to find out which "
+                "one a colour problem is in.",
+                haveGpu ? app.gpuWhy.c_str() : "This build has no GPU backend.");
+        }
+        ImGui::Separator();
         ImGui::MenuItem("Pressure calibration", nullptr, &app.showCalibration);
         ImGui::MenuItem("Tablet test pad", nullptr, &app.showTestPad);
         ImGui::MenuItem("Keyboard and interface", nullptr, &app.showShortcuts);
@@ -1693,6 +1747,16 @@ void drawStatusBar(const App& app, float windowW, float windowH, float height) {
             ImGui::TextDisabled("   sel %d x %d",
                                 app.doc.selection->w, app.doc.selection->h);
         }
+        // Two memory numbers, because there are two memories. The undo budget
+        // is host RAM and still counts exactly what it always counted (#12);
+        // this is the other one, and leaving it off the bar would make the
+        // first one look like the whole story.
+        if (app.gpu != nullptr && app.useGpu) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("   gpu %.0f MB",
+                                static_cast<double>(sbl::gpuDeviceBytes(*app.gpu)) /
+                                    (1024.0 * 1024.0));
+        }
         // D-102 asks for a VISIBLE policy, not just a cap. Say it plainly, and
         // only once there is something to say.
         if (app.doc.undo.droppedRecords() > 0) {
@@ -2026,6 +2090,9 @@ int main(int argc, char** argv) {
     }
 
     applySettings(app, loadSettings());
+    // The self-test starts from the documented default whatever this machine's
+    // preferences say, and switches to the GPU itself at the end.
+    if (selfTest) app.useGpu = false;
     syncHsvFromColour(app);
 
     // D-013: restoring is an explicit user action. Offer, never auto-open.
@@ -2043,6 +2110,8 @@ int main(int argc, char** argv) {
                                 sbl::StraightRgba8{255, 255, 255, 255});
     applyUndoBudget(app);
     zoomToActualSize(app.view, app.doc, app.viewport);
+    // After the document exists: switching backends reads the tiles back.
+    applyGpuMode(app);
 
     // `Exec=sable %f` in the .desktop file promises a path argument opens that
     // document, which is what double-clicking a .sable does. A path that will
@@ -2232,12 +2301,43 @@ int main(int argc, char** argv) {
             SDL_Log("selftest FAILED");
             return 1;
         }
+        // The GPU backend through the real application path, if this machine
+        // has one. In CI it almost never does, and "no GPU" is a pass — the
+        // engine tests are where the two backends are compared pixel for
+        // pixel. What this checks is the wiring: that flicking the switch
+        // mid-session repaints the same canvas rather than a different one.
+        const std::vector<sbl::StraightRgba8> onCpu = sbl::flatten(app.doc);
+        app.useGpu = true;
+        applyGpuMode(app);
+        if (app.useGpu) {
+            const std::vector<sbl::StraightRgba8> onGpu = sbl::flatten(app.doc);
+            int worst = 0;
+            for (std::size_t i = 0; i < onCpu.size() && i < onGpu.size(); ++i)
+                worst = std::max({worst, std::abs(onCpu[i].r - onGpu[i].r),
+                                  std::abs(onCpu[i].g - onGpu[i].g),
+                                  std::abs(onCpu[i].b - onGpu[i].b),
+                                  std::abs(onCpu[i].a - onGpu[i].a)});
+            renderFrame(app);                     // one frame with tiles in VRAM
+            app.useGpu = false;
+            applyGpuMode(app);
+            if (worst > 1 || onGpu.size() != onCpu.size()) {
+                SDL_Log("selftest FAILED: the GPU backend differs by %d levels", worst);
+                return 1;
+            }
+            SDL_Log("selftest: %s, agrees with the CPU within %d level(s)",
+                    app.gpuWhy.c_str(), worst);
+        } else {
+            SDL_Log("selftest: no GPU backend here (%s); CPU only",
+                    app.gpuWhy.c_str());
+        }
         SDL_Log("selftest OK");
 
         // Exit before the settings write below. The self-test drives the app
         // with synthetic values, and persisting those would edit the real
         // user's preferences — which is how a test run silently changed
         // someone's stabilizer setting.
+        sbl::setPaintBackend(nullptr);
+        app.gpu.reset();
         canvas.releaseAll();
         ImGui_ImplSDLRenderer3_Shutdown();
         ImGui_ImplSDL3_Shutdown();
@@ -2277,6 +2377,11 @@ int main(int argc, char** argv) {
     Settings settings = loadSettings();
     collectSettings(app, settings);
     saveSettings(settings);
+
+    // Before `app.gpu` is destroyed: the process default must never point at a
+    // backend that has gone.
+    sbl::setPaintBackend(nullptr);
+    app.gpu.reset();
 
     canvas.releaseAll();
     ImGui_ImplSDLRenderer3_Shutdown();

@@ -106,6 +106,20 @@ protected:
         if (!failure_.has_value()) failure_ = std::move(e);
     }
 
+    /// The scanline flood fill, matched against what `*this` composites.
+    ///
+    /// Not virtual and not the whole of `bucketFill`: the flood itself is host
+    /// work on host tiles either way (#12 — it is click-frequency, so the
+    /// stall is affordable), but the image it matches against must be the one
+    /// the artist clicked on. A GPU backend that let the CPU compositor
+    /// decide the region would fill to a boundary half a level away from the
+    /// one on screen.
+    ///
+    /// The caller is responsible for the tiles being on the host first.
+    [[nodiscard]] UndoRecord floodFill(Document& doc, LayerId target,
+                                       std::int32_t x, std::int32_t y,
+                                       StraightRgba8 colour, int tolerance);
+
 private:
     std::optional<Error> failure_;
 };

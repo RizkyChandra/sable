@@ -3,24 +3,32 @@
 // These cover the five things USER-STORIES.md names as carrying tests: dab
 // spacing, tile compositing, the premultiply round-trip, undo/redo symmetry,
 // and (once M2 lands) pressure normalisation.
-#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+// Not IMPLEMENT_WITH_MAIN: the GPU device has to be destroyed before
+// LeakSanitizer's exit check, and a static destructor runs after it. See the
+// main() at the bottom.
+#define DOCTEST_CONFIG_IMPLEMENT
 #include "doctest/doctest.h"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <cstring>
+#include <memory>
 #include <new>
 #ifdef _WIN32
 #include <malloc.h>   // _aligned_malloc / _aligned_free
 #endif
+#include <string>
 #include <vector>
 
 #include "sbl/backend.hpp"
 #include "sbl/canvas.hpp"
 #include "sbl/format.hpp"
+#include "sbl/gpu.hpp"
 #include "sbl/io.hpp"
 #include "sbl/paint.hpp"
 #include "sbl/project.hpp"
@@ -31,6 +39,10 @@
 #include "miniz.h"
 #include "miniz_zip.h"
 #include "nlohmann/json.hpp"
+
+#ifdef SABLE_HAVE_GPU
+#include <SDL3/SDL_init.h>
+#endif
 
 using namespace sbl;
 
@@ -62,6 +74,32 @@ void* operator new(std::size_t n, std::align_val_t a) {
     throw std::bad_alloc{};
 }
 void* operator new[](std::size_t n, std::align_val_t a) { return ::operator new(n, a); }
+
+// The nothrow forms have to be replaced too, now that the engine may link
+// SDL3 and a GPU driver (D-022/D-025). Replacing only the throwing ones leaves
+// a library that calls `new (std::nothrow)` allocating through the runtime's
+// allocator and freeing through ours, which AddressSanitizer correctly reports
+// as an alloc/dealloc mismatch — in Mesa's shader compiler, of all places.
+void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
+    ++g_allocations;
+    return std::malloc(n ? n : 1);
+}
+void* operator new[](std::size_t n, const std::nothrow_t& t) noexcept {
+    return ::operator new(n, t);
+}
+void* operator new(std::size_t n, std::align_val_t a, const std::nothrow_t&) noexcept {
+    ++g_allocations;
+    const std::size_t align = static_cast<std::size_t>(a);
+#ifdef _WIN32
+    return _aligned_malloc(((n + align - 1) / align) * align, align);
+#else
+    return std::aligned_alloc(align, ((n + align - 1) / align) * align);
+#endif
+}
+void* operator new[](std::size_t n, std::align_val_t a,
+                     const std::nothrow_t& t) noexcept {
+    return ::operator new(n, a, t);
+}
 
 void operator delete(void* p) noexcept                    { std::free(p); }
 void operator delete[](void* p) noexcept                  { std::free(p); }
@@ -2459,4 +2497,579 @@ TEST_CASE("rotating about a screen point leaves that point's pixel under it") {
     CHECK(v.rotation == doctest::Approx(0.0));
     CHECK(toCanvasX(v, sx, sy) == doctest::Approx(cx).epsilon(1e-9));
     CHECK(toCanvasY(v, sx, sy) == doctest::Approx(cy).epsilon(1e-9));
+}
+
+// ------------------------------------------------------------- the GPU backend
+//
+// Every case here starts by asking for a backend and giving up quietly if
+// there is not one — that is the normal answer in the `engine` CI job, which
+// has no SDL3 and no graphics stack, and on any machine without a SPIR-V
+// device (D-025). "No GPU" is not a failure; a GPU that disagrees with the CPU
+// is (D-021).
+
+namespace {
+
+/// One device for the whole run. Creating a GPU device is expensive and these
+/// cases would otherwise pay for it a dozen times.
+std::unique_ptr<PaintBackend> g_gpu;
+bool g_gpuTried = false;
+bool g_gpuUsed  = false;
+
+PaintBackend* gpuForTests() {
+    if (!g_gpuTried) {
+        g_gpuTried = true;
+        std::string why;
+        g_gpu = makeGpuBackend(&why);
+        g_gpuUsed = g_gpu != nullptr;
+        MESSAGE("GPU backend: " << why);
+    }
+    return g_gpu.get();
+}
+
+/// Installs a backend as the process default for a scope, which is what the
+/// application's toggle does.
+///
+/// `PaintTarget::backend` steers the dab path only. Undo, saving and the layer
+/// operations all follow the process default, so a case about any of those has
+/// to set it — and a case that does not is testing a configuration nothing
+/// ships in.
+struct WithBackend {
+    explicit WithBackend(PaintBackend* backend) { setPaintBackend(backend); }
+    ~WithBackend() { setPaintBackend(nullptr); }
+    WithBackend(const WithBackend&) = delete;
+    WithBackend& operator=(const WithBackend&) = delete;
+};
+
+/// The biggest per-channel difference between two premultiplied buffers, and
+/// how many pixels differ at all. D-021 wants the GPU checked against the CPU
+/// pixel for pixel rather than by eye, and a single number hides which of the
+/// two failure shapes it is: a handful of one-off edge pixels is rounding, a
+/// large fraction differing is a wrong formula.
+struct Divergence {
+    int         maxChannel = 0;
+    std::size_t pixels     = 0;
+};
+
+Divergence compare(const std::vector<PremulRgba8>& a, const std::vector<PremulRgba8>& b) {
+    Divergence d;
+    REQUIRE(a.size() == b.size());
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const int dr = std::abs(int{a[i].r} - int{b[i].r});
+        const int dg = std::abs(int{a[i].g} - int{b[i].g});
+        const int db = std::abs(int{a[i].b} - int{b[i].b});
+        const int da = std::abs(int{a[i].a} - int{b[i].a});
+        const int worst = std::max({dr, dg, db, da});
+        if (worst > 0) ++d.pixels;
+        d.maxChannel = std::max(d.maxChannel, worst);
+    }
+    return d;
+}
+
+/// A document that exercises everything `compositeLevel` can do: every blend
+/// mode, fractional opacity, a clipping group, and a folder.
+Document layeredDocument(std::int32_t size, int rasterLayers) {
+    Document doc = makeDocument(size, size, StraightRgba8{240, 230, 220, 255});
+    std::uint32_t seed = 12345;
+    const auto rnd = [&seed](std::uint32_t n) {
+        seed = seed * 1664525u + 1013904223u;
+        return (seed >> 16) % n;
+    };
+
+    for (int i = 0; i < rasterLayers; ++i) {
+        Layer& layer = doc.addLayer("layer " + std::to_string(i));
+        layer.blend   = ALL_BLEND_MODES[static_cast<std::size_t>(i) % ALL_BLEND_MODES.size()];
+        layer.opacity = 0.35f + static_cast<float>(i % 5) * 0.15f;
+        // Every third layer clips to the one below it, and one is hidden.
+        layer.clipToBelow = (i % 3) == 2;
+        layer.visible     = i != 4;
+
+        // Sparse on purpose: a layer with no tile at a key still has to
+        // publish a zero clip mask, which is the easiest thing to get wrong.
+        for (std::int32_t ty = 0; ty <= tileIndex(size - 1); ++ty) {
+            for (std::int32_t tx = 0; tx <= tileIndex(size - 1); ++tx) {
+                if (rnd(4) == 0) continue;
+                Tile& tile = layer.tileFor(TileKey{tx, ty});
+                PremulRgba8* px = tile.pixels();
+                for (int p = 0; p < TILE_PIXELS; ++p) {
+                    const auto a = static_cast<std::uint8_t>(rnd(256));
+                    px[p] = StraightRgba8{static_cast<std::uint8_t>(rnd(256)),
+                                          static_cast<std::uint8_t>(rnd(256)),
+                                          static_cast<std::uint8_t>(rnd(256)),
+                                          a}
+                                .premultiply();
+                }
+            }
+        }
+    }
+    return doc;
+}
+
+}  // namespace
+
+TEST_CASE("the GPU composites what the CPU composites") {
+    PaintBackend* gpu = gpuForTests();
+    if (gpu == nullptr) return;
+
+    Document doc = layeredDocument(512, 8);
+
+    // A folder, holding the top two layers, with its own blend and opacity —
+    // the recursive case, which the shader replays off a stack.
+    Layer& folder = doc.addLayer("group");
+    folder.kind    = LayerKind::Folder;
+    folder.blend   = BlendMode::Multiply;
+    folder.opacity = 0.7f;
+    const LayerId folderId = folder.id;
+    for (std::size_t i = doc.layers.size() - 3; i + 1 < doc.layers.size(); ++i)
+        doc.layers[i].parent = folderId;
+
+    const auto cpu = cpuBackend().compositeRect(doc, 0, 0, doc.width, doc.height);
+    const auto dev = gpu->compositeRect(doc, 0, 0, doc.width, doc.height);
+    const Divergence d = compare(cpu, dev);
+
+    MESSAGE("composite divergence: max channel " << d.maxChannel << ", "
+            << d.pixels << " of " << cpu.size() << " pixels differ");
+    // One level is invisible on screen and obvious in a diff, which D-021 says
+    // is the wrong way round for a mistake to behave — so it is bounded, not
+    // waved through. Anything above this is a formula that disagrees.
+    CHECK(d.maxChannel <= 1);
+}
+
+TEST_CASE("every blend mode agrees on its own") {
+    // One layer at a time, so a wrong formula cannot hide behind the
+    // accumulated rounding of a tall stack. This is the case that pins each
+    // W3C function down; the stacked ones below bound the drift.
+    PaintBackend* gpu = gpuForTests();
+    if (gpu == nullptr) return;
+
+    for (const BlendMode mode : ALL_BLEND_MODES) {
+        Document doc = layeredDocument(256, 1);
+        doc.layers.back().blend       = mode;
+        doc.layers.back().opacity     = 0.8f;
+        doc.layers.back().clipToBelow = false;
+        doc.layers.back().visible     = true;
+        const Divergence d = compare(cpuBackend().compositeRect(doc, 0, 0, 256, 256),
+                                     gpu->compositeRect(doc, 0, 0, 256, 256));
+        INFO("blend mode ", blendModeName(mode));
+        CHECK(d.maxChannel <= 1);
+    }
+}
+
+TEST_CASE("a document too big for the arena still composites correctly") {
+    // 12 layers of 2048 x 2048 is around 768 tiles against 512 slots, so this
+    // runs the eviction path and the chunk sizing that stops a chunk from
+    // evicting its own inputs. Getting either wrong puts a whole 65'536-pixel
+    // tile of the wrong layer on screen, so the check is on the RATE of
+    // disagreement rather than its size: a fraction of a percent is the
+    // rounding drift below, and anything structural is orders above it.
+    PaintBackend* gpu = gpuForTests();
+    if (gpu == nullptr) return;
+
+    const auto rate = [gpu](std::int32_t size) {
+        Document doc = layeredDocument(size, 12);
+        const Divergence d = compare(cpuBackend().compositeRect(doc, 0, 0, size, size),
+                                     gpu->compositeRect(doc, 0, 0, size, size));
+        MESSAGE("12 layers at " << size << "x" << size << ": max channel "
+                << d.maxChannel << ", " << d.pixels << " of "
+                << static_cast<std::size_t>(size) * size << " pixels differ");
+        return static_cast<double>(d.pixels) /
+               (static_cast<double>(size) * static_cast<double>(size));
+    };
+
+    const double fits = rate(1024);          // 192 tiles: inside the arena
+    const double spills = rate(2048);        // 768 tiles: eviction and re-upload
+    CHECK(fits < 0.001);
+    // The same picture at four times the area, so the same proportion of
+    // pixels should drift. A tile served from the wrong slot would not be
+    // subtle about it.
+    CHECK(spills < std::max(fits * 3.0, 0.001));
+}
+
+TEST_CASE("the GPU composites an off-canvas rectangle the way the CPU does") {
+    PaintBackend* gpu = gpuForTests();
+    if (gpu == nullptr) return;
+
+    Document doc = layeredDocument(300, 3);
+    // Straddling two edges: the padding outside the canvas must stay
+    // transparent rather than picking up the background.
+    for (const auto& [x, y, w, h] : std::vector<std::array<std::int32_t, 4>>{
+             {{-64, -64, 256, 256}}, {{200, 200, 256, 256}}, {{0, 0, 1, 1}}}) {
+        const Divergence d = compare(cpuBackend().compositeRect(doc, x, y, w, h),
+                                     gpu->compositeRect(doc, x, y, w, h));
+        CHECK(d.maxChannel <= 1);
+    }
+}
+
+TEST_CASE("the GPU picks the colour its own compositor shows") {
+    PaintBackend* gpu = gpuForTests();
+    if (gpu == nullptr) return;
+
+    Document doc = layeredDocument(300, 4);
+    const auto composited = gpu->compositeRect(doc, 0, 0, doc.width, doc.height);
+    for (const auto& [x, y] : std::vector<std::pair<std::int32_t, std::int32_t>>{
+             {0, 0}, {17, 200}, {299, 299}, {128, 64}}) {
+        const StraightRgba8 picked = gpu->pickColour(doc, x, y);
+        const StraightRgba8 shown =
+            composited[static_cast<std::size_t>(y) * doc.width + x].unpremultiply();
+        CHECK(picked == shown);
+    }
+}
+
+TEST_CASE("a stroke painted on the GPU matches the same stroke on the CPU") {
+    PaintBackend* gpu = gpuForTests();
+    if (gpu == nullptr) return;
+
+    const auto paint = [](Document& doc, PaintBackend* backend, const BrushPreset& p,
+                          StraightRgba8 colour) {
+        Layer* layer = doc.active();
+        Stroke s;
+        std::vector<Dab> scratch;
+        beginStroke(s, p, colour, layer->id);
+        PaintTarget t{*layer, s.pending, s.touched, doc.width, doc.height,
+                      nullptr, backend};
+        for (int i = 0; i < 120; ++i)
+            paintSample(s, t, at(30.0 + i * 2.0, 60.0 + std::sin(i * 0.15) * 40.0,
+                                 0.3f + static_cast<float>(i % 7) * 0.1f),
+                        scratch);
+        doc.undo.push(std::move(s.pending));
+    };
+
+    for (const BrushPreset& preset : {defaultPencil(), defaultAirbrush(), defaultOpaque()}) {
+        Document host = makeDocument(512, 256, StraightRgba8{255, 255, 255, 255});
+        Document dev  = makeDocument(512, 256, StraightRgba8{255, 255, 255, 255});
+        paint(host, &cpuBackend(), preset, StraightRgba8{20, 60, 200, 200});
+        paint(dev, gpu, preset, StraightRgba8{20, 60, 200, 200});
+
+        // The autosave hand-off contract: the host copy is only the truth
+        // again once readback has returned (#12).
+        REQUIRE(gpu->readback(dev).has_value());
+
+        const Divergence d =
+            compare(cpuBackend().compositeRect(host, 0, 0, 512, 256),
+                    cpuBackend().compositeRect(dev, 0, 0, 512, 256));
+        MESSAGE("dab divergence (" << preset.id << "): max channel " << d.maxChannel
+                << ", " << d.pixels << " pixels differ");
+        // Looser than compositing on purpose. The CPU measures the distance
+        // from a dab's centre in double and the shader in float, so a pixel
+        // whose coverage lands within an ULP of a rounding boundary tips the
+        // other way. That is a fringe pixel of an anti-aliased edge.
+        CHECK(d.maxChannel <= 2);
+    }
+}
+
+TEST_CASE("erasing and preserve-opacity agree between the backends") {
+    PaintBackend* gpu = gpuForTests();
+    if (gpu == nullptr) return;
+
+    const auto run = [](PaintBackend* backend) {
+        Document doc = makeDocument(256, 256, StraightRgba8{255, 255, 255, 255});
+        Layer* layer = doc.active();
+        std::vector<Dab> scratch;
+
+        Stroke ink;
+        beginStroke(ink, defaultOpaque(), StraightRgba8{200, 30, 30, 255}, layer->id);
+        PaintTarget t{*layer, ink.pending, ink.touched, doc.width, doc.height,
+                      nullptr, backend};
+        for (int i = 0; i < 40; ++i) paintSample(ink, t, at(40.0 + i * 4.0, 128.0), scratch);
+        doc.undo.push(std::move(ink.pending));
+
+        layer->preserveOpacity = true;
+        Stroke over;
+        beginStroke(over, defaultAirbrush(), StraightRgba8{10, 10, 220, 180}, layer->id);
+        PaintTarget t2{*layer, over.pending, over.touched, doc.width, doc.height,
+                       nullptr, backend};
+        for (int i = 0; i < 40; ++i) paintSample(over, t2, at(40.0 + i * 4.0, 132.0), scratch);
+        doc.undo.push(std::move(over.pending));
+
+        layer->preserveOpacity = false;
+        BrushPreset rubber = defaultEraser();
+        rubber.size = 30.0f;
+        Stroke out;
+        beginStroke(out, rubber, StraightRgba8{0, 0, 0, 200}, layer->id);
+        PaintTarget t3{*layer, out.pending, out.touched, doc.width, doc.height,
+                       nullptr, backend};
+        for (int i = 0; i < 20; ++i) paintSample(out, t3, at(60.0 + i * 6.0, 128.0), scratch);
+        doc.undo.push(std::move(out.pending));
+        return doc;
+    };
+
+    Document host = run(&cpuBackend());
+    Document dev  = run(gpu);
+    REQUIRE(gpu->readback(dev).has_value());
+    const Divergence d = compare(cpuBackend().compositeRect(host, 0, 0, 256, 256),
+                                 cpuBackend().compositeRect(dev, 0, 0, 256, 256));
+    MESSAGE("erase/preserve divergence: max channel " << d.maxChannel);
+    CHECK(d.maxChannel <= 2);
+}
+
+TEST_CASE("undo in GPU mode restores the canvas the CPU would have restored") {
+    // #12: undo works identically in both modes. The interesting part is that
+    // UndoStack knows nothing about the backend — it swaps host tiles — so
+    // this also checks the device copy notices it has been overtaken.
+    PaintBackend* gpu = gpuForTests();
+    if (gpu == nullptr) return;
+    const WithBackend installed(gpu);
+
+    Document doc = makeDocument(256, 256, StraightRgba8{255, 255, 255, 255});
+    Layer* layer = doc.active();
+    std::vector<Dab> scratch;
+
+    const auto blank = gpu->compositeRect(doc, 0, 0, 256, 256);
+
+    Stroke s;
+    beginStroke(s, defaultOpaque(), StraightRgba8{0, 0, 0, 255}, layer->id);
+    PaintTarget t{*layer, s.pending, s.touched, doc.width, doc.height, nullptr, gpu};
+    for (int i = 0; i < 60; ++i) paintSample(s, t, at(20.0 + i * 3.0, 120.0), scratch);
+    doc.undo.push(std::move(s.pending));
+
+    const auto drawn = gpu->compositeRect(doc, 0, 0, 256, 256);
+    CHECK(compare(blank, drawn).pixels > 0);
+
+    doc.undo.undo(doc);
+    CHECK(compare(blank, gpu->compositeRect(doc, 0, 0, 256, 256)).maxChannel == 0);
+    doc.undo.redo(doc);
+    CHECK(compare(drawn, gpu->compositeRect(doc, 0, 0, 256, 256)).maxChannel == 0);
+
+    // A second stroke over the first, so its snapshots have something to hold.
+    // Snapshots live on the host in GPU mode (#12's deliberate choice), so the
+    // budget the status bar reports is still counting the memory it names —
+    // one host tile per touched tile, and nothing hidden in VRAM.
+    Stroke again;
+    beginStroke(again, defaultOpaque(), StraightRgba8{200, 0, 0, 255}, layer->id);
+    PaintTarget t2{*layer, again.pending, again.touched, doc.width, doc.height,
+                   nullptr, gpu};
+    for (int i = 0; i < 20; ++i) paintSample(again, t2, at(30.0 + i * 3.0, 120.0), scratch);
+    const std::size_t touched = again.touched.size();
+    doc.undo.push(std::move(again.pending));
+    CHECK(touched >= 1);
+    CHECK(doc.undo.memoryBytes() >= touched * TILE_BYTES);
+    CHECK(doc.undo.memoryBytes() <= (touched + 1) * TILE_BYTES + 4096);
+}
+
+TEST_CASE("the autosave clone gets the pixels the GPU painted") {
+    // maybeAutosave calls readback() and then cloneDocument() on the main
+    // thread, and hands the clone to a worker with no device context (#12).
+    PaintBackend* gpu = gpuForTests();
+    if (gpu == nullptr) return;
+
+    Document doc = makeDocument(256, 256, StraightRgba8{255, 255, 255, 255});
+    Layer* layer = doc.active();
+    Stroke s;
+    std::vector<Dab> scratch;
+    beginStroke(s, defaultOpaque(), StraightRgba8{0, 0, 0, 255}, layer->id);
+    PaintTarget t{*layer, s.pending, s.touched, doc.width, doc.height, nullptr, gpu};
+    for (int i = 0; i < 40; ++i) paintSample(s, t, at(40.0 + i * 4.0, 100.0), scratch);
+    doc.undo.push(std::move(s.pending));
+
+    REQUIRE(gpu->readback(doc).has_value());
+    const Document clone = cloneDocument(doc);
+
+    // The worker's copy composites through the CPU backend by name, exactly as
+    // encodeThumbnail does, and must see the stroke.
+    const auto worker = cpuBackend().compositeRect(clone, 0, 0, 256, 256);
+    const auto live   = cpuBackend().compositeRect(doc, 0, 0, 256, 256);
+    CHECK(compare(worker, live).maxChannel == 0);
+    CHECK(compare(worker, cpuBackend().compositeRect(
+                              makeDocument(256, 256, StraightRgba8{255, 255, 255, 255}),
+                              0, 0, 256, 256))
+              .pixels > 0);
+}
+
+TEST_CASE("saving and duplicating in GPU mode carry the painted pixels") {
+    // The other host-tile readers: the project writer encodes Tile::pixels()
+    // straight into PNGs, and duplicateLayer clones them. Neither goes through
+    // the backend, so both have to ask for the pixels back first (D-025).
+    PaintBackend* gpu = gpuForTests();
+    if (gpu == nullptr) return;
+    const WithBackend installed(gpu);
+
+    Document doc = makeDocument(256, 256, StraightRgba8{255, 255, 255, 255});
+    Layer* layer = doc.active();
+    std::vector<Dab> scratch;
+    Stroke s;
+    beginStroke(s, defaultOpaque(), StraightRgba8{0, 0, 0, 255}, layer->id);
+    PaintTarget t{*layer, s.pending, s.touched, doc.width, doc.height, nullptr, gpu};
+    for (int i = 0; i < 40; ++i) paintSample(s, t, at(40.0 + i * 4.0, 100.0), scratch);
+    doc.undo.push(std::move(s.pending));
+
+    const LayerId original = layer->id;
+    UndoRecord dup = duplicateLayer(doc, original);
+    REQUIRE(!dup.empty());
+    const Layer* source = doc.layerById(original);
+    const Layer* copy   = doc.active();
+    REQUIRE(copy != nullptr);
+    REQUIRE(copy->id != original);
+    REQUIRE(copy->tiles.size() == source->tiles.size());
+    for (const auto& [key, tile] : source->tiles) {
+        const Tile* other = copy->find(key);
+        REQUIRE(other != nullptr);
+        CHECK(std::memcmp(tile.pixels(), other->pixels(), TILE_BYTES) == 0);
+    }
+    // Not blank: a duplicate of nothing would pass the comparison above.
+    CHECK(!source->tiles.begin()->second.isFullyTransparent());
+
+    const auto file = scratchFile("gpu_roundtrip.sable");
+    REQUIRE(exportDocument(doc, file).has_value());
+    const auto reloaded = importDocument(file);
+    REQUIRE(reloaded.has_value());
+    CHECK(compare(cpuBackend().compositeRect(*reloaded, 0, 0, 256, 256),
+                  cpuBackend().compositeRect(doc, 0, 0, 256, 256))
+              .maxChannel == 0);
+    std::error_code ec;
+    std::filesystem::remove(file, ec);
+}
+
+TEST_CASE("a bucket fill in GPU mode fills the region the GPU composited") {
+    PaintBackend* gpu = gpuForTests();
+    if (gpu == nullptr) return;
+
+    const auto run = [](PaintBackend* backend) {
+        Document doc = makeDocument(256, 256, StraightRgba8{255, 255, 255, 255});
+        Layer* layer = doc.active();
+        std::vector<Dab> scratch;
+        BrushPreset p = defaultOpaque();
+        p.size = 12.0f;
+        Stroke s;
+        beginStroke(s, p, StraightRgba8{0, 0, 0, 255}, layer->id);
+        PaintTarget t{*layer, s.pending, s.touched, doc.width, doc.height,
+                      nullptr, backend};
+        for (int i = 0; i < 60; ++i) paintSample(s, t, at(128.0, 10.0 + i * 4.0), scratch);
+        doc.undo.push(std::move(s.pending));
+
+        UndoRecord rec = backend->bucketFill(doc, layer->id, 20, 20,
+                                             StraightRgba8{0, 200, 0, 255}, 16);
+        doc.undo.push(std::move(rec));
+        return doc;
+    };
+
+    Document host = run(&cpuBackend());
+    Document dev  = run(gpu);
+    REQUIRE(gpu->readback(dev).has_value());
+    const Divergence d = compare(cpuBackend().compositeRect(host, 0, 0, 256, 256),
+                                 cpuBackend().compositeRect(dev, 0, 0, 256, 256));
+    MESSAGE("bucket fill divergence: max channel " << d.maxChannel << ", "
+            << d.pixels << " pixels differ");
+    CHECK(d.maxChannel <= 2);
+}
+
+TEST_CASE("GPU against CPU on a large canvas with many layers"
+          * doctest::skip()) {
+    // The measurement #13 asks for. Skipped by default because it is a
+    // benchmark and not an assertion — run it with:
+    //   ./build/engine_tests --no-skip -tc="GPU against CPU*" -s
+    PaintBackend* gpu = gpuForTests();
+    if (gpu == nullptr) return;
+
+    for (const int layers : {1, 4, 8, 16}) {
+        Document doc = layeredDocument(2048, layers);
+
+        const auto time = [&doc](PaintBackend& backend, int reps) {
+            const auto start = std::chrono::steady_clock::now();
+            std::size_t sink = 0;
+            for (int i = 0; i < reps; ++i)
+                sink += backend.compositeRect(doc, 0, 0, doc.width, doc.height).size();
+            const auto end = std::chrono::steady_clock::now();
+            REQUIRE(sink > 0);
+            return std::chrono::duration<double, std::milli>(end - start).count() / reps;
+        };
+
+        (void)time(*gpu, 1);                 // warm the arena, not the clock
+        const double cpuMs = time(cpuBackend(), 3);
+        const double gpuMs = time(*gpu, 3);
+        MESSAGE("2048x2048, " << layers << " layers: CPU " << cpuMs << " ms, GPU "
+                << gpuMs << " ms, speedup " << (cpuMs / gpuMs) << "x");
+    }
+
+    const auto clock = [](auto&& fn) {
+        const auto start = std::chrono::steady_clock::now();
+        fn();
+        return std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - start).count();
+    };
+
+    // Dabs on their own: 600 samples of a big soft brush, which is the shape
+    // that costs the CPU the most per dab.
+    for (PaintBackend* backend :
+         std::array<PaintBackend*, 2>{&cpuBackend(), gpu}) {
+        Document paper = makeDocument(2048, 2048, StraightRgba8{255, 255, 255, 255});
+        Layer* layer = paper.active();
+        BrushPreset p = defaultAirbrush();
+        p.size = 200.0f;
+        Stroke s;
+        std::vector<Dab> scratch;
+        scratch.reserve(1024);
+        beginStroke(s, p, StraightRgba8{0, 0, 0, 200}, layer->id);
+        PaintTarget t{*layer, s.pending, s.touched, paper.width, paper.height,
+                      nullptr, backend};
+        const double ms = clock([&] {
+            for (int i = 0; i < 600; ++i)
+                paintSample(s, t, at(200.0 + i * 2.5, 1024.0 + std::sin(i * 0.05) * 400.0),
+                            scratch);
+            (void)backend->readback(paper);   // the work is not done until it lands
+        });
+        MESSAGE("600 airbrush samples on 2048x2048 (" << backend->name() << "): "
+                << ms << " ms");
+    }
+
+    // The click-frequency paths #12 asks to be measured rather than assumed.
+    Document doc = layeredDocument(2048, 8);
+    (void)gpu->compositeRect(doc, 0, 0, doc.width, doc.height);
+    MESSAGE("pickColour: " << clock([&] { (void)gpu->pickColour(doc, 1000, 1000); })
+            << " ms");
+    MESSAGE("readback with nothing painted: "
+            << clock([&] { (void)gpu->readback(doc); }) << " ms");
+    MESSAGE("bucketFill: " << clock([&] {
+        UndoRecord rec = gpu->bucketFill(doc, doc.layers.back().id, 5, 5,
+                                         StraightRgba8{0, 0, 0, 255}, 200);
+        (void)rec;
+    }) << " ms");
+
+    // The CPU reference on the same fill, which is also the check on
+    // `Tile::stamp()`: it is a global increment inside `setPixel`, so a
+    // four-million-pixel flood fill is where it would show up if anywhere.
+    MESSAGE("bucketFill on the CPU: " << clock([&] {
+        Document plain = layeredDocument(2048, 8);
+        UndoRecord rec = cpuBackend().bucketFill(plain, plain.layers.back().id, 5, 5,
+                                                 StraightRgba8{0, 0, 0, 255}, 200);
+        (void)rec;
+    }) << " ms");
+
+    // The autosave pause: a stroke's worth of tiles coming back to the host,
+    // which is what maybeAutosave pays on the main thread before the hand-off.
+    {
+        Layer* layer = doc.active();
+        Stroke s;
+        std::vector<Dab> scratch;
+        BrushPreset p = defaultAirbrush();
+        p.size = 300.0f;
+        beginStroke(s, p, StraightRgba8{0, 0, 0, 200}, layer->id);
+        PaintTarget t{*layer, s.pending, s.touched, doc.width, doc.height, nullptr, gpu};
+        for (int i = 0; i < 200; ++i) paintSample(s, t, at(300.0 + i * 6.0, 900.0), scratch);
+        MESSAGE("readback of " << s.touched.size() << " painted tiles: "
+                << clock([&] { (void)gpu->readback(doc); }) << " ms");
+    }
+}
+
+/// LeakSanitizer asks this at exit, not at startup, so the answer can depend
+/// on whether a GPU device was actually created.
+///
+/// Creating one dlopen()s a Vulkan driver, which allocates about 50 KB of
+/// process-wide state and never frees it. The stacks are inside a shared
+/// object that has since been unloaded, so a suppression cannot even name
+/// them. Leak checking therefore stops for a run that touched a driver, and
+/// stays on for every run that did not — which includes the CI sanitizer job,
+/// where the engine is built without SDL3 at all. The engine's own leak
+/// coverage is unchanged; it is the driver's that is beyond reach.
+extern "C" int __lsan_is_turned_off() { return g_gpuUsed ? 1 : 0; }
+
+int main(int argc, char** argv) {
+    doctest::Context context(argc, argv);
+    const int failed = context.run();
+    // Before LeakSanitizer's exit check. Everything the driver hangs off a GPU
+    // device stays allocated until the device is destroyed, and a static
+    // destructor runs too late to be seen as anything but a leak.
+    g_gpu.reset();
+#ifdef SABLE_HAVE_GPU
+    SDL_Quit();      // the subsystem globals go here, not in QuitSubSystem
+#endif
+    return failed;
 }

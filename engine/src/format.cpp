@@ -7,6 +7,7 @@
 
 #include "miniz.h"
 #include "miniz_zip.h"
+#include "sbl/backend.hpp"
 #include "sbl/project.hpp"
 
 namespace sbl {
@@ -136,6 +137,14 @@ std::expected<void, Error> exportDocument(const Document& doc,
         return fail(ErrorKind::Malformed,
                     "Sable cannot write " + path.string() +
                     ". It writes " + extensionList(FormatUse::Write) + ".");
+
+    // The project writer encodes `Tile::pixels()` directly, so the host copy
+    // has to be the truth first (D-025). Here rather than in `saveProject`,
+    // because the autosave worker calls that one on a thread with no device
+    // context — and it has already read back before handing over its clone.
+    if (const auto ready = paintBackend().readback(doc); !ready.has_value())
+        return std::unexpected(ready.error());
+
     return format->write(doc, path);
 }
 

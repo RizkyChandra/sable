@@ -1,0 +1,104 @@
+// One tile of the composited canvas, on the GPU (#13).
+//
+// This is `compositeLevel` in engine/src/io.cpp with the recursion turned into
+// a stack, because GLSL has none. The host walks the layer tree and hands the
+// walk over as a flat op list; the shader replays it per pixel.
+//
+// Regenerate the SPIR-V beside this file with:
+//   glslc -O --target-env=vulkan1.0 -o composite.comp.spv composite.comp
+//   xxd -i composite.comp.spv > composite.spv.h        (see spirv.h for the shape)
+// engine/src/shaders/build.sh does both, for both shaders.
+#version 450
+
+#include "sable.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// SPIR-V binding order is SDL_GPU's, from SDL_CreateGPUComputePipeline:
+// set 0 read-only storage, set 1 read-write storage, set 2 uniforms.
+layout(std430, set = 0, binding = 0) readonly buffer Arena  { uint arena[]; };
+layout(std430, set = 1, binding = 0) writeonly buffer Dest { uint dest[]; };
+
+const uint kNoSlot = 0xFFFFFFFFu;
+
+// Deeper nesting than this falls back to the CPU compositor on the host. The
+// arrays below are dynamically indexed, so every extra level costs private
+// memory in all 256 threads of the group whether the document uses it or not.
+const int kMaxDepth = 4;
+const int kMaxOps   = 192;
+
+// ops[i]: x = kind, y = arena slot (kNoSlot for a layer with no tile here),
+//         z = blend mode | clipToBelow << 8, w = float bits of opacity.
+// kind: 0 draw a layer, 1 open a folder, 2 close one, 3 drop the clip mask.
+layout(std140, set = 2, binding = 0) uniform Params {
+    uvec4 head;    // x: op count, y: destination slot, z: packed background
+    ivec4 rect;    // x,y: tile origin in canvas pixels; z,w: canvas size
+    uvec4 ops[kMaxOps];
+} P;
+
+void main() {
+    ivec2 lp = ivec2(gl_GlobalInvocationID.xy);
+    uint pix = uint(lp.y) * 256u + uint(lp.x);
+    ivec2 canvasPos = ivec2(P.rect.x + lp.x, P.rect.y + lp.y);
+
+    // Outside the document stays transparent so an edge tile does not paint
+    // background past the canvas bounds — CpuBackend::compositeRect, verbatim.
+    bool inside = canvasPos.x >= 0 && canvasPos.y >= 0 &&
+                  canvasPos.x < P.rect.z && canvasPos.y < P.rect.w;
+    uvec4 dst = inside ? unpackRgba(P.head.z) : uvec4(0u);
+
+    uvec4 stackDst[kMaxDepth];
+    uint  stackClip[kMaxDepth];
+    int   sp = 0;
+    // 0xFFFFFFFF is "no clip mask yet", which is `clipMask.empty()` on the CPU.
+    uint clipA = kNoSlot;
+
+    uint opCount = min(P.head.x, uint(kMaxOps));
+    for (uint i = 0u; i < opCount; ++i) {
+        uvec4 op = P.ops[i];
+
+        if (op.x == 1u) {                       // open a folder
+            stackDst[sp]  = dst;
+            stackClip[sp] = clipA;
+            ++sp;
+            dst   = uvec4(0u);                  // a group starts transparent
+            clipA = kNoSlot;
+            continue;
+        }
+        if (op.x == 3u) {                       // an invisible layer clears it
+            clipA = kNoSlot;
+            continue;
+        }
+
+        uvec4 src;
+        if (op.x == 2u) {                       // close a folder
+            src = dst;                          // what the group composited to
+            --sp;
+            dst   = stackDst[sp];
+            clipA = stackClip[sp];              // the enclosing level's mask
+        } else {
+            src = op.y == kNoSlot ? uvec4(0u)
+                                  : unpackRgba(arena[op.y * 65536u + pix]);
+        }
+
+        uint mode        = op.z & 255u;
+        bool clipToBelow = ((op.z >> 8u) & 1u) != 0u;
+        bool clipped     = clipToBelow && clipA != kNoSlot;
+        float opacity    = uintBitsToFloat(op.w);
+        uint own         = src.w;               // read before opacity scaling
+
+        if (src.w != 0u) {
+            float scale = opacity;
+            if (clipped) scale *= float(clipA) / 255.0;
+            if (scale > 0.0) {
+                if (scale < 1.0) src = scale8v(src, scale);
+                dst = blendOverMode(mode, src, dst);
+            }
+        }
+        // A layer with no tile here still publishes a zero mask, which is what
+        // makes a clipped layer above it invisible rather than unclipped.
+        if (!clipToBelow) clipA = own;
+    }
+
+    dest[P.head.y * 65536u + pix] = packRgba(dst);
+}
