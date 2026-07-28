@@ -79,6 +79,11 @@ struct NewCanvasForm {
     int  width  = kDefaultCanvas;
     int  height = kDefaultCanvas;
     bool transparent = false;
+    /// D-023. Off by default and not remembered between documents: it doubles
+    /// the memory and halves the undo history, so it should be a thing the
+    /// artist chooses for a drawing rather than a setting they turned on once
+    /// and stopped seeing.
+    bool wideColour = false;
 };
 
 /// SDL delivers axis changes and motion as SEPARATE events. There is no single
@@ -465,6 +470,18 @@ void showError(App& app, const sbl::Error& error);
 /// painting, and swapping it out from under that would drop them.
 void applyGpuMode(App& app) {
     if (app.painting) return;
+
+    // D-023, #21: the GPU backend is 8-bit RGBA end to end and declines a
+    // 16-bit document tile by tile. It would still be CORRECT — every declined
+    // operation lands on the CPU — but the artist would be looking at a ticked
+    // menu item, a status bar reading "GPU", and CPU performance. Say it
+    // instead, once, and untick the box.
+    if (app.useGpu && app.doc.depth != sbl::ColourDepth::Bits8) {
+        app.useGpu = false;
+        app.notices = {"Staying on the CPU: this document is 16-bit, and the "
+                       "GPU backend paints 8-bit only."};
+    }
+
     if (app.useGpu && app.gpu == nullptr) {
         app.gpu = sbl::makeGpuBackend(&app.gpuWhy);
         if (app.gpu == nullptr) {
@@ -486,7 +503,8 @@ void applyGpuMode(App& app) {
     if (app.canvas != nullptr) app.canvas->markAllDirty();
 }
 
-void resetDocument(App& app, std::int32_t w, std::int32_t h, bool transparent) {
+void resetDocument(App& app, std::int32_t w, std::int32_t h, bool transparent,
+                   sbl::ColourDepth depth = sbl::ColourDepth::Bits8) {
     // Nothing may outlive the document it was editing — an import warning
     // included, since it describes a document that no longer exists.
     app.text.finish(app.window, app.doc);
@@ -494,7 +512,12 @@ void resetDocument(App& app, std::int32_t w, std::int32_t h, bool transparent) {
     app.canvas->releaseAll();
     app.doc = sbl::makeDocument(
         w, h, transparent ? sbl::StraightRgba8{0, 0, 0, 0}
-                          : sbl::StraightRgba8{255, 255, 255, 255});
+                          : sbl::StraightRgba8{255, 255, 255, 255},
+        depth);
+    // The GPU cannot paint 16-bit tiles yet, so a new 16-bit document has to
+    // put the toggle back where the artist can see it rather than leave the
+    // View menu ticked over a backend that is silently declining every dab.
+    applyGpuMode(app);
     applyUndoBudget(app);
     centreSymmetry(app);
     fitToViewport(app.view, app.doc, app.viewport);
@@ -580,6 +603,7 @@ void doOpenDocument(App& app, const std::filesystem::path& path) {
     app.notices = app.doc.warnings;
     for (const std::string& warning : app.notices)
         SDL_Log("%s: %s", path.filename().string().c_str(), warning.c_str());
+    applyGpuMode(app);         // a 16-bit file arriving turns the GPU back off
     applyUndoBudget(app);
     centreSymmetry(app);
     fitToViewport(app.view, app.doc, app.viewport);
@@ -2302,6 +2326,15 @@ void drawStatusBar(const App& app, float windowW, float windowH, float height) {
         // difference that matters when the answer is "not what you ticked".
         ImGui::SameLine();
         ImGui::TextDisabled("   %s", app.useGpu ? "GPU" : "CPU");
+        // D-023: shown only when it is not the default, because a permanent
+        // "8-bit" on the bar is noise on every document that never chose. When
+        // it IS 16-bit it explains the halved history the undo numbers beside
+        // it are about to report.
+        if (app.doc.depth != sbl::ColourDepth::Bits8) {
+            ImGui::SameLine();
+            const std::string_view name = sbl::depthName(app.doc.depth);
+            ImGui::TextDisabled("   %.*s", static_cast<int>(name.size()), name.data());
+        }
         // Two memory numbers, because there are two memories. The undo budget
         // is host RAM and still counts exactly what it always counted (#12);
         // this is the other one, and leaving it off the bar would make the
@@ -2403,9 +2436,35 @@ void drawModals(App& app) {
         ImGui::RadioButton("Transparent", &background, 1);
         app.form.transparent = background == 1;
 
+        // D-023. Here and only here: a document's depth is fixed when it is
+        // made, because converting a painting's depth under the artist is a
+        // destructive edit and the downward direction throws away exactly what
+        // they turned it on for.
+        ImGui::Separator();
+        ImGui::Checkbox("16 bits per channel", &app.form.wideColour);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "Smoother build-up from stacked low-opacity passes — soft "
+                "shading and airbrush work.\n\nCosts double the memory per "
+                "tile, so the same undo budget holds about half the history, "
+                "and the GPU backend cannot paint it.\n\nCannot be changed "
+                "afterwards.");
+        }
+        const auto depth = app.form.wideColour ? sbl::ColourDepth::Bits16
+                                               : sbl::ColourDepth::Bits8;
+        // The cost, in the units the status bar and the Edit menu already use,
+        // rather than as a warning nobody reads.
+        ImGui::TextDisabled(
+            "%.0f MB per full layer at this size",
+            static_cast<double>(
+                static_cast<std::size_t>((app.form.width  + 255) / 256) *
+                static_cast<std::size_t>((app.form.height + 255) / 256) *
+                sbl::tileBytes(depth)) / (1024.0 * 1024.0));
+
         ImGui::Separator();
         if (ImGui::Button("Create", ImVec2(110, 0))) {
-            resetDocument(app, app.form.width, app.form.height, app.form.transparent);
+            resetDocument(app, app.form.width, app.form.height, app.form.transparent,
+                          depth);
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
@@ -3480,6 +3539,80 @@ int main(int argc, char** argv) {
             SDL_Log("selftest: no GPU backend here (%s); CPU only",
                     app.gpuWhy.c_str());
         }
+
+        // --- #21: a 16-bit document, through the application rather than the
+        // engine. The unit tests cover the maths; this covers the wiring the
+        // artist actually touches — the New-canvas checkbox, the paint path,
+        // Ctrl+S and reopening. Last, because it replaces the document every
+        // phase above was counting.
+        {
+            // Asked for, so that the decline is what turns it off rather than
+            // it having happened to be off already.
+            app.useGpu = true;
+            resetDocument(app, 512, 512, false, sbl::ColourDepth::Bits16);
+            if (app.doc.depth != sbl::ColourDepth::Bits16) {
+                SDL_Log("selftest FAILED: the new canvas is not 16-bit");
+                return 1;
+            }
+            if (app.useGpu) {
+                SDL_Log("selftest FAILED: the GPU stayed on for a 16-bit document");
+                return 1;
+            }
+
+            activeBrush(app) = sbl::defaultAirbrush();
+            app.foreground = sbl::StraightRgba8{30, 30, 30, 255};
+            // Stacked low-opacity passes: the workflow D-004 named as the cost
+            // it was accepting, driven through the real app paint path.
+            for (int pass = 0; pass < 12; ++pass) {
+                beginPaint(app);
+                for (int i = 0; i < 24; ++i) {
+                    const double cx = 120.0 + i * 8.0;
+                    sbl::InputSample sample =
+                        mouseSample(app, toScreenX(app.view, cx, 300.0),
+                                         toScreenY(app.view, cx, 300.0));
+                    sample.fromMouse = false;
+                    sample.pressure  = 0.8f;
+                    paintWith(app, sample);
+                }
+                endPaint(app);
+            }
+
+            const auto path = std::filesystem::temp_directory_path() /
+                              "sable_selftest_16bit.sable";
+            app.doc.path = path;
+            doSaveProject(app, path);
+            auto reopened = sbl::importDocument(path);
+            if (!reopened.has_value() ||
+                reopened->depth != sbl::ColourDepth::Bits16) {
+                SDL_Log("selftest FAILED: a 16-bit project did not reopen as 16-bit");
+                return 1;
+            }
+            // The pixels, not merely the manifest: a save that narrowed them
+            // would reload as a perfectly valid 16-bit document full of 8-bit
+            // values, which is the failure that looks like success.
+            const sbl::Tile* saved = app.doc.layers.front().find(sbl::TileKey{0, 1});
+            const sbl::Tile* back  = reopened->layers.front().find(sbl::TileKey{0, 1});
+            if (saved == nullptr || back == nullptr) {
+                SDL_Log("selftest FAILED: the 16-bit stroke wrote no tile");
+                return 1;
+            }
+            int worst16 = 0;
+            for (int y = 0; y < sbl::TILE_SIZE; y += 4)
+                for (int x = 0; x < sbl::TILE_SIZE; x += 4)
+                    worst16 = std::max(worst16,
+                                       std::abs(static_cast<int>(saved->pixel(x, y).a) -
+                                                static_cast<int>(back->pixel(x, y).a)));
+            if (worst16 > 4) {
+                SDL_Log("selftest FAILED: a 16-bit round trip moved alpha by %d",
+                        worst16);
+                return 1;
+            }
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+            SDL_Log("selftest: 16-bit canvas paints, saves and reopens "
+                    "(alpha within %d of 65535), GPU declined it", worst16);
+        }
+
         SDL_Log("selftest OK");
 
         // Exit before the settings write below. The self-test drives the app

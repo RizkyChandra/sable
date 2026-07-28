@@ -17,6 +17,14 @@ constexpr std::uint8_t mul255(std::uint32_t c, std::uint32_t a) noexcept {
     return static_cast<std::uint8_t>((t + (t >> 8)) >> 8);
 }
 
+/// The same trick one width up (D-023). 64-bit throughout: 65535 * 65535 does
+/// fit in 32 bits with the rounding term, but only just, and a proof nobody
+/// re-checks is not worth the register on a 64-bit target.
+constexpr std::uint16_t mul65535(std::uint64_t c, std::uint64_t a) noexcept {
+    const std::uint64_t t = c * a + 32768u;
+    return static_cast<std::uint16_t>((t + (t >> 16)) >> 16);
+}
+
 /// Makes `Tile::pixels()` the truth before host code moves tiles about.
 ///
 /// The layer operations below read and move pixels without going through the
@@ -58,6 +66,36 @@ PremulRgba8 over(PremulRgba8 src, PremulRgba8 dst) noexcept {
         static_cast<std::uint8_t>(src.g + mul255(dst.g, inv)),
         static_cast<std::uint8_t>(src.b + mul255(dst.b, inv)),
         static_cast<std::uint8_t>(src.a + mul255(dst.a, inv)),
+    };
+}
+
+StraightRgba16 PremulRgba16::unpremultiply() const noexcept {
+    if (a == 0)     return StraightRgba16{};
+    if (a == 65535) return StraightRgba16{r, g, b, 65535};
+    const auto up = [this](std::uint16_t c) noexcept -> std::uint16_t {
+        const std::uint64_t v = (static_cast<std::uint64_t>(c) * 65535u + a / 2u) / a;
+        return static_cast<std::uint16_t>(std::min<std::uint64_t>(v, 65535u));
+    };
+    return StraightRgba16{up(r), up(g), up(b), a};
+}
+
+PremulRgba16 StraightRgba16::premultiply() const noexcept {
+    if (a == 65535) return PremulRgba16{r, g, b, 65535};
+    return PremulRgba16{mul65535(r, a), mul65535(g, a), mul65535(b, a), a};
+}
+
+PremulRgba16 over(PremulRgba16 src, PremulRgba16 dst) noexcept {
+    if (src.a == 65535) return src;
+    if (src.a == 0)     return dst;
+    const std::uint32_t inv = 65535u - src.a;
+    // This is the whole of the banding fix: a low-opacity dab laid over the
+    // same pixel forty times rounds away 1/65535 of a step each time instead of
+    // 1/255, so the passes accumulate instead of quantising into a plateau.
+    return PremulRgba16{
+        static_cast<std::uint16_t>(src.r + mul65535(dst.r, inv)),
+        static_cast<std::uint16_t>(src.g + mul65535(dst.g, inv)),
+        static_cast<std::uint16_t>(src.b + mul65535(dst.b, inv)),
+        static_cast<std::uint16_t>(src.a + mul65535(dst.a, inv)),
     };
 }
 
@@ -174,22 +212,65 @@ PremulRgba8 blendOver(BlendMode mode, PremulRgba8 src, PremulRgba8 dst) noexcept
         static_cast<std::uint8_t>(std::lround(std::clamp(ao, 0.0f, 1.0f) * 255.0f))};
 }
 
+PremulRgba16 blendOver(BlendMode mode, PremulRgba16 src, PremulRgba16 dst) noexcept {
+    // Written out rather than shared with the 8-bit version through a template
+    // over the channel type — D-023 asks for the second implementation first
+    // and the generalisation only once there are two to generalise from. The
+    // part that actually carries the maths, `blendChannel`, IS shared: it is
+    // defined on 0..1 and has no channel width of its own.
+    if (mode == BlendMode::Normal) return over(src, dst);
+    if (src.a == 0) return dst;
+    if (dst.a == 0) return src;
+
+    const StraightRgba16 s = src.unpremultiply();
+    const StraightRgba16 b = dst.unpremultiply();
+    const float as = static_cast<float>(src.a) / 65535.0f;
+    const float ab = static_cast<float>(dst.a) / 65535.0f;
+
+    const auto channel = [&](std::uint16_t sc, std::uint16_t bc) -> std::uint16_t {
+        const float cs = static_cast<float>(sc) / 65535.0f;
+        const float cb = static_cast<float>(bc) / 65535.0f;
+        const float co = as * (1.0f - ab) * cs
+                       + as * ab * blendChannel(mode, cs, cb)
+                       + (1.0f - as) * ab * cb;
+        return static_cast<std::uint16_t>(
+            std::lround(std::clamp(co, 0.0f, 1.0f) * 65535.0f));
+    };
+
+    const float ao = as + ab * (1.0f - as);
+    return PremulRgba16{
+        channel(s.r, b.r), channel(s.g, b.g), channel(s.b, b.b),
+        static_cast<std::uint16_t>(std::lround(std::clamp(ao, 0.0f, 1.0f) * 65535.0f))};
+}
+
 // --------------------------------------------------------------------- tile
 
+Tile::Tile(ColourDepth depth) : depth_(depth), stamp_(++g_tileStamp) {
+    if (depth == ColourDepth::Bits16) px16_ = std::make_unique<PremulRgba16[]>(TILE_PIXELS);
+    else                              px8_  = std::make_unique<PremulRgba8[]>(TILE_PIXELS);
+}
+
 Tile Tile::clone() const {
-    Tile copy;
-    std::memcpy(copy.px_.get(), px_.get(), TILE_BYTES);
+    Tile copy(depth_);
+    if (px16_) std::memcpy(copy.px16_.get(), px16_.get(), byteSize());
+    else       std::memcpy(copy.px8_.get(),  px8_.get(),  byteSize());
     return copy;
 }
 
-void Tile::fill(PremulRgba8 c) noexcept {
+void Tile::fill(PremulRgba16 c) noexcept {
     stamp_ = ++g_tileStamp;
-    std::fill_n(px_.get(), TILE_PIXELS, c);
+    if (px16_) std::fill_n(px16_.get(), TILE_PIXELS, c);
+    else       std::fill_n(px8_.get(),  TILE_PIXELS, narrow(c));
 }
 
 bool Tile::isFullyTransparent() const noexcept {
+    if (px16_) {
+        for (int i = 0; i < TILE_PIXELS; ++i)
+            if (px16_[i].a != 0) return false;
+        return true;
+    }
     for (int i = 0; i < TILE_PIXELS; ++i)
-        if (px_[i].a != 0) return false;
+        if (px8_[i].a != 0) return false;
     return true;
 }
 
@@ -206,17 +287,21 @@ const Tile* Layer::find(TileKey k) const noexcept {
 }
 
 Tile& Layer::tileFor(TileKey k) {
-    return tiles.try_emplace(k).first->second;
+    return tiles.try_emplace(k, depth).first->second;
 }
 
 // ---------------------------------------------------------------------- undo
 
 std::size_t UndoRecord::memoryBytes() const noexcept {
+    // Asks each tile how big it is rather than assuming (D-023). This number is
+    // shown to the artist in the status bar and the Edit menu, so at 16 bits it
+    // has to say the truth — twice the bytes, and therefore about half the
+    // history at the same budget — instead of quietly under-reporting by half.
     std::size_t n = label.capacity();
     for (const auto& s : tiles)
-        if (s.before.has_value()) n += TILE_BYTES;
+        if (s.before.has_value()) n += s.before->byteSize();
     if (structure && structure->state)
-        n += structure->state->tiles.size() * TILE_BYTES;
+        for (const auto& [key, tile] : structure->state->tiles) n += tile.byteSize();
     return n;
 }
 
@@ -335,8 +420,9 @@ void UndoStack::push(UndoRecord&& rec) {
 
 void UndoStack::setMemoryBudget(std::size_t bytes) noexcept {
     // A budget below one tile would evict on every stroke. Floor it at
-    // something that can hold a few.
-    budget_ = std::max<std::size_t>(bytes, static_cast<std::size_t>(TILE_BYTES) * 4);
+    // something that can hold a few — of the LARGER kind, so the floor is a
+    // floor at both depths rather than only at eight bits.
+    budget_ = std::max<std::size_t>(bytes, tileBytes(ColourDepth::Bits16) * 4);
     enforceBudget();
 }
 
@@ -417,17 +503,20 @@ const Layer* Document::layerById(LayerId id) const noexcept {
 
 Layer& Document::addLayer(std::string name) {
     Layer l;
-    l.id   = nextLayerId++;
-    l.name = std::move(name);
+    l.id    = nextLayerId++;
+    l.name  = std::move(name);
+    l.depth = depth;               // the document is the authority on depth
     layers.push_back(std::move(l));
     return layers.back();
 }
 
-Document makeDocument(std::int32_t w, std::int32_t h, StraightRgba8 background) {
+Document makeDocument(std::int32_t w, std::int32_t h, StraightRgba8 background,
+                      ColourDepth depth) {
     Document doc;
     doc.width      = std::max(w, 1);
     doc.height     = std::max(h, 1);
     doc.background = background;
+    doc.depth      = depth;        // set before addLayer, which copies it
     doc.activeLayer = doc.addLayer("Layer 1").id;
     return doc;
 }
@@ -438,6 +527,11 @@ Document cloneDocument(const Document& doc) {
     copy.height      = doc.height;
     copy.dpi         = doc.dpi;
     copy.background  = doc.background;
+    // Without this the autosave worker writes a manifest saying 8-bit over
+    // tiles that are 16 — and the recovery file opens as a different painting
+    // from the one that was lost. Tile::clone() keeps each tile's own depth, so
+    // this line is what keeps the document's answer agreeing with theirs.
+    copy.depth       = doc.depth;
     copy.activeLayer = doc.activeLayer;
     copy.nextLayerId = doc.nextLayerId;
     copy.selection   = doc.selection;
@@ -451,8 +545,9 @@ Document cloneDocument(const Document& doc) {
     copy.layers.reserve(doc.layers.size());
     for (const Layer& layer : doc.layers) {
         Layer out;
-        out.id   = layer.id;
-        out.kind = layer.kind;
+        out.id    = layer.id;
+        out.kind  = layer.kind;
+        out.depth = layer.depth;
         applyProps(out, propsOf(layer));
         out.tiles.reserve(layer.tiles.size());
         for (const auto& [key, tile] : layer.tiles) out.tiles.emplace(key, tile.clone());
@@ -504,8 +599,9 @@ std::size_t indexOf(const Document& doc, LayerId id) {
 
 UndoRecord addLayerAbove(Document& doc, LayerId reference, std::string name) {
     Layer layer;
-    layer.id   = doc.nextLayerId++;
-    layer.name = std::move(name);
+    layer.id    = doc.nextLayerId++;
+    layer.name  = std::move(name);
+    layer.depth = doc.depth;
 
     const std::size_t at = reference == NO_LAYER
         ? doc.layers.size()
@@ -558,8 +654,9 @@ UndoRecord duplicateLayer(Document& doc, LayerId id) {
     copy.id   = doc.nextLayerId++;
     copy.name = source->name + " copy";
     applyProps(copy, propsOf(*source));
-    copy.name = source->name + " copy";
-    copy.kind = source->kind;
+    copy.name  = source->name + " copy";
+    copy.kind  = source->kind;
+    copy.depth = source->depth;
     // Tiles are move-only, so the copy is explicit — which is the point.
     for (const auto& [key, tile] : source->tiles) copy.tiles.emplace(key, tile.clone());
 
@@ -624,19 +721,40 @@ UndoRecord CpuBackend::mergeLayerDown(Document& doc, LayerId id) {
         rec.tiles.push_back(std::move(snap));
 
         Tile& dstTile = dstLayer.tileFor(key);
-        const PremulRgba8* src = srcTile.pixels();
-        PremulRgba8* dst = dstTile.pixels();
-        for (int i = 0; i < TILE_PIXELS; ++i) {
-            PremulRgba8 s = src[i];
-            if (s.a == 0) continue;
-            if (opacity < 1.0f) {
-                const auto scale = [&](std::uint8_t c) {
-                    return static_cast<std::uint8_t>(
-                        std::lround(static_cast<float>(c) * opacity));
-                };
-                s = PremulRgba8{scale(s.r), scale(s.g), scale(s.b), scale(s.a)};
+        if (srcTile.depth() == ColourDepth::Bits8 &&
+            dstTile.depth() == ColourDepth::Bits8) {
+            // The 8-bit path, untouched. Kept verbatim rather than routed
+            // through the 16-bit one so that an 8-bit document merges to the
+            // same bytes it always did, at the same speed (D-023).
+            const PremulRgba8* src = srcTile.pixels8();
+            PremulRgba8* dst = dstTile.pixels8();
+            for (int i = 0; i < TILE_PIXELS; ++i) {
+                PremulRgba8 s = src[i];
+                if (s.a == 0) continue;
+                if (opacity < 1.0f) {
+                    const auto scale = [&](std::uint8_t c) {
+                        return static_cast<std::uint8_t>(
+                            std::lround(static_cast<float>(c) * opacity));
+                    };
+                    s = PremulRgba8{scale(s.r), scale(s.g), scale(s.b), scale(s.a)};
+                }
+                dst[i] = blendOver(mode, s, dst[i]);
             }
-            dst[i] = blendOver(mode, s, dst[i]);
+        } else {
+            for (int y = 0; y < TILE_SIZE; ++y) {
+                for (int x = 0; x < TILE_SIZE; ++x) {
+                    PremulRgba16 s = srcTile.pixel(x, y);
+                    if (s.a == 0) continue;
+                    if (opacity < 1.0f) {
+                        const auto scale = [&](std::uint16_t c) {
+                            return static_cast<std::uint16_t>(
+                                std::lround(static_cast<float>(c) * opacity));
+                        };
+                        s = PremulRgba16{scale(s.r), scale(s.g), scale(s.b), scale(s.a)};
+                    }
+                    dstTile.setPixel(x, y, blendOver(mode, s, dstTile.pixel(x, y)));
+                }
+            }
         }
     }
 

@@ -31,6 +31,15 @@
 namespace sbl {
 namespace {
 
+/// The GPU arena, its shaders and every transfer below are 8-bit RGBA
+/// throughout, so this backend's byte count stays a constant even though a
+/// tile's is not any more (D-023). A 16-bit document is DECLINED rather than
+/// converted — see `GpuBackend::applyDab` and `GpuBackend::compositeRect` —
+/// because painting it at half its depth without saying so is the one outcome
+/// worse than not using the GPU at all.
+constexpr std::size_t kTileBytes8 = tileBytes(ColourDepth::Bits8);
+
+
 // glslc -mfmt=c output; regenerate with engine/src/shaders/build.sh.
 const std::uint32_t kCompositeSpv[] =
 #include "shaders/composite.spv.inc"
@@ -182,7 +191,7 @@ public:
     [[nodiscard]] std::expected<void, Error> readback(const Document& doc) override;
 
     [[nodiscard]] std::size_t deviceBytes() const noexcept {
-        return static_cast<std::size_t>(arenaSlots_ + 3u * kChunkSlots) * TILE_BYTES;
+        return static_cast<std::size_t>(arenaSlots_ + 3u * kChunkSlots) * kTileBytes8;
     }
 
 private:
@@ -283,17 +292,17 @@ bool GpuBackend::start(std::string* why) {
     SDL_GPUBufferCreateInfo buf{};
     buf.usage = SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_READ |
                 SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE;
-    buf.size  = kArenaSlots * static_cast<Uint32>(TILE_BYTES);
+    buf.size  = kArenaSlots * static_cast<Uint32>(kTileBytes8);
     arena_ = SDL_CreateGPUBuffer(dev_, &buf);
     if (arena_ == nullptr) return fail("tile arena");
     arenaSlots_ = kArenaSlots;
 
-    buf.size = kChunkSlots * static_cast<Uint32>(TILE_BYTES);
+    buf.size = kChunkSlots * static_cast<Uint32>(kTileBytes8);
     dest_ = SDL_CreateGPUBuffer(dev_, &buf);
     if (dest_ == nullptr) return fail("composite target");
 
     SDL_GPUTransferBufferCreateInfo tb{};
-    tb.size  = kChunkSlots * static_cast<Uint32>(TILE_BYTES);
+    tb.size  = kChunkSlots * static_cast<Uint32>(kTileBytes8);
     tb.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
     up_ = SDL_CreateGPUTransferBuffer(dev_, &tb);
     tb.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
@@ -342,6 +351,11 @@ void GpuBackend::releaseSlot(Resident& entry) {
 
 Resident* GpuBackend::residentFor(LayerId id, TileKey key, const Tile* tile) {
     if (tile == nullptr) return nullptr;
+    // Belt and braces behind applyDab's depth check. A 16-bit tile is 512 KiB
+    // and the arena slot is 256, so uploading one would not merely be wrong, it
+    // would read past the end of the tile; "no slot" is the existing, tested
+    // way of saying "let the CPU do this one".
+    if (tile->depth() != ColourDepth::Bits8) return nullptr;
     const CacheKey ck{id, key};
     Resident& entry = resident_[ck];
     entry.used = ++clock_;
@@ -386,9 +400,10 @@ bool GpuBackend::syncTiles(const std::vector<Behind>& work) {
     if (!downloadSlots(slotScratch_, pixelScratch_)) return false;
 
     for (std::size_t i = 0; i < work.size(); ++i) {
-        // pixels() moves the stamp — that is its job — so record where to.
-        std::memcpy(work[i].tile->pixels(), pixelScratch_.data() + i * TILE_PIXELS,
-                    TILE_BYTES);
+        // pixels8() moves the stamp — that is its job — so record where to.
+        // Never null: only 8-bit tiles ever became resident (`residentFor`).
+        std::memcpy(work[i].tile->pixels8(), pixelScratch_.data() + i * TILE_PIXELS,
+                    kTileBytes8);
         work[i].entry->stamp     = work[i].tile->stamp();
         work[i].entry->hostStale = false;
     }
@@ -437,8 +452,8 @@ bool GpuBackend::uploadTiles() {
                 static_cast<PremulRgba8*>(SDL_MapGPUTransferBuffer(dev_, up_, true));
             if (staging == nullptr) return false;
             for (std::size_t i = 0; i < n; ++i)
-                std::memcpy(staging + i * TILE_PIXELS, uploads_[base + i].second->pixels(),
-                            TILE_BYTES);
+                std::memcpy(staging + i * TILE_PIXELS,
+                            uploads_[base + i].second->pixels8(), kTileBytes8);
             SDL_UnmapGPUTransferBuffer(dev_, up_);
 
             SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(dev_);
@@ -446,10 +461,10 @@ bool GpuBackend::uploadTiles() {
             SDL_GPUCopyPass* pass = SDL_BeginGPUCopyPass(cmd);
             for (std::size_t i = 0; i < n; ++i) {
                 const SDL_GPUTransferBufferLocation src{up_,
-                                                        static_cast<Uint32>(i * TILE_BYTES)};
+                                                        static_cast<Uint32>(i * kTileBytes8)};
                 const SDL_GPUBufferRegion dst{
-                    arena_, uploads_[base + i].first * static_cast<Uint32>(TILE_BYTES),
-                    static_cast<Uint32>(TILE_BYTES)};
+                    arena_, uploads_[base + i].first * static_cast<Uint32>(kTileBytes8),
+                    static_cast<Uint32>(kTileBytes8)};
                 SDL_UploadToGPUBuffer(pass, &src, &dst, false);
             }
             SDL_EndGPUCopyPass(pass);
@@ -472,10 +487,10 @@ bool GpuBackend::downloadSlots(const std::vector<std::uint32_t>& slots,
         SDL_GPUCopyPass* pass = SDL_BeginGPUCopyPass(cmd);
         for (std::size_t i = 0; i < n; ++i) {
             const SDL_GPUBufferRegion src{
-                arena_, slots[base + i] * static_cast<Uint32>(TILE_BYTES),
-                static_cast<Uint32>(TILE_BYTES)};
+                arena_, slots[base + i] * static_cast<Uint32>(kTileBytes8),
+                static_cast<Uint32>(kTileBytes8)};
             const SDL_GPUTransferBufferLocation dst{down_,
-                                                    static_cast<Uint32>(i * TILE_BYTES)};
+                                                    static_cast<Uint32>(i * kTileBytes8)};
             SDL_DownloadFromGPUBuffer(pass, &src, &dst);
         }
         SDL_EndGPUCopyPass(pass);
@@ -489,7 +504,7 @@ bool GpuBackend::downloadSlots(const std::vector<std::uint32_t>& slots,
         const auto* mapped =
             static_cast<const PremulRgba8*>(SDL_MapGPUTransferBuffer(dev_, down_, false));
         if (mapped == nullptr) return false;
-        std::memcpy(out.data() + base * TILE_PIXELS, mapped, n * TILE_BYTES);
+        std::memcpy(out.data() + base * TILE_PIXELS, mapped, n * kTileBytes8);
         SDL_UnmapGPUTransferBuffer(dev_, down_);
     }
     return true;
@@ -523,7 +538,10 @@ void GpuBackend::submitPending() {
         p.geom[i][1]  = static_cast<float>(d.y);
         p.geom[i][2]  = d.radius;
         p.geom[i][3]  = d.hardness;
-        p.paint[i][0] = packRgba(d.colour);
+        // The shader paints 8-bit tiles, and this narrows to exactly what
+        // `CpuBackend::applyDab` narrows the same dab to — which is what keeps
+        // tests/differential.cpp inside its ±1 tolerance without touching it.
+        p.paint[i][0] = packRgba(narrow(d.colour));
         p.paint[i][1] = d.erase ? 1u : 0u;
     }
 
@@ -552,6 +570,18 @@ void GpuBackend::submitPending() {
 void GpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
     if (t.layer.locked || t.layer.kind != LayerKind::Raster) return;
     if (dab.colour.a == 0 || dab.radius <= 0.0f) return;
+
+    // D-023: the arena and both shaders are 8-bit RGBA. Hand a 16-bit layer
+    // straight to the reference implementation rather than half of it to the
+    // device — this is the same fallback the arena-full case takes below, and
+    // the artist's picture is right either way. `submitPending` first, because
+    // the CPU is about to write host tiles this backend may still owe pixels to.
+    if (t.layer.depth != ColourDepth::Bits8) {
+        submitPending();
+        syncLayer(t.layer);
+        cpuBackend().applyDab(t, dab);
+        return;
+    }
 
     const double r = dab.radius;
     const auto lo = [](double v) { return static_cast<std::int32_t>(std::floor(v)); };
@@ -652,6 +682,12 @@ std::vector<PremulRgba8> GpuBackend::compositeRect(const Document& doc, std::int
     if (w <= 0 || h <= 0) return {};
     submitPending();
 
+    // D-023, and the same answer as `applyDab`: composite.comp reads 8-bit
+    // tiles out of the arena, so a 16-bit document is composited by the
+    // reference implementation instead. Deliberately BEFORE buildProgram —
+    // there is no version of this the shader could be asked to attempt.
+    if (doc.depth != ColourDepth::Bits8) return cpuFallback(doc, x, y, w, h);
+
     program_.clear();
     if (!buildProgram(doc, std::nullopt, 0, program_))
         return cpuFallback(doc, x, y, w, h);   // deeper or wider than the shader
@@ -736,10 +772,10 @@ std::vector<PremulRgba8> GpuBackend::compositeRect(const Document& doc, std::int
 
         SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd);
         for (std::size_t i = 0; i < n; ++i) {
-            const SDL_GPUBufferRegion src{dest_, static_cast<Uint32>(i * TILE_BYTES),
-                                          static_cast<Uint32>(TILE_BYTES)};
+            const SDL_GPUBufferRegion src{dest_, static_cast<Uint32>(i * kTileBytes8),
+                                          static_cast<Uint32>(kTileBytes8)};
             const SDL_GPUTransferBufferLocation dst{down_,
-                                                    static_cast<Uint32>(i * TILE_BYTES)};
+                                                    static_cast<Uint32>(i * kTileBytes8)};
             SDL_DownloadFromGPUBuffer(copy, &src, &dst);
         }
         SDL_EndGPUCopyPass(copy);

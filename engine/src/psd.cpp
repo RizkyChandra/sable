@@ -982,9 +982,11 @@ void encodeChannels(const Layer& layer, OutRecord& rec) {
             const Tile* tile = layer.find(TileKey{tileIndex(cx), ty});
             if (tile == nullptr) continue;
 
-            const StraightRgba8 c =
+            // Sable writes 8-bit PSD, so this is an export boundary and the
+            // narrowing is the honest one (D-023).
+            const StraightRgba8 c = narrow(
                 tile->pixel(cx - tileIndex(cx) * TILE_SIZE, cy - ty * TILE_SIZE)
-                    .unpremultiply();
+                    .unpremultiply());
             const std::size_t i = y * w + x;
             planes[i]                 = c.a;
             planes[w * h + i]         = c.r;

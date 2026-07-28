@@ -8,25 +8,39 @@ C++23 · SDL3 · Dear ImGui · MIT.
 Fast pen response and a small interface, on ordinary hardware. Inspired by
 PaintTool SAI's feel, built from original code.
 
-**Status: Milestones 1–4 feature-complete for v1.** Canvas, seven brushes,
-undo, PNG export, pen pressure with calibration, stabilizer, colour, layers
-with blend modes, clipping and groups, selection, bucket fill, transform, the
-`.sable` project format, layered PSD import and export, crash recovery,
-dockable panels, reassignable keys, interface scaling, and light/dark themes.
+**Status: v2 — competing with PaintTool SAI 2 directly.**
 
-**One v1 requirement is not met, and cannot be met here: US-00.** The stylus
-spike needs a real tablet, and none was available. Every pressure claim in
-D-002 — that `SDL_PenAxis` delivers pressure and tilt on both X11 and Wayland,
-at a usable sample rate, without synthetic mouse duplicates — is verified only
-against synthetic input. **Run US-00 before trusting the pen path.** It is half
-a day, and D-002a is the fallback if it fails.
+Canvas with pan, zoom and rotation. Pencil, opaque, airbrush, marker,
+watercolour and smudge brushes. Pen pressure with editable curves, per-device
+calibration and a pulled-string stabilizer. Layers with 13 blend modes,
+clipping, groups, linework and text. Rectangle, lasso and magic-wand selection.
+Bucket fill, transform, perspective and symmetry rulers.
 
-Deferred to Stage D by the PRD, not missing from v1: JPEG/WebP export, layer
-masks, freehand selection, rulers, text, and colour management.
+**Reads and writes other applications' files:** PSD (layered, both directions,
+with layer masks), OpenRaster, and Krita `.kra` (read). Its own `.sable` is a
+plain ZIP of PNG tiles you can open with `unzip`.
 
-Before a public release the AppStream metadata needs a homepage and bug-tracker
-URL — `appstreamcli validate` fails on that until the project is hosted
-somewhere. See the comment in `packaging/org.sable.Sable.metainfo.xml`.
+**Painting runs on the CPU or the GPU, your choice** (*View → Paint and
+composite on the GPU*). The CPU path stays the default and the reference
+implementation; the GPU is roughly 100× faster on a large multi-layer
+composite. A test suite compares the two backends pixel for pixel on 32
+scenarios and fails on any colour difference over one level, or any alpha
+difference at all — so what you paint is what you save whichever you use. If no
+GPU is available, Sable says so in the status bar and keeps working.
+
+Crash recovery that never overwrites your file. Dockable panels, reassignable
+keys for every action, interface scaling, light and dark themes.
+
+**One requirement remains unmet, and it is the important one: US-00.** The
+stylus spike has never been run, on any platform, because no tablet was
+available at any point during development. Every claim about pressure, tilt and
+sample rate is verified against *synthetic* input only. The engine maths has
+204 tests behind it; the hardware path has none. **Run US-00 before trusting
+the pen.** It is half a day, and `docs/DECISION-LOG.md` D-002a is the recorded
+fallback if it fails.
+
+Windows and macOS builds compile and pass CI, but nobody has painted a stroke
+in either by hand, and neither is signed or notarised.
 
 ## Build
 

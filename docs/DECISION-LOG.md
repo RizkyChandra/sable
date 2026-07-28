@@ -744,6 +744,35 @@ exactly why the default does not change: an artist who does not need 16 bits
 should not pay for it, and on D-019's modest hardware the difference is between
 comfortable and swapping.
 
+### What #21 built, and the two things it deliberately did not
+
+**Compositing stays 8-bit at both depths.** The screen is 8-bit and so is PNG
+export, so a 16-bit tile has to be narrowed somewhere. Narrowing per pixel at
+the blend (`compositeLevel` in `engine/src/io.cpp`) means a 16-bit document's
+smooth ramp arrives as the *correct* 8-bit ramp rather than the plateaued one
+8-bit storage would have held — which is the whole of the visible benefit, and
+it is measured rather than claimed. Compositing wide would additionally help a
+STACK of semi-transparent 16-bit layers, whose intermediate results are
+currently rounded twice. That is a second change and is not this one.
+
+**The GPU backend declines a 16-bit document.** Its arena, both compute
+shaders and every transfer are 8-bit RGBA (D-025), so `applyDab` and
+`compositeRect` hand a 16-bit document to `cpuBackend()` and the application
+unticks the View-menu toggle with a notice. Declining rather than converting:
+painting a document at half its depth without saying so is worse than not
+using the GPU. `tests/differential.cpp` keeps its ±1 colour, 0 alpha
+tolerances untouched.
+
+**The hook D-004 left worked exactly as written.** Adding the wider types
+turned every conversion site into a compile error — forty-odd across ten files
+— rather than a silent truncation. The identity that made the change small is
+`narrow(widen(c)) == c` for every byte, which let the cold paths (fills, the
+transform, text, importers) be written once instead of twice; only the dab
+loop, `over`, `blendOver` and `mergeLayerDown` have a second implementation,
+as this entry asked. Two working implementations now exist, so the template
+this entry declined is finally a decision someone could make on evidence — and
+it should still wait for a third reason.
+
 ## D-024 — File formats: one registry, extension first and content second
 
 **Status:** Decided

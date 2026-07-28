@@ -48,6 +48,15 @@ struct Region {
 
 /// Composites one level into `buf`, which is already premultiplied.
 ///
+/// **This is an 8-bit compositor at both document depths, deliberately.** The
+/// screen is 8-bit and so is PNG export, so a 16-bit tile has to be narrowed
+/// somewhere; doing it here — per pixel, before the blend — means a 16-bit
+/// document's smooth ramp arrives as the CORRECT 8-bit ramp rather than as the
+/// plateaued one an 8-bit document would have stored in the first place, which
+/// is the whole of the visible benefit. Compositing wide would additionally
+/// help a STACK of semi-transparent 16-bit layers, where the intermediate
+/// results are rounded twice. That is a second change and is not this one.
+///
 /// A folder composites its children into a transparent scratch buffer first,
 /// then blends that as a single unit — which is the whole point of a group:
 /// its opacity and blend mode apply to the result, not to each child.
@@ -94,9 +103,9 @@ void compositeLevel(std::vector<PremulRgba8>& buf, const Document& doc,
                 const std::int32_t x1 = std::min({TILE_SIZE, doc.width - ox,
                                                   r.x + static_cast<std::int32_t>(w) - ox});
 
+                const PremulRgba8*  px8  = tile.pixels8();
                 for (std::int32_t ty = y0; ty < y1; ++ty) {
-                    const PremulRgba8* row =
-                        tile.pixels() + static_cast<std::size_t>(ty) * TILE_SIZE;
+                    const std::size_t rowAt = static_cast<std::size_t>(ty) * TILE_SIZE;
                     // Signed: ox - r.x is negative for a tile that starts left
                     // of the region, and only the sum with tx is in bounds.
                     const std::int64_t rowStart =
@@ -104,7 +113,14 @@ void compositeLevel(std::vector<PremulRgba8>& buf, const Document& doc,
                             static_cast<std::int64_t>(w) + (ox - r.x);
                     for (std::int32_t tx = x0; tx < x1; ++tx) {
                         const auto at = static_cast<std::size_t>(rowStart + tx);
-                        PremulRgba8 src = row[tx];
+                        // A 16-bit tile is narrowed HERE, on the way to an
+                        // 8-bit screen and an 8-bit PNG, and nowhere earlier.
+                        // See compositeLevel16 for the path a 16-bit document
+                        // actually takes; this one only meets a wide tile in a
+                        // document some other reader made mixed.
+                        PremulRgba8 src = px8 != nullptr
+                            ? px8[rowAt + static_cast<std::size_t>(tx)]
+                            : narrow(tile.pixel(tx, ty));
                         if (!ownAlpha.empty()) ownAlpha[at] = src.a;
                         if (src.a == 0) continue;
                         float scale = opacity;
@@ -139,7 +155,7 @@ PremulRgba8 pickLevel(const Document& doc, std::optional<LayerId> parent,
         if (layer->kind == LayerKind::Folder)
             own = pickLevel(doc, layer->id, x, y, PremulRgba8{});
         else if (const Tile* tile = layer->find(key); tile != nullptr)
-            own = tile->pixel(tx, ty);
+            own = narrow(tile->pixel(tx, ty));   // same narrowing as compositeLevel
 
         if (!layer->clipToBelow) clipAlpha = own.a;
         if (!layer->visible || layer->opacity <= 0.0f || own.a == 0) continue;

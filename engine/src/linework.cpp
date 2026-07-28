@@ -226,19 +226,25 @@ UndoRecord drawLineworkLayer(Layer& layer, const LineworkContent& content,
         // One composite per stroke, from coverage that was accumulated with
         // max: the line is drawn at its own opacity, once, however many stamps
         // went into it.
-        const PremulRgba8 colour = stroke.colour.premultiply();
+        // Widened once, then composited through the depth-agnostic accessors:
+        // a linework layer in a 16-bit document must not quietly narrow its
+        // own line to 8 bits on the way in. `narrow(widen(c)) == c`, so an
+        // 8-bit document is bit-identical to what this did before.
+        const PremulRgba16 colour = widen(stroke.colour.premultiply());
         for (const auto& [key, cov] : coverage) {
             Tile& tile = layer.tileFor(key);
-            PremulRgba8* px = tile.pixels();
             for (int i = 0; i < TILE_PIXELS; ++i) {
                 const std::uint8_t c = cov[static_cast<std::size_t>(i)];
                 if (c == 0) continue;
-                const auto scale = [c](std::uint8_t v) {
-                    return static_cast<std::uint8_t>((v * c + 127) / 255);
+                const auto scale = [c](std::uint16_t v) {
+                    return static_cast<std::uint16_t>((v * c + 127) / 255);
                 };
-                px[i] = over(PremulRgba8{scale(colour.r), scale(colour.g),
-                                         scale(colour.b), scale(colour.a)},
-                             px[i]);
+                const int x = i % TILE_SIZE;
+                const int y = i / TILE_SIZE;
+                tile.setPixel(x, y,
+                              over(PremulRgba16{scale(colour.r), scale(colour.g),
+                                                scale(colour.b), scale(colour.a)},
+                                   tile.pixel(x, y)));
             }
         }
     }

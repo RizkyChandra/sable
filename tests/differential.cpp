@@ -198,7 +198,11 @@ public:
 
     void applyDab(PaintTarget& t, const Dab& dab) override {
         Dab wrong = dab;
-        wrong.colour.r = down(wrong.colour.r, dabRedBias);
+        // `Dab::colour` is 16-bit (D-023) while the bias is quoted in the
+        // 8-bit steps this file's tolerances are written in, so the mutation is
+        // scaled to keep meaning exactly what it meant: `dabRedBias` steps of
+        // the eight-bit ladder, not of the sixteen-bit one.
+        wrong.colour.r = down16(wrong.colour.r, dabRedBias * 257);
         cpuBackend().applyDab(t, wrong);
     }
     UndoRecord bucketFill(Document& doc, LayerId target, std::int32_t x, std::int32_t y,
@@ -239,6 +243,9 @@ private:
     /// perturbation that saturates is a perturbation that cannot be seen.
     static std::uint8_t down(std::uint8_t v, int by) noexcept {
         return static_cast<std::uint8_t>(std::max(0, static_cast<int>(v) - by));
+    }
+    static std::uint16_t down16(std::uint16_t v, int by) noexcept {
+        return static_cast<std::uint16_t>(std::max(0, static_cast<int>(v) - by));
     }
 };
 
