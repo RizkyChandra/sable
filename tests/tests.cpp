@@ -13,8 +13,8 @@
 #include <filesystem>
 #include <cstring>
 #include <new>
-#ifdef _MSC_VER
-#include <malloc.h>
+#ifdef _WIN32
+#include <malloc.h>   // _aligned_malloc / _aligned_free
 #endif
 #include <vector>
 
@@ -45,9 +45,11 @@ void* operator new[](std::size_t n) { return ::operator new(n); }
 void* operator new(std::size_t n, std::align_val_t a) {
     ++g_allocations;
     const std::size_t align = static_cast<std::size_t>(a);
-    // MSVC has no std::aligned_alloc; its aligned allocations must be freed
-    // with _aligned_free, so the matching deletes below branch as well.
-#ifdef _MSC_VER
+    // No std::aligned_alloc on Windows with ANY toolchain — the CRT does not
+    // provide C11 aligned_alloc, so libstdc++ does not expose it under MinGW
+    // either. Its aligned allocations must be freed with _aligned_free, so the
+    // matching deletes below branch as well.
+#ifdef _WIN32
     if (void* p = _aligned_malloc(((n + align - 1) / align) * align, align)) return p;
 #else
     if (void* p = std::aligned_alloc(align, ((n + align - 1) / align) * align)) return p;
@@ -60,7 +62,7 @@ void operator delete(void* p) noexcept                    { std::free(p); }
 void operator delete[](void* p) noexcept                  { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept       { std::free(p); }
 void operator delete[](void* p, std::size_t) noexcept     { std::free(p); }
-#ifdef _MSC_VER
+#ifdef _WIN32
 void operator delete(void* p, std::align_val_t) noexcept  { _aligned_free(p); }
 void operator delete[](void* p, std::align_val_t) noexcept { _aligned_free(p); }
 void operator delete(void* p, std::size_t, std::align_val_t) noexcept   { _aligned_free(p); }
