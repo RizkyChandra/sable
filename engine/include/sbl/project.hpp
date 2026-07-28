@@ -29,7 +29,23 @@ namespace sbl {
 /// it would silently drop on the next save. For text that matters most: an
 /// older Sable would open a v4 file, drop the words, and write back a picture
 /// the artist can no longer edit.
-inline constexpr int SABLE_FORMAT_VERSION = 4;
+///
+/// 5 added 16-bit colour (D-023): `colour.depth` is 16 and the tile PNGs are
+/// 16 bits per channel. This is the first bump that is NOT written
+/// unconditionally — see below.
+inline constexpr int SABLE_FORMAT_VERSION = 5;
+
+/// What an 8-bit document declares, which is the last version whose contents
+/// an older Sable can read in full.
+///
+/// The bumps above were all unconditional because every one of them added
+/// something an ordinary document might contain. Depth is different: it is a
+/// per-document choice, and the overwhelming majority of documents will never
+/// make it. Writing 5 on all of them would lock every 8-bit painting out of an
+/// older Sable in exchange for nothing, so the version says what the file
+/// actually needs — and a 16-bit file, which an older Sable genuinely would
+/// misread, still gets refused by name.
+inline constexpr int SABLE_FORMAT_VERSION_8BIT = 4;
 
 /// Undo history is deliberately not saved.
 [[nodiscard]] std::expected<void, Error> saveProject(

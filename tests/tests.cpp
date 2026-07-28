@@ -212,9 +212,9 @@ TEST_CASE("a cloned tile is an independent copy") {
     Tile a;
     a.fill(PremulRgba8{10, 20, 30, 40});
     Tile b = a.clone();
-    CHECK(b.pixel(5, 5) == PremulRgba8{10, 20, 30, 40});
+    CHECK(narrow(b.pixel(5, 5)) == PremulRgba8{10, 20, 30, 40});
     b.setPixel(5, 5, PremulRgba8{});
-    CHECK(a.pixel(5, 5) == PremulRgba8{10, 20, 30, 40});
+    CHECK(narrow(a.pixel(5, 5)) == PremulRgba8{10, 20, 30, 40});
 }
 
 // ------------------------------------------------------------ dab spacing
@@ -329,9 +329,9 @@ TEST_CASE("a dab dragged off the canvas edge paints only the on-canvas part") {
     REQUIRE(layer.tiles.size() == 1);
     const Tile* tile = layer.find(TileKey{0, 0});
     REQUIRE(tile != nullptr);
-    CHECK(tile->pixel(2, 2).a > 0);
+    CHECK(narrow(tile->pixel(2, 2)).a > 0);
     // Nothing painted beyond the canvas bound.
-    CHECK(tile->pixel(63, 63).a == 0);
+    CHECK(narrow(tile->pixel(63, 63)).a == 0);
 }
 
 TEST_CASE("a solid dab reproduces the chosen colour exactly at its centre") {
@@ -354,7 +354,7 @@ TEST_CASE("a solid dab reproduces the chosen colour exactly at its centre") {
 
     const Tile* tile = layer.find(TileKey{0, 0});
     REQUIRE(tile != nullptr);
-    CHECK(tile->pixel(32, 32).unpremultiply() == chosen);
+    CHECK(narrow(tile->pixel(32, 32)).unpremultiply() == chosen);
 }
 
 TEST_CASE("a soft stroke on a transparent canvas has no dark halo") {
@@ -843,9 +843,9 @@ TEST_CASE("duplicating a layer copies its pixels, not its identity") {
     const Tile* copyTile     = doc.layerById(copy)->find(TileKey{0, 0});
     REQUIRE(originalTile != nullptr);
     REQUIRE(copyTile != nullptr);
-    CHECK(copyTile->pixel(200, 200).a > 0);
-    CHECK(originalTile->pixel(200, 200).a == 0);
-    CHECK(originalTile->pixel(60, 60).a > 0);      // and it kept its own paint
+    CHECK(narrow(copyTile->pixel(200, 200)).a > 0);
+    CHECK(narrow(originalTile->pixel(200, 200)).a == 0);
+    CHECK(narrow(originalTile->pixel(60, 60)).a > 0);      // and it kept its own paint
 }
 
 TEST_CASE("moving a layer changes draw order and undoes cleanly") {
@@ -935,7 +935,7 @@ TEST_CASE("a property edit is undoable without snapshotting pixels") {
     UndoRecord rec = setLayerProps(doc, id, props);
     // The whole point of the separate props delta: an opacity slider must not
     // cost 256 KiB per touched tile of history.
-    CHECK(rec.memoryBytes() < static_cast<std::size_t>(TILE_BYTES));
+    CHECK(rec.memoryBytes() < static_cast<std::size_t>(tileBytes(ColourDepth::Bits8)));
     doc.undo.push(std::move(rec));
 
     CHECK(doc.layerById(id)->opacity == doctest::Approx(0.25f));
@@ -3122,7 +3122,7 @@ TEST_CASE("eviction drops the oldest history and keeps redo working") {
     REQUIRE(doc.undo.canRedo());
 
     // Tighten the budget to something only a couple of records fit in.
-    doc.undo.setMemoryBudget(static_cast<std::size_t>(TILE_BYTES) * 6);
+    doc.undo.setMemoryBudget(static_cast<std::size_t>(tileBytes(ColourDepth::Bits8)) * 6);
     CHECK(doc.undo.memoryBytes() <= doc.undo.memoryBudget());
 
     // Redo survives if the undo side alone could satisfy the budget.
@@ -3175,7 +3175,7 @@ TEST_CASE("a 4000 x 4000 canvas stays cheap while painting in one corner") {
 
     // 4000 x 4000 would be 62'500 tiles if it were dense; a fraction of one
     // percent of that is the whole point.
-    CHECK(layer->tiles.size() * TILE_BYTES < 2u * 1024u * 1024u);
+    CHECK(layer->tiles.size() * tileBytes(ColourDepth::Bits8) < 2u * 1024u * 1024u);
 }
 
 TEST_CASE("undo memory is proportional to what was painted, not to the canvas") {
@@ -3192,7 +3192,7 @@ TEST_CASE("undo memory is proportional to what was painted, not to the canvas") 
 
     const std::size_t touched = s.touched.size();
     doc.undo.push(std::move(s.pending));
-    CHECK(doc.undo.memoryBytes() <= touched * TILE_BYTES + 4096);
+    CHECK(doc.undo.memoryBytes() <= touched * tileBytes(ColourDepth::Bits8) + 4096);
 }
 
 // ------------------------------------------------------------------ export
@@ -3387,16 +3387,16 @@ TEST_CASE("a .ora written by Krita imports with its stack intact") {
     // would show up.
     const Tile* baseTile = base->find(TileKey{0, 0});
     REQUIRE(baseTile != nullptr);
-    CHECK(baseTile->pixel(2, 2) == PremulRgba8{255, 0, 0, 255});
+    CHECK(narrow(baseTile->pixel(2, 2)) == PremulRgba8{255, 0, 0, 255});
 
     const Tile* insideTile = inside->find(TileKey{0, 0});
     REQUIRE(insideTile != nullptr);
-    CHECK(insideTile->pixel(16, 16) == PremulRgba8{0, 0, 255, 255});
-    CHECK(insideTile->pixel(2, 2) == PremulRgba8{0, 0, 0, 0});
+    CHECK(narrow(insideTile->pixel(16, 16)) == PremulRgba8{0, 0, 255, 255});
+    CHECK(narrow(insideTile->pixel(2, 2)) == PremulRgba8{0, 0, 0, 0});
 
     const Tile* fadeTile = fade->find(TileKey{0, 0});
     REQUIRE(fadeTile != nullptr);
-    CHECK(fadeTile->pixel(5, 30) == PremulRgba8{128, 0, 0, 128});
+    CHECK(narrow(fadeTile->pixel(5, 30)) == PremulRgba8{128, 0, 0, 128});
 
     // ORA has no background of its own, so an imported image keeps its
     // transparency rather than gaining a white sheet under it.
@@ -3457,7 +3457,7 @@ TEST_CASE("a .kra written by Krita imports with its layer stack intact") {
     REQUIRE(background != nullptr);
     const Tile* backgroundTile = background->find(TileKey{0, 0});
     REQUIRE(backgroundTile != nullptr);
-    CHECK(backgroundTile->pixel(40, 40) == PremulRgba8{255, 255, 255, 255});
+    CHECK(narrow(backgroundTile->pixel(40, 40)) == PremulRgba8{255, 255, 255, 255});
 
     const Layer* group  = byName(*doc, "Group");
     const Layer* inside = byName(*doc, "Inside");
@@ -3485,16 +3485,16 @@ TEST_CASE("a .kra written by Krita imports with its layer stack intact") {
     // any of those three read wrongly and these three checks fail.
     const Tile* baseTile = base->find(TileKey{0, 0});
     REQUIRE(baseTile != nullptr);
-    CHECK(baseTile->pixel(2, 2) == PremulRgba8{255, 0, 0, 255});
+    CHECK(narrow(baseTile->pixel(2, 2)) == PremulRgba8{255, 0, 0, 255});
 
     const Tile* insideTile = inside->find(TileKey{0, 0});
     REQUIRE(insideTile != nullptr);
-    CHECK(insideTile->pixel(16, 16) == PremulRgba8{0, 0, 255, 255});
-    CHECK(insideTile->pixel(2, 2) == PremulRgba8{0, 0, 0, 0});
+    CHECK(narrow(insideTile->pixel(16, 16)) == PremulRgba8{0, 0, 255, 255});
+    CHECK(narrow(insideTile->pixel(2, 2)) == PremulRgba8{0, 0, 0, 0});
 
     const Tile* fadeTile = fade->find(TileKey{0, 0});
     REQUIRE(fadeTile != nullptr);
-    CHECK(fadeTile->pixel(5, 30) == PremulRgba8{128, 0, 0, 128});
+    CHECK(narrow(fadeTile->pixel(5, 30)) == PremulRgba8{128, 0, 0, 128});
 
     // The same document exported to ORA by Krita must import to the same
     // picture — two readers, two containers, one answer.
@@ -3881,7 +3881,7 @@ Document layeredDocument(std::int32_t size, int rasterLayers) {
             for (std::int32_t tx = 0; tx <= tileIndex(size - 1); ++tx) {
                 if (rnd(4) == 0) continue;
                 Tile& tile = layer.tileFor(TileKey{tx, ty});
-                PremulRgba8* px = tile.pixels();
+                PremulRgba8* px = tile.pixels8();
                 for (int p = 0; p < TILE_PIXELS; ++p) {
                     const auto a = static_cast<std::uint8_t>(rnd(256));
                     px[p] = StraightRgba8{static_cast<std::uint8_t>(rnd(256)),
@@ -4238,8 +4238,8 @@ TEST_CASE("undo in GPU mode restores the canvas the CPU would have restored") {
     const std::size_t touched = again.touched.size();
     doc.undo.push(std::move(again.pending));
     CHECK(touched >= 1);
-    CHECK(doc.undo.memoryBytes() >= touched * TILE_BYTES);
-    CHECK(doc.undo.memoryBytes() <= (touched + 1) * TILE_BYTES + 4096);
+    CHECK(doc.undo.memoryBytes() >= touched * tileBytes(ColourDepth::Bits8));
+    CHECK(doc.undo.memoryBytes() <= (touched + 1) * tileBytes(ColourDepth::Bits8) + 4096);
 }
 
 TEST_CASE("the autosave clone gets the pixels the GPU painted") {
@@ -4299,7 +4299,7 @@ TEST_CASE("saving and duplicating in GPU mode carry the painted pixels") {
     for (const auto& [key, tile] : source->tiles) {
         const Tile* other = copy->find(key);
         REQUIRE(other != nullptr);
-        CHECK(std::memcmp(tile.pixels(), other->pixels(), TILE_BYTES) == 0);
+        CHECK(std::memcmp(tile.pixels8(), other->pixels8(), tileBytes(ColourDepth::Bits8)) == 0);
     }
     // Not blank: a duplicate of nothing would pass the comparison above.
     CHECK(!source->tiles.begin()->second.isFullyTransparent());
@@ -4499,7 +4499,7 @@ int inkedPixels(const Document& doc) {
     for (const Layer& layer : doc.layers)
         for (const auto& [key, tile] : layer.tiles)
             for (int i = 0; i < TILE_PIXELS; ++i)
-                if (tile.pixels()[i].a > 0) ++n;
+                if (tile.pixels8()[i].a > 0) ++n;
     return n;
 }
 
@@ -4800,4 +4800,437 @@ TEST_CASE("a CJK glyph rasterises, where the machine has a font carrying one") {
         return;
     }
     MESSAGE("no font here carries CJK; rasterising not exercised");
+}
+
+// ====================================================================== #21
+// 16-bit colour (D-023). Three things have to be true at once: a 16-bit
+// document is measurably better at the workflow D-004 named as the cost it was
+// accepting, an 8-bit document is not touched at all, and the numbers the
+// artist is shown stay true at both depths.
+
+TEST_CASE("widening a channel is lossless and narrowing undoes it exactly") {
+    // The lemma the rest of this rests on. `narrow(widen(c)) == c` is what
+    // lets an 8-bit source colour travel through 16-bit code — the dab
+    // pipeline, the fills, the transform — and land on an 8-bit tile as the
+    // byte it started as, which is why none of the 8-bit tests above moved.
+    for (int v = 0; v <= 255; ++v) {
+        const auto c = static_cast<std::uint8_t>(v);
+        CHECK(narrowChannel(widenChannel(c)) == c);
+    }
+    CHECK(widenChannel(0)   == 0);
+    CHECK(widenChannel(255) == 65535);
+    // And the ends of the other direction, where an off-by-one hides.
+    CHECK(narrowChannel(0)     == 0);
+    CHECK(narrowChannel(65535) == 255);
+    CHECK(narrowChannel(128)   == 0);      // 128/257 is 0.498
+    CHECK(narrowChannel(129)   == 1);      // 129/257 is 0.502
+}
+
+TEST_CASE("an 8-bit tile costs exactly what it always cost") {
+    // D-023's cost is doubled memory, and the promise beside it is that an
+    // 8-bit document does not pay any of it.
+    CHECK(tileBytes(ColourDepth::Bits8)  == 262144u);   // the old TILE_BYTES
+    CHECK(tileBytes(ColourDepth::Bits16) == 524288u);
+
+    const Tile narrowTile;
+    CHECK(narrowTile.depth() == ColourDepth::Bits8);    // the default, still
+    CHECK(narrowTile.byteSize() == 262144u);
+    CHECK(narrowTile.pixels8()  != nullptr);
+    // Null, not a truncating view: a path that has not been taught about the
+    // other depth fails at once rather than writing half a drawing.
+    CHECK(narrowTile.pixels16() == nullptr);
+
+    const Tile wideTile(ColourDepth::Bits16);
+    CHECK(wideTile.byteSize() == 524288u);
+    CHECK(wideTile.pixels8()  == nullptr);
+    CHECK(wideTile.pixels16() != nullptr);
+}
+
+TEST_CASE("a document's depth reaches its layers, its tiles and its clones") {
+    Document doc = makeDocument(512, 512, StraightRgba8{0, 0, 0, 0},
+                                ColourDepth::Bits16);
+    REQUIRE(doc.depth == ColourDepth::Bits16);
+    REQUIRE(doc.layers.size() == 1);
+    CHECK(doc.layers[0].depth == ColourDepth::Bits16);
+    CHECK(doc.active()->tileFor(TileKey{0, 0}).depth() == ColourDepth::Bits16);
+
+    const UndoRecord added = addLayerAbove(doc, doc.activeLayer, "Second");
+    CHECK(!added.empty());
+    CHECK(doc.active()->depth == ColourDepth::Bits16);
+
+    // cloneDocument is the autosave hand-off. A clone that lost the depth would
+    // write a manifest saying 8 over tiles that are 16, and the recovery file
+    // would open as a different painting from the one that was lost.
+    const Document copy = cloneDocument(doc);
+    CHECK(copy.depth == ColourDepth::Bits16);
+    for (const Layer& layer : copy.layers) {
+        CHECK(layer.depth == ColourDepth::Bits16);
+        for (const auto& [key, tile] : layer.tiles)
+            CHECK(tile.depth() == ColourDepth::Bits16);
+    }
+}
+
+namespace {
+
+/// One low-density airbrush dab, laid down `passes` times in the same place —
+/// which is what soft shading actually is.
+void stackAirbrush(Document& doc, int passes) {
+    Layer* layer = doc.active();
+    std::vector<Dab> scratch;
+    for (int i = 0; i < passes; ++i) {
+        Stroke s;
+        beginStroke(s, defaultAirbrush(), StraightRgba8{0, 0, 0, 255}, layer->id);
+        PaintTarget t{*layer, s.pending, s.touched, doc.width, doc.height};
+        paintSample(s, t, at(128.0, 128.0), scratch);
+    }
+}
+
+/// Alpha along a horizontal line, in 16-bit units at BOTH depths, so the two
+/// profiles are directly comparable. An 8-bit tile answers `widen(its byte)`.
+std::vector<std::uint16_t> alphaProfile(const Document& doc, std::int32_t y,
+                                        std::int32_t x0, std::int32_t x1) {
+    std::vector<std::uint16_t> out;
+    const Layer& layer = doc.layers.front();
+    for (std::int32_t x = x0; x < x1; ++x) {
+        const TileKey key{tileIndex(x), tileIndex(y)};
+        const Tile* tile = layer.find(key);
+        out.push_back(tile == nullptr
+                          ? std::uint16_t{0}
+                          : tile->pixel(x - key.first * TILE_SIZE,
+                                        y - key.second * TILE_SIZE).a);
+    }
+    return out;
+}
+
+/// The length of the longest run of identical values. THIS IS THE BAND: a
+/// stretch of a gradient the storage could not tell apart, which is what the
+/// eye sees as a step.
+std::size_t longestBand(const std::vector<std::uint16_t>& profile) {
+    std::size_t best = 0, run = 0;
+    for (std::size_t i = 0; i < profile.size(); ++i) {
+        run = (i > 0 && profile[i] == profile[i - 1]) ? run + 1 : 1;
+        best = std::max(best, run);
+    }
+    return best;
+}
+
+std::size_t distinctLevels(std::vector<std::uint16_t> profile) {
+    std::ranges::sort(profile);
+    const auto stale = std::ranges::unique(profile);
+    return static_cast<std::size_t>(stale.begin() - profile.begin());
+}
+
+}  // namespace
+
+TEST_CASE("stacked low-opacity airbrush passes band less at 16 bits") {
+    // The acceptance criterion of #21, and D-004's recorded cost being paid
+    // back: "visible banding when many low-opacity airbrush passes stack".
+    //
+    // Measured, not asserted. The airbrush's soft falloff IS the gradient —
+    // coverage runs smoothly from 1 at the centre to 0 at the rim — so the
+    // radial alpha profile is a ramp that a depth either resolves or does not.
+    constexpr int kPasses = 25;
+    constexpr std::int32_t kCentre = 128;
+    // Inside the 30 px radius of the default airbrush, so every sample is on
+    // the falloff rather than off the end of it.
+    constexpr std::int32_t kFrom = kCentre + 1, kTo = kCentre + 29;
+
+    Document narrowDoc = makeDocument(256, 256, StraightRgba8{0, 0, 0, 0});
+    Document wideDoc   = makeDocument(256, 256, StraightRgba8{0, 0, 0, 0},
+                                      ColourDepth::Bits16);
+    stackAirbrush(narrowDoc, kPasses);
+    stackAirbrush(wideDoc,   kPasses);
+
+    const auto narrowProfile = alphaProfile(narrowDoc, kCentre, kFrom, kTo);
+    const auto wideProfile   = alphaProfile(wideDoc,   kCentre, kFrom, kTo);
+    REQUIRE(narrowProfile.size() == wideProfile.size());
+
+    const std::size_t narrowBand = longestBand(narrowProfile);
+    const std::size_t wideBand   = longestBand(wideProfile);
+    const std::size_t narrowLevels = distinctLevels(narrowProfile);
+    const std::size_t wideLevels   = distinctLevels(wideProfile);
+
+    MESSAGE("banding over " << narrowProfile.size() << " px of airbrush falloff, "
+            << kPasses << " stacked passes: 8-bit has " << narrowLevels
+            << " distinct levels and a longest band of " << narrowBand
+            << " px; 16-bit has " << wideLevels << " levels and a longest band of "
+            << wideBand << " px");
+
+    // Both halves of "less banding": more of the ramp is resolved, and the
+    // flat stretches are shorter.
+    CHECK(wideLevels > narrowLevels);
+    CHECK(wideBand   < narrowBand);
+
+    // And it is the same picture, not a different one. Not pixel-for-pixel:
+    // twenty-five passes of rounding at one step per pass compound, and the
+    // 8-bit ramp is the one that drifts — which is the defect, not a
+    // disagreement about what to draw. So compare the totals, which is the
+    // ink actually laid down.
+    const auto total = [](const std::vector<std::uint16_t>& p) {
+        double sum = 0.0;
+        for (const std::uint16_t v : p) sum += v;
+        return sum;
+    };
+    const double narrowInk = total(narrowProfile), wideInk = total(wideProfile);
+    MESSAGE("ink over the same falloff: 8-bit " << narrowInk << ", 16-bit " << wideInk);
+    CHECK(std::abs(narrowInk - wideInk) / wideInk < 0.15);
+
+    // Monotonically non-increasing outward, at both depths: a profile that
+    // wobbled would make "distinct levels" mean noise rather than resolution.
+    for (std::size_t i = 1; i < wideProfile.size(); ++i)
+        CHECK(wideProfile[i] <= wideProfile[i - 1]);
+}
+
+TEST_CASE("a very low density pass registers at 16 bits where 8 loses it") {
+    // The other face of the same problem, and the one an artist meets first: a
+    // pass so light that its whole contribution rounds to nothing. At 8 bits
+    // the canvas is untouched however many times it is repeated.
+    BrushPreset faint = defaultAirbrush();
+    faint.density = 0.001f;                // a pen barely touching the tablet
+
+    const auto paintOnce = [&](Document& doc) {
+        std::vector<Dab> scratch;
+        Stroke s;
+        beginStroke(s, faint, StraightRgba8{0, 0, 0, 255}, doc.activeLayer);
+        PaintTarget t{*doc.active(), s.pending, s.touched, doc.width, doc.height};
+        paintSample(s, t, at(128.0, 128.0), scratch);
+    };
+
+    Document narrowDoc = makeDocument(256, 256, StraightRgba8{0, 0, 0, 0});
+    Document wideDoc   = makeDocument(256, 256, StraightRgba8{0, 0, 0, 0},
+                                      ColourDepth::Bits16);
+    for (int i = 0; i < 20; ++i) { paintOnce(narrowDoc); paintOnce(wideDoc); }
+
+    const std::uint16_t narrowAlpha = alphaProfile(narrowDoc, 128, 128, 129).front();
+    const std::uint16_t wideAlpha   = alphaProfile(wideDoc,   128, 128, 129).front();
+    MESSAGE("20 passes at density 0.001: 8-bit alpha " << narrowAlpha
+            << ", 16-bit alpha " << wideAlpha << " (both in 16-bit units)");
+    CHECK(narrowAlpha == 0);
+    CHECK(wideAlpha   >  0);
+}
+
+TEST_CASE("the undo budget tells the truth at both depths") {
+    // D-017's budget is SHOWN to the artist, so at 16 bits it has to say the
+    // real number: twice the bytes per snapshot, and therefore about half the
+    // history at the same setting. Under-reporting by half would be the status
+    // bar quietly lying about how much undo is left.
+    const auto strokeCost = [](ColourDepth depth) {
+        Document doc = makeDocument(1024, 1024, StraightRgba8{255, 255, 255, 255},
+                                    depth);
+        // The tiles have to EXIST first. D-006 snapshots what was there, and
+        // "nothing was there" costs no bytes — correctly, but it would measure
+        // the wrong thing here.
+        std::vector<Dab> scratch;
+        {
+            Stroke warm;
+            beginStroke(warm, defaultPencil(), StraightRgba8{0, 0, 0, 255},
+                        doc.activeLayer);
+            PaintTarget t{*doc.active(), warm.pending, warm.touched, doc.width,
+                          doc.height};
+            for (int i = 0; i < 80; ++i) paintSample(warm, t, at(300.0 + i, 300.0), scratch);
+        }
+
+        Stroke s;
+        beginStroke(s, defaultPencil(), StraightRgba8{0, 0, 0, 255}, doc.activeLayer);
+        PaintTarget t{*doc.active(), s.pending, s.touched, doc.width, doc.height};
+        for (int i = 0; i < 80; ++i) paintSample(s, t, at(300.0 + i, 302.0), scratch);
+        const std::size_t touched = s.touched.size();
+        REQUIRE(touched > 0);
+        doc.undo.push(std::move(s.pending));
+        return std::pair<std::size_t, std::size_t>{doc.undo.memoryBytes(), touched};
+    };
+
+    const auto [narrowBytes, narrowTiles] = strokeCost(ColourDepth::Bits8);
+    const auto [wideBytes,   wideTiles]   = strokeCost(ColourDepth::Bits16);
+    REQUIRE(narrowTiles == wideTiles);
+
+    // One snapshot per touched tile, at that tile's own size — not at a
+    // constant that stopped being one.
+    CHECK(narrowBytes >= narrowTiles * tileBytes(ColourDepth::Bits8));
+    CHECK(narrowBytes <  narrowTiles * tileBytes(ColourDepth::Bits8) + 4096);
+    CHECK(wideBytes   >= wideTiles   * tileBytes(ColourDepth::Bits16));
+    CHECK(wideBytes   <  wideTiles   * tileBytes(ColourDepth::Bits16) + 4096);
+    MESSAGE("one stroke over " << narrowTiles << " tiles costs " << narrowBytes
+            << " bytes of history at 8 bits and " << wideBytes << " at 16");
+
+    // And the eviction that follows from it: the same budget holds fewer 16-bit
+    // records, which is the cost D-023 accepted in writing.
+    const auto recordsHeld = [](ColourDepth depth, std::size_t budget) {
+        Document doc = makeDocument(512, 512, StraightRgba8{0, 0, 0, 0}, depth);
+        // Every tile allocated up front, so each stroke below snapshots a tile
+        // that existed and the comparison is about bytes per snapshot rather
+        // than about which stroke happened to create a tile.
+        const UndoRecord warm =
+            fillSelection(doc, doc.activeLayer, StraightRgba8{200, 200, 200, 255});
+        CHECK(!warm.empty());
+        doc.undo.setMemoryBudget(budget);
+        std::vector<Dab> scratch;
+        for (int i = 0; i < 12; ++i) {
+            Stroke s;
+            beginStroke(s, defaultPencil(), StraightRgba8{0, 0, 0, 255}, doc.activeLayer);
+            PaintTarget t{*doc.active(), s.pending, s.touched, doc.width, doc.height};
+            paintSample(s, t, at(20.0 + i * 30.0, 20.0), scratch);
+            doc.undo.push(std::move(s.pending));
+        }
+        CHECK(doc.undo.memoryBytes() <= doc.undo.memoryBudget());
+        return doc.undo.size();
+    };
+    const std::size_t budget = 8u * tileBytes(ColourDepth::Bits8);
+    const std::size_t narrowHeld = recordsHeld(ColourDepth::Bits8, budget);
+    const std::size_t wideHeld   = recordsHeld(ColourDepth::Bits16, budget);
+    MESSAGE("at a budget of eight 8-bit tiles: " << narrowHeld
+            << " steps of history at 8 bits, " << wideHeld << " at 16");
+    // "Roughly half the history at the same setting", which is what D-023 says
+    // in words and what the status bar now has to be able to report.
+    CHECK(wideHeld * 2 <= narrowHeld + 1);
+    CHECK(wideHeld >= 1);          // D-017: one record always survives
+}
+
+TEST_CASE("a 16-bit document saves, reloads and keeps its extra bits") {
+    Document doc = makeDocument(256, 256, StraightRgba8{0, 0, 0, 0},
+                                ColourDepth::Bits16);
+    stackAirbrush(doc, 25);
+    // A value no 8-bit tile could hold, so a round trip that silently narrowed
+    // would be caught by the pixel itself rather than only by the manifest.
+    doc.active()->tileFor(TileKey{0, 0}).setPixel(
+        4, 4, PremulRgba16{1000, 2000, 3000, 65535});
+
+    const auto path = std::filesystem::temp_directory_path() / "sable_16bit.sable";
+    REQUIRE(saveProject(doc, path).has_value());
+    const auto loaded = loadProject(path);
+    REQUIRE(loaded.has_value());
+
+    CHECK(loaded->depth == ColourDepth::Bits16);
+    for (const Layer& layer : loaded->layers) CHECK(layer.depth == ColourDepth::Bits16);
+
+    const Tile* tile = loaded->layers.front().find(TileKey{0, 0});
+    REQUIRE(tile != nullptr);
+    REQUIRE(tile->depth() == ColourDepth::Bits16);
+    const PremulRgba16 back = tile->pixel(4, 4);
+    // Not exact: the tile PNG holds STRAIGHT alpha, so the round trip is
+    // unpremultiply -> premultiply and rounds once each way. Well inside an
+    // 8-bit step, which is the claim that matters.
+    CHECK(std::abs(static_cast<int>(back.r) - 1000) <= 2);
+    CHECK(std::abs(static_cast<int>(back.g) - 2000) <= 2);
+    CHECK(std::abs(static_cast<int>(back.b) - 3000) <= 2);
+    CHECK(back.a == 65535);
+
+    // The whole painting, not one pixel: the airbrush falloff has to come back
+    // as the falloff, or the file is 8-bit with extra steps.
+    const auto before = alphaProfile(doc,     128, 129, 157);
+    const auto after  = alphaProfile(*loaded, 128, 129, 157);
+    REQUIRE(before.size() == after.size());
+    for (std::size_t i = 0; i < before.size(); ++i)
+        CHECK(std::abs(static_cast<int>(before[i]) - static_cast<int>(after[i])) <= 2);
+    CHECK(distinctLevels(after) > 20);      // still a ramp, not a staircase
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("only a 16-bit file claims the newer format version") {
+    // The last acceptance criterion: an older Sable must REFUSE a 16-bit file
+    // rather than misread it — and must not be locked out of an 8-bit one for
+    // a feature it is not using.
+    const auto manifestOf = [](const std::filesystem::path& path) {
+        mz_zip_archive zip{};
+        REQUIRE(mz_zip_reader_init_file(&zip, path.string().c_str(), 0));
+        std::size_t size = 0;
+        void* data = mz_zip_reader_extract_file_to_heap(&zip, "document.json", &size, 0);
+        REQUIRE(data != nullptr);
+        const nlohmann::json manifest =
+            nlohmann::json::parse(std::string(static_cast<const char*>(data), size));
+        mz_free(data);
+        mz_zip_reader_end(&zip);
+        return manifest;
+    };
+
+    const auto dir = std::filesystem::temp_directory_path();
+    const auto narrowPath = dir / "sable_depth8.sable";
+    const auto widePath   = dir / "sable_depth16.sable";
+
+    const Document narrowDoc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+    const Document wideDoc   = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255},
+                                            ColourDepth::Bits16);
+    REQUIRE(saveProject(narrowDoc, narrowPath).has_value());
+    REQUIRE(saveProject(wideDoc,   widePath).has_value());
+
+    const nlohmann::json narrowManifest = manifestOf(narrowPath);
+    const nlohmann::json wideManifest   = manifestOf(widePath);
+
+    CHECK(narrowManifest["format_version"] == SABLE_FORMAT_VERSION_8BIT);
+    CHECK(narrowManifest["colour"]["depth"] == 8);
+    CHECK(wideManifest["format_version"] == SABLE_FORMAT_VERSION);
+    CHECK(wideManifest["colour"]["depth"] == 16);
+    // Which is only worth anything if the two differ — otherwise the gate on
+    // load has nothing to catch.
+    CHECK(SABLE_FORMAT_VERSION > SABLE_FORMAT_VERSION_8BIT);
+
+    std::error_code ec;
+    std::filesystem::remove(narrowPath, ec);
+    std::filesystem::remove(widePath, ec);
+}
+
+TEST_CASE("a 16-bit document composites, picks and exports") {
+    // Nothing here is about precision: it is that every 8-bit consumer of a
+    // document — the screen, the eyedropper, PNG export — still gets an answer,
+    // and the same answer as each other (#1, US-13.3).
+    Document doc = makeDocument(128, 128, StraightRgba8{255, 255, 255, 255},
+                                ColourDepth::Bits16);
+    doc.active()->tileFor(TileKey{0, 0}).fill(PremulRgba16{0, 0, 32768, 32768});
+
+    const std::vector<StraightRgba8> flat = flatten(doc);
+    REQUIRE(flat.size() == 128u * 128u);
+    const StraightRgba8 picked = pickColour(doc, 40, 40);
+    CHECK(picked == flat[40 * 128 + 40]);
+    // Half-alpha blue over white: opaque once composited, and still bluer than
+    // it is red.
+    CHECK(picked.a == 255);
+    CHECK(picked.b > picked.r);
+
+    const std::vector<PremulRgba8> rect = compositeRect(doc, 0, 0, 128, 128);
+    REQUIRE(rect.size() == flat.size());
+    CHECK(rect[40 * 128 + 40].unpremultiply() == flat[40 * 128 + 40]);
+
+    const auto png = std::filesystem::temp_directory_path() / "sable_16bit.png";
+    CHECK(exportPng(doc, png).has_value());
+    std::error_code ec;
+    std::filesystem::remove(png, ec);
+}
+
+TEST_CASE("a 16-bit layer merges, fills and transforms without narrowing") {
+    Document doc = makeDocument(256, 256, StraightRgba8{0, 0, 0, 0},
+                                ColourDepth::Bits16);
+    const LayerId lower = doc.activeLayer;
+    const UndoRecord added = addLayerAbove(doc, lower, "Upper");
+    CHECK(!added.empty());
+    const LayerId upper = doc.activeLayer;
+
+    doc.layerById(lower)->tileFor(TileKey{0, 0}).fill(PremulRgba16{0, 0, 0, 65535});
+    doc.layerById(upper)->tileFor(TileKey{0, 0}).fill(PremulRgba16{300, 0, 0, 65535});
+
+    const UndoRecord merged = mergeLayerDown(doc, upper);
+    CHECK(!merged.empty());
+    const Tile* tile = doc.layerById(lower)->find(TileKey{0, 0});
+    REQUIRE(tile != nullptr);
+    CHECK(tile->depth() == ColourDepth::Bits16);
+    // 300 sits between two 8-bit steps (257 and 514). A merge that went through
+    // eight bits would land on one of them.
+    CHECK(tile->pixel(9, 9).r == 300);
+
+    // A fill takes an 8-bit colour from the picker, so nothing is lost by it —
+    // but it must not damage the 16-bit tile it lands in either.
+    const UndoRecord filled = fillSelection(doc, lower, StraightRgba8{10, 20, 30, 255});
+    CHECK(!filled.empty());
+    CHECK(doc.layerById(lower)->find(TileKey{0, 0})->depth() == ColourDepth::Bits16);
+    CHECK(narrow(doc.layerById(lower)->find(TileKey{0, 0})->pixel(9, 9)) ==
+          PremulRgba8{10, 20, 30, 255});
+
+    // A transform reads pixels and puts them back. Reading at eight bits would
+    // make nudging a selection a destructive edit.
+    doc.layerById(lower)->tileFor(TileKey{0, 0}).fill(PremulRgba16{300, 600, 900, 65535});
+    const UndoRecord moved =
+        transformRegion(doc, lower, Selection{0, 0, 64, 64}, Transform{.dx = 64.0});
+    CHECK(!moved.empty());
+    CHECK(doc.layerById(lower)->find(TileKey{0, 0})->pixel(80, 20).r == 300);
 }

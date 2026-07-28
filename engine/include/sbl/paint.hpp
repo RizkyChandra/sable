@@ -81,7 +81,14 @@ struct Dab {
     float density  = 0.0f;     // 0..1, this dab's paint strength
     float hardness = 0.0f;     // 0..1, edge falloff
     float angle    = 0.0f;     // radians, from tilt/rotation; 0 when round
-    PremulRgba8 colour{};      // density already folded in
+    /// Density already folded in, and held at 16 bits WHATEVER the document's
+    /// depth (D-023). This is where the banding is actually made: an airbrush
+    /// at density 0.06 has an 8-bit dab alpha of 15, and the soft edge of that
+    /// dab then multiplies 15 by a coverage of a few percent and rounds it to
+    /// nothing. Keeping the dab itself wide costs an 8-bit document one
+    /// `narrow` per dab — not per pixel — and it is what a 16-bit document
+    /// needs before any of the storage width is worth having.
+    PremulRgba16 colour{};
     bool  erase = false;
 };
 
@@ -104,9 +111,11 @@ struct Stroke {
     UndoRecord   pending;                  // copy-on-first-touch (D-006)
     TouchedTiles touched;
 
-    // Watercolour and smudge only: colour picked up from the canvas.
-    PremulRgba8 loadedColour{};
-    float       loadedAmount = 0.0f;
+    // Watercolour and smudge only: colour picked up from the canvas. Wide for
+    // the same reason as Dab::colour — a smear that requantised on every dab
+    // would band along its own length.
+    PremulRgba16 loadedColour{};
+    float        loadedAmount = 0.0f;
 
     [[nodiscard]] bool active() const noexcept { return !samples.empty(); }
 };

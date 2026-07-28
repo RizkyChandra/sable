@@ -183,9 +183,10 @@ Rect boundsOf(const Layer& layer, std::int32_t canvasW, std::int32_t canvasH) {
         const std::int32_t x1 = std::min<std::int32_t>(TILE_SIZE, canvasW - originX);
 
         for (std::int32_t y = y0; y < y1; ++y) {
-            const PremulRgba8* row = tile.pixels() + static_cast<std::size_t>(y) * TILE_SIZE;
             for (std::int32_t x = x0; x < x1; ++x) {
-                if (row[x].a == 0) continue;
+                // Depth-agnostic: this only asks whether a pixel is empty, and
+                // an export scan is nowhere near the hot path.
+                if (tile.pixel(x, y).a == 0) continue;
                 minX = std::min(minX, originX + x);
                 maxX = std::max(maxX, originX + x);
                 minY = std::min(minY, originY + y);
@@ -213,8 +214,11 @@ std::vector<unsigned char> encodeRegion(const Layer& layer, Rect r) {
 
         for (std::int32_t y = top; y < bottom; ++y) {
             for (std::int32_t x = left; x < right; ++x) {
+                // ORA layers are 8-bit PNGs, so this is a real export boundary
+                // and the narrowing belongs here (D-023). Unpremultiplied wide
+                // and narrowed after, which is one rounding rather than two.
                 const StraightRgba8 c =
-                    tile.pixel(x - originX, y - originY).unpremultiply();
+                    narrow(tile.pixel(x - originX, y - originY).unpremultiply());
                 const std::size_t at =
                     (static_cast<std::size_t>(y - r.y) * static_cast<std::size_t>(r.w) +
                      static_cast<std::size_t>(x - r.x)) * 4;

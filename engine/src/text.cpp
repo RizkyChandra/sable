@@ -256,11 +256,16 @@ void blitCoverage(Layer& layer, const unsigned char* bitmap, int bw, int bh,
             const int tx = px - key.first  * TILE_SIZE;
             const int ty = py - key.second * TILE_SIZE;
 
-            const auto scale = [&](std::uint8_t c) {
-                return static_cast<std::uint8_t>((c * coverage + 127) / 255);
+            // Widened before coverage is applied, not after: the whole of a
+            // glyph's antialiasing lives in this multiply, and doing it at
+            // eight bits on a 16-bit layer would put stair-steps back into
+            // exactly the edges the layer's depth was chosen to smooth.
+            const auto scale = [&](std::uint16_t c) {
+                return static_cast<std::uint16_t>((c * coverage + 127) / 255);
             };
-            const PremulRgba8 src{scale(colour.r), scale(colour.g), scale(colour.b),
-                                  scale(colour.a)};
+            const PremulRgba16 wide = widen(colour);
+            const PremulRgba16 src{scale(wide.r), scale(wide.g), scale(wide.b),
+                                   scale(wide.a)};
             tile->setPixel(tx, ty, over(src, tile->pixel(tx, ty)));
         }
     }

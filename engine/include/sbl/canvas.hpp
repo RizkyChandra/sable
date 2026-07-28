@@ -24,8 +24,14 @@ namespace sbl {
 // D-004: premultiplied and straight alpha are DIFFERENT TYPES. No implicit
 // conversion, no constructor taking the other — the compiler has to reject a
 // mix-up or the split earns nothing.
+//
+// D-023 adds a second axis: 8-bit and 16-bit channels are also distinct types,
+// for exactly the same reason and by exactly the same mechanism. The only legal
+// crossings are the four named `widen`/`narrow` functions below, so a truncation
+// is something somebody typed rather than something a compiler did quietly.
 
 struct StraightRgba8;
+struct StraightRgba16;
 
 /// Channels already multiplied by alpha. Everything inside the engine.
 /// 50% red is {128, 0, 0, 128} — not {255, 0, 0, 128}.
@@ -42,15 +48,82 @@ struct StraightRgba8 {
     friend bool operator==(const StraightRgba8&, const StraightRgba8&) = default;
 };
 
+/// The same pair one channel width up (D-023). Full scale is 65535, not 255 —
+/// a 16-bit value is NOT an 8-bit value with room to spare, and the type says so.
+struct PremulRgba16 {
+    std::uint16_t r = 0, g = 0, b = 0, a = 0;
+    [[nodiscard]] StraightRgba16 unpremultiply() const noexcept;
+    friend bool operator==(const PremulRgba16&, const PremulRgba16&) = default;
+};
+
+struct StraightRgba16 {
+    std::uint16_t r = 0, g = 0, b = 0, a = 0;
+    [[nodiscard]] PremulRgba16 premultiply() const noexcept;
+    friend bool operator==(const StraightRgba16&, const StraightRgba16&) = default;
+};
+
+// The channel-width boundary, in four functions and nowhere else.
+//
+// `widen` is exact and `narrow(widen(c)) == c` for every c, which is what lets
+// an 8-bit source colour travel through a 16-bit code path and come back
+// unchanged. `narrow` is where precision is actually lost, so it is spelled out
+// at each call site — an unavoidable one is at the PNG export boundary, and an
+// avoidable one is a bug.
+
+[[nodiscard]] constexpr std::uint16_t widenChannel(std::uint8_t c) noexcept {
+    return static_cast<std::uint16_t>(c * 257);      // 0 -> 0, 255 -> 65535
+}
+
+/// Round-to-nearest divide by 257. Exact: no lookup table, no drift at the ends.
+[[nodiscard]] constexpr std::uint8_t narrowChannel(std::uint16_t c) noexcept {
+    return static_cast<std::uint8_t>((static_cast<std::uint32_t>(c) * 255u + 32895u) >> 16);
+}
+
+[[nodiscard]] constexpr PremulRgba16 widen(PremulRgba8 c) noexcept {
+    return PremulRgba16{widenChannel(c.r), widenChannel(c.g), widenChannel(c.b),
+                        widenChannel(c.a)};
+}
+[[nodiscard]] constexpr StraightRgba16 widen(StraightRgba8 c) noexcept {
+    return StraightRgba16{widenChannel(c.r), widenChannel(c.g), widenChannel(c.b),
+                          widenChannel(c.a)};
+}
+[[nodiscard]] constexpr PremulRgba8 narrow(PremulRgba16 c) noexcept {
+    return PremulRgba8{narrowChannel(c.r), narrowChannel(c.g), narrowChannel(c.b),
+                       narrowChannel(c.a)};
+}
+[[nodiscard]] constexpr StraightRgba8 narrow(StraightRgba16 c) noexcept {
+    return StraightRgba8{narrowChannel(c.r), narrowChannel(c.g), narrowChannel(c.b),
+                         narrowChannel(c.a)};
+}
+
 /// dst = src + dst * (1 - src.a), per channel, no per-pixel divide.
-[[nodiscard]] PremulRgba8 over(PremulRgba8 src, PremulRgba8 dst) noexcept;
+[[nodiscard]] PremulRgba8  over(PremulRgba8 src, PremulRgba8 dst) noexcept;
+[[nodiscard]] PremulRgba16 over(PremulRgba16 src, PremulRgba16 dst) noexcept;
+
+/// Which channel width a document's tiles are stored at (D-023). 8-bit is the
+/// default and stays the default: an artist who does not need 16 bits should not
+/// pay double the memory and half the undo history for it.
+///
+/// The values are the manifest's `colour.depth`, so the enum and the file format
+/// cannot drift apart.
+enum class ColourDepth : std::uint8_t { Bits8 = 8, Bits16 = 16 };
+
+[[nodiscard]] constexpr std::string_view depthName(ColourDepth d) noexcept {
+    return d == ColourDepth::Bits16 ? "16-bit" : "8-bit";
+}
 
 // --------------------------------------------------------------------- tile
 // D-005: the unit of allocation, of redraw, of undo, and of texture upload.
 
 inline constexpr int TILE_SIZE   = 256;
 inline constexpr int TILE_PIXELS = TILE_SIZE * TILE_SIZE;
-inline constexpr int TILE_BYTES  = TILE_PIXELS * 4;   // 262'144
+
+/// D-023: this is why `TILE_BYTES` is gone. A tile is 256 KiB at 8 bits and
+/// 512 KiB at 16, so every byte count — the undo budget the artist is shown
+/// most of all — has to ask a tile how big it is rather than assume.
+[[nodiscard]] constexpr std::size_t tileBytes(ColourDepth d) noexcept {
+    return static_cast<std::size_t>(TILE_PIXELS) * (d == ColourDepth::Bits16 ? 8u : 4u);
+}
 
 /// Ticks once for every handle to a tile's pixels that could write to them.
 ///
@@ -62,48 +135,91 @@ inline constexpr int TILE_BYTES  = TILE_PIXELS * 4;   // 262'144
 /// `cloneDocument` already relies on for the autosave hand-off.
 inline std::uint64_t g_tileStamp = 0;
 
-/// Premultiplied RGBA8, row-major, no padding.
+/// Premultiplied RGBA, row-major, no padding, at one of the two channel widths.
 /// Heap-allocated deliberately: 256 KiB must never land on the stack, and
 /// moving a Tile must stay a pointer move rather than a memcpy.
+///
+/// A tile's depth is fixed at construction and never changes. Exactly one of
+/// the two buffers below is allocated, so an 8-bit document allocates and
+/// touches precisely what it always did (D-023: 8-bit must not pay for 16-bit).
 class Tile {
 public:
-    Tile() : px_(std::make_unique<PremulRgba8[]>(TILE_PIXELS)), stamp_(++g_tileStamp) {}
+    /// Default 8-bit, so every existing construction site keeps its meaning
+    /// rather than silently acquiring a new one.
+    Tile() : Tile(ColourDepth::Bits8) {}
+    explicit Tile(ColourDepth depth);
+
     Tile(Tile&&) noexcept            = default;   // move-only, by design
     Tile& operator=(Tile&&) noexcept = default;
     Tile(const Tile&)                = delete;    // copy must be explicit
     Tile& operator=(const Tile&)     = delete;
 
-    /// The only way to copy 256 KiB. Make it a thing you have to type.
+    /// The only way to copy a quarter of a megabyte. Make it a thing you have
+    /// to type. The copy keeps this tile's depth.
     [[nodiscard]] Tile clone() const;
 
+    [[nodiscard]] ColourDepth depth()    const noexcept { return depth_; }
+    [[nodiscard]] std::size_t byteSize() const noexcept { return tileBytes(depth_); }
+
+    /// Raw access at ONE width. **Null when the tile is the other depth** —
+    /// a path that has not been taught about 16-bit therefore fails at once and
+    /// visibly, instead of writing half a drawing's worth of truncated colour.
+    ///
     /// Non-const, so handing it out is indistinguishable from writing through
     /// it. That is the whole of the invalidation story for a backend that
     /// keeps its own copy: it cannot be told about a write it did not make, so
     /// instead nobody can obtain the means to write without moving the stamp.
-    [[nodiscard]] PremulRgba8* pixels() noexcept {
+    [[nodiscard]] PremulRgba8* pixels8() noexcept {
         stamp_ = ++g_tileStamp;
-        return px_.get();
+        return px8_.get();
     }
-    [[nodiscard]] const PremulRgba8* pixels() const noexcept { return px_.get(); }
+    [[nodiscard]] const PremulRgba8* pixels8() const noexcept { return px8_.get(); }
+    [[nodiscard]] PremulRgba16* pixels16() noexcept {
+        stamp_ = ++g_tileStamp;
+        return px16_.get();
+    }
+    [[nodiscard]] const PremulRgba16* pixels16() const noexcept { return px16_.get(); }
 
-    [[nodiscard]] PremulRgba8 pixel(int x, int y) const noexcept {
-        return px_[static_cast<std::size_t>(y) * TILE_SIZE + x];
+    /// Depth-agnostic single-pixel access, in 16-bit units whatever the tile is.
+    ///
+    /// This is what the cold paths use — fills, transforms, text, importers —
+    /// so that they exist once rather than twice. It costs an 8-bit tile a
+    /// multiply on read and a divide-by-257 on write, and since
+    /// `narrow(widen(c)) == c` an 8-bit document that pushes an 8-bit colour
+    /// through here stores exactly the byte it would have stored before.
+    [[nodiscard]] PremulRgba16 pixel(int x, int y) const noexcept {
+        const auto at = static_cast<std::size_t>(y) * TILE_SIZE + x;
+        return px16_ ? px16_[at] : widen(px8_[at]);
     }
-    void setPixel(int x, int y, PremulRgba8 c) noexcept {
+    void setPixel(int x, int y, PremulRgba16 c) noexcept {
         stamp_ = ++g_tileStamp;
-        px_[static_cast<std::size_t>(y) * TILE_SIZE + x] = c;
+        const auto at = static_cast<std::size_t>(y) * TILE_SIZE + x;
+        if (px16_) px16_[at] = c;
+        else       px8_[at]  = narrow(c);
     }
+
+    /// Writing 8-bit data is always safe at either depth — `widen` loses
+    /// nothing, and a caller who only had eight bits cannot supply more. It is
+    /// READING that has to be depth-correct, which is why there is no 8-bit
+    /// `pixel()` to match this.
+    void setPixel(int x, int y, PremulRgba8 c) noexcept { setPixel(x, y, widen(c)); }
 
     /// What the host pixels are, as a value. Equal stamps mean equal contents;
     /// unequal stamps mean no more than "assume they differ". Measured cost of
     /// keeping it: none — a 4-megapixel flood fill times the same either way.
     [[nodiscard]] std::uint64_t stamp() const noexcept { return stamp_; }
 
-    void fill(PremulRgba8 c) noexcept;
+    void fill(PremulRgba16 c) noexcept;
+    void fill(PremulRgba8 c) noexcept { fill(widen(c)); }   // see setPixel
     [[nodiscard]] bool isFullyTransparent() const noexcept;
 
 private:
-    std::unique_ptr<PremulRgba8[]> px_;
+    // Exactly one is non-null; `depth_` says which. Two members rather than one
+    // buffer and a reinterpret_cast, because the aliasing rules are not worth
+    // arguing with for sixteen bytes per 256 KiB tile.
+    std::unique_ptr<PremulRgba8[]>  px8_;
+    std::unique_ptr<PremulRgba16[]> px16_;
+    ColourDepth   depth_ = ColourDepth::Bits8;
     std::uint64_t stamp_ = 0;
 };
 
@@ -199,6 +315,11 @@ inline constexpr std::array<BlendMode, 13> ALL_BLEND_MODES{
 /// classic source of dark fringes.
 [[nodiscard]] PremulRgba8 blendOver(BlendMode mode, PremulRgba8 src,
                                     PremulRgba8 dst) noexcept;
+/// The 16-bit twin (D-023). Shares `blendChannel` — the blend formulae are
+/// defined on 0..1 floats and have no width of their own, so only the
+/// normalisation and the rounding at the end differ.
+[[nodiscard]] PremulRgba16 blendOver(BlendMode mode, PremulRgba16 src,
+                                     PremulRgba16 dst) noexcept;
 
 using LayerId = std::uint32_t;                 // stable; never reused in a document
 inline constexpr LayerId NO_LAYER = 0;
@@ -211,6 +332,14 @@ struct Layer {
     /// Sparse (D-005). Raster layers only; a Folder keeps this empty.
     /// An absent entry means fully transparent — not a buffer of zeros.
     TileMap tiles;
+
+    /// What depth `tileFor` allocates at. Kept on the Layer rather than looked
+    /// up from the Document because the paint path is deliberately given a
+    /// `PaintTarget`, not a document (see `sbl/paint.hpp`), and an importer
+    /// blitting into a bare Layer has no document either. `Document::depth` is
+    /// still the authority — everything that makes a Layer copies it from
+    /// there, and `cloneDocument` carries it across the autosave hand-off.
+    ColourDepth depth = ColourDepth::Bits8;
 
     float     opacity = 1.0f;          // 0..1, applied at composite time
     BlendMode blend   = BlendMode::Normal;
@@ -410,6 +539,12 @@ struct Document {
     std::uint32_t dpi    = 72;
     StraightRgba8 background{255, 255, 255, 255};
 
+    /// D-023, chosen when the document is made and never changed afterwards:
+    /// converting a painting's depth under the artist is a destructive edit,
+    /// and one going down would throw away exactly what they turned it on for.
+    /// Written to and read from the `.sable` manifest as `colour.depth`.
+    ColourDepth depth = ColourDepth::Bits8;
+
     std::vector<Layer> layers;             // index 0 = bottom
     LayerId  activeLayer = NO_LAYER;
     LayerId  nextLayerId = 1;              // never reused within a document
@@ -443,8 +578,12 @@ struct Document {
 };
 
 /// A blank document with one raster layer, ready to paint on.
+///
+/// `depth` defaults to 8-bit and stays defaulted (D-023), so the hundred
+/// existing callers keep the document they asked for.
 [[nodiscard]] Document makeDocument(std::int32_t w, std::int32_t h,
-                                    StraightRgba8 background);
+                                    StraightRgba8 background,
+                                    ColourDepth depth = ColourDepth::Bits8);
 
 /// A deep, independent copy — every tile cloned, no undo history.
 ///

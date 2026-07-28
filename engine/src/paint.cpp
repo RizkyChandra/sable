@@ -43,6 +43,11 @@ constexpr float lerpf(float a, float b, float t) noexcept { return a + (b - a) *
     return static_cast<std::uint8_t>(std::lround(static_cast<float>(c) * f));
 }
 
+[[nodiscard]] std::uint16_t scale16(std::uint16_t c, float f) noexcept {
+    return static_cast<std::uint16_t>(
+        std::clamp<long>(std::lround(static_cast<float>(c) * f), 0L, 65535L));
+}
+
 [[nodiscard]] Dab makeDab(const BrushPreset& p, StraightRgba8 colour,
                           const InputSample& s) noexcept {
     Dab d;
@@ -56,10 +61,17 @@ constexpr float lerpf(float a, float b, float t) noexcept { return a + (b - a) *
 
     // Density is folded into the colour here, not at blend time, so the
     // per-pixel loop stays a multiply and an add.
+    //
+    // Widened FIRST and scaled second. Because `widen` is exact and 65535/257
+    // is 255, `narrow(scale16(widen(c), f))` is the old `scale8(c, f)` — so an
+    // 8-bit document gets the dab it always got, and a 16-bit one gets the bits
+    // that the old order threw away before they could be used.
     const float alpha = d.density * (static_cast<float>(colour.a) / 255.0f);
-    d.colour = PremulRgba8{scale8(colour.r, alpha), scale8(colour.g, alpha),
-                           scale8(colour.b, alpha),
-                           static_cast<std::uint8_t>(std::lround(alpha * 255.0f))};
+    const StraightRgba16 wide = widen(colour);
+    d.colour = PremulRgba16{scale16(wide.r, alpha), scale16(wide.g, alpha),
+                            scale16(wide.b, alpha),
+                            static_cast<std::uint16_t>(
+                                std::lround(std::clamp(alpha, 0.0f, 1.0f) * 65535.0f))};
     return d;
 }
 
@@ -208,7 +220,7 @@ void beginStroke(Stroke& s, const BrushPreset& preset, StraightRgba8 colour,
     s.pending.tiles.reserve(16);
     s.touched.clear();
 
-    s.loadedColour = PremulRgba8{};
+    s.loadedColour = PremulRgba16{};
     s.loadedAmount = 0.0f;
 }
 
@@ -294,10 +306,21 @@ void CpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
             const std::int32_t y0 = std::max(minY, oy);
             const std::int32_t y1 = std::min(maxY, oy + TILE_SIZE - 1);
 
-            PremulRgba8* px = tile->pixels();
+            // The coverage geometry is identical at both depths, so it is
+            // written once; only the four lines that touch a pixel differ, and
+            // they are the two blocks below. D-023 asks for the second
+            // implementation written out rather than a template over the
+            // channel type, and this is as much of it as actually differs.
+            const bool wide = tile->depth() == ColourDepth::Bits16;
+            PremulRgba8*  px8  = wide ? nullptr : tile->pixels8();
+            PremulRgba16* px16 = wide ? tile->pixels16() : nullptr;
+            // One narrow per dab, not per pixel: an 8-bit document pays a
+            // handful of nanoseconds a dab and nothing at all per pixel.
+            const PremulRgba8 dab8 = narrow(dab.colour);
+
             for (std::int32_t y = y0; y <= y1; ++y) {
                 const double ddy = (static_cast<double>(y) + 0.5) - dab.y;
-                PremulRgba8* row = px + static_cast<std::size_t>(y - oy) * TILE_SIZE;
+                const std::size_t rowAt = static_cast<std::size_t>(y - oy) * TILE_SIZE;
                 for (std::int32_t x = x0; x <= x1; ++x) {
                     // Scaled by the selection, not gated on it: a lasso edge is
                     // a fraction of a pixel, and rounding it to in-or-out is
@@ -314,19 +337,38 @@ void CpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
                                          dab.radius, dab.hardness) * clip;
                     if (cov <= 0.0f) continue;
 
-                    PremulRgba8& dst = row[x - ox];
+                    if (wide) {
+                        PremulRgba16& dst = px16[rowAt + static_cast<std::size_t>(x - ox)];
+                        if (t.layer.preserveOpacity)
+                            cov *= static_cast<float>(dst.a) / 65535.0f;
+
+                        if (dab.erase) {
+                            const float keep =
+                                1.0f - cov * (static_cast<float>(dab.colour.a) / 65535.0f);
+                            dst = PremulRgba16{scale16(dst.r, keep), scale16(dst.g, keep),
+                                               scale16(dst.b, keep), scale16(dst.a, keep)};
+                        } else {
+                            const PremulRgba16 src{
+                                scale16(dab.colour.r, cov), scale16(dab.colour.g, cov),
+                                scale16(dab.colour.b, cov), scale16(dab.colour.a, cov)};
+                            dst = over(src, dst);
+                        }
+                        continue;
+                    }
+
+                    PremulRgba8& dst = px8[rowAt + static_cast<std::size_t>(x - ox)];
                     if (t.layer.preserveOpacity)
                         cov *= static_cast<float>(dst.a) / 255.0f;
 
                     if (dab.erase) {
                         const float keep =
-                            1.0f - cov * (static_cast<float>(dab.colour.a) / 255.0f);
+                            1.0f - cov * (static_cast<float>(dab8.a) / 255.0f);
                         dst = PremulRgba8{scale8(dst.r, keep), scale8(dst.g, keep),
                                           scale8(dst.b, keep), scale8(dst.a, keep)};
                     } else {
                         const PremulRgba8 src{
-                            scale8(dab.colour.r, cov), scale8(dab.colour.g, cov),
-                            scale8(dab.colour.b, cov), scale8(dab.colour.a, cov)};
+                            scale8(dab8.r, cov), scale8(dab8.g, cov),
+                            scale8(dab8.b, cov), scale8(dab8.a, cov)};
                         dst = over(src, dst);
                     }
                 }
@@ -345,6 +387,15 @@ PremulRgba8 lerpPremul(PremulRgba8 a, PremulRgba8 b, float t) noexcept {
     return PremulRgba8{mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b), mix(a.a, b.a)};
 }
 
+PremulRgba16 lerpPremul(PremulRgba16 a, PremulRgba16 b, float t) noexcept {
+    const auto mix = [t](std::uint16_t p, std::uint16_t q) {
+        return static_cast<std::uint16_t>(std::clamp<long>(
+            std::lround(lerpf(static_cast<float>(p), static_cast<float>(q), t)),
+            0L, 65535L));
+    };
+    return PremulRgba16{mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b), mix(a.a, b.a)};
+}
+
 /// Turns a dab into a smear of colour carried from earlier in the stroke.
 ///
 /// blending    — how much canvas colour under the dab is pulled into the load.
@@ -357,7 +408,7 @@ void loadAndDeposit(Stroke& s, const PaintTarget& t, Dab& dab) noexcept {
     const auto px = static_cast<std::int32_t>(std::lround(dab.x));
     const auto py = static_cast<std::int32_t>(std::lround(dab.y));
 
-    PremulRgba8 under{};
+    PremulRgba16 under{};
     if (px >= 0 && py >= 0 && px < t.width && py < t.height) {
         const TileKey key{tileIndex(px), tileIndex(py)};
         if (const Tile* tile = t.layer.find(key); tile != nullptr)
@@ -370,15 +421,15 @@ void loadAndDeposit(Stroke& s, const PaintTarget& t, Dab& dab) noexcept {
 
     s.loadedColour = lerpPremul(s.loadedColour, under, blending);
     s.loadedAmount = s.loadedAmount * persistence +
-                     (1.0f - persistence) * (static_cast<float>(under.a) / 255.0f);
+                     (1.0f - persistence) * (static_cast<float>(under.a) / 65535.0f);
 
     // Deposit what is carried, thinned by dilution. The first dab of a stroke
     // carries nothing, so a smudge starts by picking up rather than painting.
     const float alpha = std::clamp(dab.density * s.loadedAmount * (1.0f - dilution),
                                    0.0f, 1.0f);
-    const StraightRgba8 carried = s.loadedColour.unpremultiply();
-    dab.colour = StraightRgba8{carried.r, carried.g, carried.b,
-                               static_cast<std::uint8_t>(std::lround(alpha * 255.0f))}
+    const StraightRgba16 carried = s.loadedColour.unpremultiply();
+    dab.colour = StraightRgba16{carried.r, carried.g, carried.b,
+                                static_cast<std::uint16_t>(std::lround(alpha * 65535.0f))}
                      .premultiply();
 }
 
@@ -406,10 +457,10 @@ struct PixelWriter {
     UndoRecord&   undo;
     TouchedTiles& touched;
 
-    [[nodiscard]] PremulRgba8 get(std::int32_t x, std::int32_t y) {
+    [[nodiscard]] PremulRgba16 get(std::int32_t x, std::int32_t y) {
         const TileKey key{tileIndex(x), tileIndex(y)};
         const Tile* tile = layer.find(key);
-        if (tile == nullptr) return PremulRgba8{};
+        if (tile == nullptr) return PremulRgba16{};
         return tile->pixel(x - key.first * TILE_SIZE, y - key.second * TILE_SIZE);
     }
 
@@ -417,13 +468,23 @@ struct PixelWriter {
     /// write — which is what every rectangular selection still gets — and
     /// anything less is the anti-aliased edge of a lasso or a wand fading out
     /// rather than stepping.
+    ///
+    /// The mix happens at the LAYER's depth, not always at 16 bits: at 16 bits
+    /// so a soft edge over 16-bit paint keeps it, and at 8 bits so an 8-bit
+    /// document produces the byte it always produced. Fills take an 8-bit
+    /// colour either way — it came from the colour picker — so nothing is lost
+    /// by widening it on the way in.
     void blendIn(std::int32_t x, std::int32_t y, PremulRgba8 colour,
                  std::uint8_t cov) {
         if (cov == 255) { set(x, y, colour); return; }
-        set(x, y, lerpPremul(get(x, y), colour, static_cast<float>(cov) / 255.0f));
+        const float t = static_cast<float>(cov) / 255.0f;
+        if (layer.depth == ColourDepth::Bits16)
+            set(x, y, lerpPremul(get(x, y), widen(colour), t));
+        else
+            set(x, y, lerpPremul(narrow(get(x, y)), colour, t));
     }
 
-    void set(std::int32_t x, std::int32_t y, PremulRgba8 colour) {
+    void set(std::int32_t x, std::int32_t y, PremulRgba16 colour) {
         const TileKey key{tileIndex(x), tileIndex(y)};
         Tile* tile = layer.find(key);
         if (touched.insert(key).second) {
@@ -435,6 +496,12 @@ struct PixelWriter {
         }
         if (tile == nullptr) tile = &layer.tileFor(key);
         tile->setPixel(x - key.first * TILE_SIZE, y - key.second * TILE_SIZE, colour);
+    }
+
+    /// 8-bit in is always lossless (see Tile::setPixel), so the two fills and
+    /// the transform's clear pass keep passing the colour they already have.
+    void set(std::int32_t x, std::int32_t y, PremulRgba8 colour) {
+        set(x, y, widen(colour));
     }
 };
 
@@ -612,7 +679,12 @@ UndoRecord CpuBackend::transformRegion(Document& doc, LayerId target,
     // Coverage decides how much of each pixel travels, so a lasso moves its own
     // shape rather than the box around it. A rectangle covers everything it
     // spans and this is the old behaviour exactly.
-    std::vector<PremulRgba8> lifted(srcW * srcH);
+    // Lifted at 16 bits whatever the layer is. Reading a 16-bit layer at 8
+    // would quantise the artist's paint as the price of nudging it — a
+    // transform is not supposed to cost precision — and on an 8-bit layer
+    // `pixel()` hands back exactly `widen(the stored byte)`, so the round trip
+    // through `writer.set` puts the same byte back.
+    std::vector<PremulRgba16> lifted(srcW * srcH);
     for (std::size_t row = 0; row < srcH; ++row) {
         for (std::size_t col = 0; col < srcW; ++col) {
             const std::int32_t px = sx0 + static_cast<std::int32_t>(col);
@@ -622,12 +694,12 @@ UndoRecord CpuBackend::transformRegion(Document& doc, LayerId target,
             const TileKey key{tileIndex(px), tileIndex(py)};
             const Tile* tile = layer->find(key);
             if (tile == nullptr) continue;
-            PremulRgba8 c =
+            PremulRgba16 c =
                 tile->pixel(px - key.first * TILE_SIZE, py - key.second * TILE_SIZE);
             if (cov != 255) {
                 const float f = static_cast<float>(cov) / 255.0f;
-                c = PremulRgba8{scale8(c.r, f), scale8(c.g, f), scale8(c.b, f),
-                                scale8(c.a, f)};
+                c = PremulRgba16{scale16(c.r, f), scale16(c.g, f), scale16(c.b, f),
+                                 scale16(c.a, f)};
             }
             lifted[row * srcW + col] = c;
         }
@@ -694,28 +766,28 @@ UndoRecord CpuBackend::transformRegion(Document& doc, LayerId target,
             const double tx = fx - static_cast<double>(x0);
             const double ty = fy - static_cast<double>(y0);
 
-            const auto sample = [&](std::int64_t px, std::int64_t py) -> PremulRgba8 {
+            const auto sample = [&](std::int64_t px, std::int64_t py) -> PremulRgba16 {
                 if (px < 0 || py < 0 || px >= static_cast<std::int64_t>(srcW) ||
-                    py >= static_cast<std::int64_t>(srcH)) return PremulRgba8{};
+                    py >= static_cast<std::int64_t>(srcH)) return PremulRgba16{};
                 return lifted[static_cast<std::size_t>(py) * srcW +
                               static_cast<std::size_t>(px)];
             };
-            const PremulRgba8 p00 = sample(x0, y0);
-            const PremulRgba8 p10 = sample(x0 + 1, y0);
-            const PremulRgba8 p01 = sample(x0, y0 + 1);
-            const PremulRgba8 p11 = sample(x0 + 1, y0 + 1);
+            const PremulRgba16 p00 = sample(x0, y0);
+            const PremulRgba16 p10 = sample(x0 + 1, y0);
+            const PremulRgba16 p01 = sample(x0, y0 + 1);
+            const PremulRgba16 p11 = sample(x0 + 1, y0 + 1);
 
-            const auto mix = [&](std::uint8_t a, std::uint8_t b, std::uint8_t c,
-                                 std::uint8_t d) {
+            const auto mix = [&](std::uint16_t a, std::uint16_t b, std::uint16_t c,
+                                 std::uint16_t d) {
                 const double top    = a + (b - a) * tx;
                 const double bottom = c + (d - c) * tx;
-                return static_cast<std::uint8_t>(
-                    std::clamp(std::lround(top + (bottom - top) * ty), 0L, 255L));
+                return static_cast<std::uint16_t>(
+                    std::clamp(std::lround(top + (bottom - top) * ty), 0L, 65535L));
             };
-            const PremulRgba8 value{mix(p00.r, p10.r, p01.r, p11.r),
-                                    mix(p00.g, p10.g, p01.g, p11.g),
-                                    mix(p00.b, p10.b, p01.b, p11.b),
-                                    mix(p00.a, p10.a, p01.a, p11.a)};
+            const PremulRgba16 value{mix(p00.r, p10.r, p01.r, p11.r),
+                                     mix(p00.g, p10.g, p01.g, p11.g),
+                                     mix(p00.b, p10.b, p01.b, p11.b),
+                                     mix(p00.a, p10.a, p01.a, p11.a)};
             if (value.a == 0) continue;      // leave what the clear left behind
             writer.set(x, y, value);
         }

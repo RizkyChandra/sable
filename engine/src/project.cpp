@@ -68,11 +68,33 @@ std::string tilePath(LayerId layer, TileKey key) {
            std::to_string(key.first) + "_" + std::to_string(key.second) + ".png";
 }
 
-/// Encodes one tile as straight-alpha RGBA8, so external tools can open it.
+/// Encodes one tile as straight-alpha RGBA, so external tools can open it —
+/// 8 bits per channel from an 8-bit tile, 16 from a 16-bit one. PNG carries
+/// both, so a 16-bit project's tiles stay openable in any image viewer, and
+/// saving a 16-bit painting does not quietly throw away what it was for.
 std::vector<unsigned char> encodeTile(const Tile& tile) {
-    std::vector<unsigned char> straight(
-        static_cast<std::size_t>(TILE_PIXELS) * 4);
-    const PremulRgba8* src = tile.pixels();
+    std::vector<unsigned char> png;
+    if (tile.depth() == ColourDepth::Bits16) {
+        // PNG is big-endian, so the high byte goes first. lodepng will not do
+        // this for us from a 16-bit-per-channel host buffer.
+        std::vector<unsigned char> straight(static_cast<std::size_t>(TILE_PIXELS) * 8);
+        const PremulRgba16* src = tile.pixels16();
+        for (int i = 0; i < TILE_PIXELS; ++i) {
+            const StraightRgba16 c = src[i].unpremultiply();
+            const std::uint16_t ch[4]{c.r, c.g, c.b, c.a};
+            for (int k = 0; k < 4; ++k) {
+                straight[static_cast<std::size_t>(i) * 8 + k * 2 + 0] =
+                    static_cast<unsigned char>(ch[k] >> 8);
+                straight[static_cast<std::size_t>(i) * 8 + k * 2 + 1] =
+                    static_cast<unsigned char>(ch[k] & 0xFF);
+            }
+        }
+        lodepng::encode(png, straight, TILE_SIZE, TILE_SIZE, LCT_RGBA, 16);
+        return png;
+    }
+
+    std::vector<unsigned char> straight(static_cast<std::size_t>(TILE_PIXELS) * 4);
+    const PremulRgba8* src = tile.pixels8();
     for (int i = 0; i < TILE_PIXELS; ++i) {
         const StraightRgba8 c = src[i].unpremultiply();
         straight[i * 4 + 0] = c.r;
@@ -80,22 +102,52 @@ std::vector<unsigned char> encodeTile(const Tile& tile) {
         straight[i * 4 + 2] = c.b;
         straight[i * 4 + 3] = c.a;
     }
-
-    std::vector<unsigned char> png;
     lodepng::encode(png, straight, TILE_SIZE, TILE_SIZE);
     return png;
 }
 
+/// Decodes into a tile of `out`'s own depth, whatever the PNG's is. The
+/// document's manifest decides the depth, not each tile: a 16-bit project whose
+/// tile happens to have been written as 8-bit still gets 16-bit storage to
+/// paint into, and an 8-bit project cannot be widened by a stray file.
 bool decodeTile(const unsigned char* data, std::size_t size, Tile& out) {
-    std::vector<unsigned char> straight;
     unsigned w = 0, h = 0;
-    if (lodepng::decode(straight, w, h, data, size) != 0) return false;
+    lodepng::State state;
+    if (lodepng_inspect(&w, &h, &state, data, size) != 0) return false;
     if (w != TILE_SIZE || h != TILE_SIZE) return false;
+    const bool wideFile = state.info_png.color.bitdepth == 16;
 
-    PremulRgba8* dst = out.pixels();
+    std::vector<unsigned char> straight;
+    if (lodepng::decode(straight, w, h, data, size, LCT_RGBA, wideFile ? 16 : 8) != 0)
+        return false;
+
+    if (wideFile) {
+        for (int i = 0; i < TILE_PIXELS; ++i) {
+            const auto at = static_cast<std::size_t>(i) * 8;
+            const auto ch = [&](int k) {
+                return static_cast<std::uint16_t>(
+                    (static_cast<unsigned>(straight[at + k * 2]) << 8) |
+                    straight[at + k * 2 + 1]);
+            };
+            out.setPixel(i % TILE_SIZE, i / TILE_SIZE,
+                         StraightRgba16{ch(0), ch(1), ch(2), ch(3)}.premultiply());
+        }
+        return true;
+    }
+
+    if (out.depth() == ColourDepth::Bits8) {
+        // The original path, byte for byte: an 8-bit project reads exactly what
+        // it always read, at the speed it always read it.
+        PremulRgba8* dst = out.pixels8();
+        for (int i = 0; i < TILE_PIXELS; ++i)
+            dst[i] = StraightRgba8{straight[i * 4 + 0], straight[i * 4 + 1],
+                                   straight[i * 4 + 2], straight[i * 4 + 3]}.premultiply();
+        return true;
+    }
     for (int i = 0; i < TILE_PIXELS; ++i)
-        dst[i] = StraightRgba8{straight[i * 4 + 0], straight[i * 4 + 1],
-                               straight[i * 4 + 2], straight[i * 4 + 3]}.premultiply();
+        out.setPixel(i % TILE_SIZE, i / TILE_SIZE,
+                     StraightRgba8{straight[i * 4 + 0], straight[i * 4 + 1],
+                                   straight[i * 4 + 2], straight[i * 4 + 3]}.premultiply());
     return true;
 }
 
@@ -160,14 +212,24 @@ std::expected<void, Error> saveProject(const Document& doc,
     };
 
     json manifest;
-    manifest["format_version"] = SABLE_FORMAT_VERSION;
+    // An 8-bit document keeps declaring the version it always declared, so
+    // saving from this build does not lock an ordinary painting out of an
+    // older Sable for a feature it is not using. Only a 16-bit document claims
+    // the newer format — and then the version gate on load is what makes an
+    // older reader say "written by a newer version of Sable" instead of reading
+    // half-width tiles as though they were the whole picture.
+    manifest["format_version"] = doc.depth == ColourDepth::Bits16
+                                     ? SABLE_FORMAT_VERSION
+                                     : SABLE_FORMAT_VERSION_8BIT;
     manifest["app"]            = "Sable 0.1.0";
     manifest["width"]          = doc.width;
     manifest["height"]         = doc.height;
     manifest["dpi"]            = doc.dpi;
     manifest["background"]     = hexColour(doc.background);
     manifest["tile_size"]      = TILE_SIZE;
-    manifest["colour"] = {{"depth", 8}, {"space", "sRGB"}, {"premultiplied", true}};
+    manifest["colour"] = {{"depth", static_cast<int>(doc.depth)},
+                          {"space", "sRGB"},
+                          {"premultiplied", true}};
     manifest["active_layer"]   = doc.activeLayer;
     manifest["layers"]         = json::array();
 
@@ -337,6 +399,13 @@ std::expected<Document, Error> loadProject(const std::filesystem::path& path) {
     doc.background = parseColour(manifest.value("background", std::string("#ffffffff")));
     doc.path = path;
 
+    // D-023. Absent, or any value that is not 16, means 8 — which is what every
+    // file written before this feature says, and what a hand-edited manifest
+    // with a typo in it should get rather than a document twice the size.
+    if (manifest.contains("colour") && manifest["colour"].is_object() &&
+        manifest["colour"].value("depth", 8) == 16)
+        doc.depth = ColourDepth::Bits16;
+
     // Absent before v3, and in any v3 document with nothing selected. A
     // malformed one is dropped rather than repaired: a selection that is not
     // the one the artist drew would send the next fill somewhere they did not
@@ -389,6 +458,7 @@ std::expected<Document, Error> loadProject(const std::filesystem::path& path) {
 
     for (const auto& entry : manifest["layers"]) {
         Layer layer;
+        layer.depth = doc.depth;        // the document decides, not each layer
         layer.id   = entry.value("id", 0u);
         if (layer.id == NO_LAYER) continue;         // 0 is the reserved "no layer"
         const std::string kind = entry.value("kind", std::string("raster"));
@@ -459,7 +529,7 @@ std::expected<Document, Error> loadProject(const std::filesystem::path& path) {
         void* data = mz_zip_reader_extract_to_heap(&zip, i, &size, 0);
         if (data == nullptr) { repaired = true; continue; }
 
-        Tile tile;
+        Tile tile(doc.depth);
         const bool ok = decodeTile(static_cast<const unsigned char*>(data), size, tile);
         mz_free(data);
         if (!ok) { repaired = true; continue; }       // one bad tile, not a bad file
