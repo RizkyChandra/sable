@@ -73,6 +73,13 @@ void compositeLevel(std::vector<PremulRgba8>& buf, const Document& doc,
             continue;
         }
         const float opacity = std::clamp(layer->opacity, 0.0f, 1.0f);
+        // #48. Coverage folds into the same `scale` the opacity and the clip
+        // mask already go through, so the three are one rounding rather than
+        // three — and the layer's own alpha is published to the clip mask
+        // AFTER the mask, because a clipped layer must not show through a pixel
+        // its base has hidden.
+        const LayerMask* mask =
+            layer->mask.has_value() && layer->mask->enabled ? &*layer->mask : nullptr;
         std::vector<std::uint8_t> ownAlpha;
         if (!layer->clipToBelow) ownAlpha.assign(w * h, 0);
 
@@ -81,9 +88,19 @@ void compositeLevel(std::vector<PremulRgba8>& buf, const Document& doc,
             compositeLevel(group, doc, layer->id, r);
             for (std::size_t i = 0; i < buf.size(); ++i) {
                 PremulRgba8 src = group[i];
-                if (!ownAlpha.empty()) ownAlpha[i] = src.a;
+                // A folder's mask applies to what its children composited to,
+                // which is the whole reason a group can have one. Per pixel
+                // here, not per tile: this buffer is a region, not a tile, and
+                // a folder mask is rare enough not to earn a second path.
+                float cover = 1.0f;
+                if (mask != nullptr)
+                    cover = static_cast<float>(maskCoverage(
+                                *mask, r.x + static_cast<std::int32_t>(i % w),
+                                r.y + static_cast<std::int32_t>(i / w))) / 255.0f;
+                if (!ownAlpha.empty())
+                    ownAlpha[i] = cover < 1.0f ? scale8(src.a, cover) : src.a;
                 if (src.a == 0) continue;
-                float scale = opacity;
+                float scale = opacity * cover;
                 if (clipped) scale *= static_cast<float>(clipMask[i]) / 255.0f;
                 if (scale <= 0.0f) continue;
                 if (scale < 1.0f)
@@ -104,6 +121,13 @@ void compositeLevel(std::vector<PremulRgba8>& buf, const Document& doc,
                                                   r.x + static_cast<std::int32_t>(w) - ox});
 
                 const PremulRgba8*  px8  = tile.pixels8();
+                // The mask is keyed exactly like the pixels, so the tile that
+                // covers these pixels is the tile at THIS key — one lookup for
+                // 65'536 pixels instead of one each, which is the difference
+                // between a mask costing a multiply and costing a hash.
+                const Tile* maskTile = mask != nullptr ? mask->find(key) : nullptr;
+                const PremulRgba8* maskPx =
+                    maskTile != nullptr ? maskTile->pixels8() : nullptr;
                 for (std::int32_t ty = y0; ty < y1; ++ty) {
                     const std::size_t rowAt = static_cast<std::size_t>(ty) * TILE_SIZE;
                     // Signed: ox - r.x is negative for a tile that starts left
@@ -121,9 +145,19 @@ void compositeLevel(std::vector<PremulRgba8>& buf, const Document& doc,
                         PremulRgba8 src = px8 != nullptr
                             ? px8[rowAt + static_cast<std::size_t>(tx)]
                             : narrow(tile.pixel(tx, ty));
-                        if (!ownAlpha.empty()) ownAlpha[at] = src.a;
+                        float cover = 1.0f;
+                        if (mask != nullptr) {
+                            const std::uint8_t cov =
+                                maskTile == nullptr ? mask->outside
+                                : maskPx != nullptr
+                                    ? maskPx[rowAt + static_cast<std::size_t>(tx)].r
+                                    : narrowChannel(maskTile->pixel(tx, ty).r);
+                            cover = static_cast<float>(cov) / 255.0f;
+                        }
+                        if (!ownAlpha.empty())
+                            ownAlpha[at] = cover < 1.0f ? scale8(src.a, cover) : src.a;
                         if (src.a == 0) continue;
-                        float scale = opacity;
+                        float scale = opacity * cover;
                         if (clipped) scale *= static_cast<float>(clipMask[at]) / 255.0f;
                         if (scale <= 0.0f) continue;
                         if (scale < 1.0f)
@@ -157,10 +191,18 @@ PremulRgba8 pickLevel(const Document& doc, std::optional<LayerId> parent,
         else if (const Tile* tile = layer->find(key); tile != nullptr)
             own = narrow(tile->pixel(tx, ty));   // same narrowing as compositeLevel
 
-        if (!layer->clipToBelow) clipAlpha = own.a;
+        // The mask, in the same order and the same arithmetic compositeLevel
+        // uses: the alpha published to the clip mask is the masked one, and
+        // coverage multiplies into `scale` beside the opacity.
+        float cover = 1.0f;
+        if (layer->mask.has_value() && layer->mask->enabled)
+            cover = static_cast<float>(maskCoverage(*layer->mask, x, y)) / 255.0f;
+        const std::uint8_t ownAlpha = cover < 1.0f ? scale8(own.a, cover) : own.a;
+
+        if (!layer->clipToBelow) clipAlpha = ownAlpha;
         if (!layer->visible || layer->opacity <= 0.0f || own.a == 0) continue;
 
-        float scale = std::clamp(layer->opacity, 0.0f, 1.0f);
+        float scale = std::clamp(layer->opacity, 0.0f, 1.0f) * cover;
         if (clipped) scale *= static_cast<float>(clipAlpha) / 255.0f;
         if (scale <= 0.0f) continue;
 

@@ -265,7 +265,16 @@ void appendSample(Stroke& s, const InputSample& sample, std::vector<Dab>& out) {
 // --------------------------------------------------------------- dab -> tiles
 
 void CpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
-    if (t.layer.locked || t.layer.kind != LayerKind::Raster) return;
+    // A mask is not generated from words or curves, so painting one is allowed
+    // on the layer kinds whose pixels are protected (#48). `locked` still
+    // means locked: it is the artist saying "leave this layer alone".
+    const bool toMask = t.toMask;
+    if (t.layer.locked) return;
+    // Asked for the mask and the layer has none: paint NOTHING. Falling through
+    // to the pixels would put a stroke somewhere the artist was not looking,
+    // which is the one outcome here they cannot see coming.
+    if (toMask && !t.layer.mask.has_value()) return;
+    if (!toMask && t.layer.kind != LayerKind::Raster) return;
     if (dab.colour.a == 0 || dab.radius <= 0.0f) return;
 
     const double r = dab.radius;
@@ -286,17 +295,21 @@ void CpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
 
             // D-006: copy on FIRST touch only. Later dabs on this tile within
             // the same stroke cost nothing.
-            Tile* tile = t.layer.find(key);
+            Tile* tile = toMask ? t.layer.mask->find(key) : t.layer.find(key);
             if (t.touched.insert(key).second) {
                 TileSnapshot snap;
                 snap.layer = t.layer.id;
                 snap.key   = key;
+                snap.mask  = toMask;
                 if (tile != nullptr) snap.before.emplace(tile->clone());
                 t.undo.tiles.push_back(std::move(snap));
             }
             if (tile == nullptr) {
-                if (dab.erase) continue;          // nothing to erase from an empty tile
-                tile = &t.layer.tileFor(key);
+                // An absent MASK tile is not empty: it reads as the mask's
+                // `outside`, so an eraser has something to take away and the
+                // tile has to be allocated for it to land in.
+                if (dab.erase && !toMask) continue;
+                tile = toMask ? &t.layer.mask->tileFor(key) : &t.layer.tileFor(key);
             }
 
             const std::int32_t ox = tx * TILE_SIZE;
@@ -311,6 +324,11 @@ void CpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
             // they are the two blocks below. D-023 asks for the second
             // implementation written out rather than a template over the
             // channel type, and this is as much of it as actually differs.
+            // "Keep alpha" is about the layer's own silhouette and says nothing
+            // about a mask. Left on, it would refuse to paint back into a part
+            // of the mask the artist had erased — which is the one thing an
+            // eraser on a mask is for.
+            const bool preserve = t.layer.preserveOpacity && !toMask;
             const bool wide = tile->depth() == ColourDepth::Bits16;
             PremulRgba8*  px8  = wide ? nullptr : tile->pixels8();
             PremulRgba16* px16 = wide ? tile->pixels16() : nullptr;
@@ -339,7 +357,7 @@ void CpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
 
                     if (wide) {
                         PremulRgba16& dst = px16[rowAt + static_cast<std::size_t>(x - ox)];
-                        if (t.layer.preserveOpacity)
+                        if (preserve)
                             cov *= static_cast<float>(dst.a) / 65535.0f;
 
                         if (dab.erase) {
@@ -357,7 +375,7 @@ void CpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
                     }
 
                     PremulRgba8& dst = px8[rowAt + static_cast<std::size_t>(x - ox)];
-                    if (t.layer.preserveOpacity)
+                    if (preserve)
                         cov *= static_cast<float>(dst.a) / 255.0f;
 
                     if (dab.erase) {

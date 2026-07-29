@@ -229,7 +229,22 @@ struct Layer {
     /// Set on a Linework layer and on nothing else (D-028), on the same
     /// terms: the tiles are rasterised from these curves.
     std::optional<LineworkContent> linework;
+    /// D-029. Absent means no mask, which is NOT the same as a mask that
+    /// hides nothing — the second is a channel the artist can paint into.
+    /// Legal on any kind, folders included.
+    std::optional<LayerMask> mask;
     // Draw order is the Document's vector order, not a field here.
+};
+
+// D-029. Sparse like the pixels, and made of the same tiles: coverage is the
+// RED channel of an ordinary opaque 8-bit tile, so the brush, the undo
+// snapshot, the tile PNG and the GPU arena slot all serve a mask unchanged.
+// Painting black hides, painting white reveals, and erasing — which takes
+// every channel to zero — hides.
+struct LayerMask {
+    std::unordered_map<TileKey, Tile, TileKeyHash> tiles;
+    uint8_t outside = 255;             // coverage where no tile is allocated
+    bool    enabled = true;            // off keeps the pixels, stops applying
 };
 
 // D-026. The pixels are what renders; this is what edits them again later.
@@ -675,6 +690,7 @@ document.json                          manifest
 thumbnail.png                          256 px preview for file browsers
 selection.png                          8-bit greyscale coverage mask, when there is one
 layers/<layerId>/tiles/<tx>_<ty>.png   one PNG per non-empty tile, straight alpha
+layers/<layerId>/mask/<tx>_<ty>.png    one PNG per allocated mask tile (D-029)
 ```
 
 ```jsonc
@@ -690,6 +706,7 @@ layers/<layerId>/tiles/<tx>_<ty>.png   one PNG per non-empty tile, straight alph
       "opacity": 1.0, "blend": "normal", "visible": true,
       "locked": false, "preserve_opacity": false, "clip_to_below": false,
       "parent": null,
+      "mask": { "enabled": true, "outside": 255, "tiles": [[0, 0]] },
       "tiles": [[0, 0], [0, 1], [1, 0]] },
     { "id": 2, "kind": "text", "name": "Caption",
       "opacity": 1.0, "blend": "normal", "visible": true,
@@ -721,15 +738,23 @@ Rules:
   message rather than reading it wrong. Version 2 added `vanishing_points`,
   version 3 `selection`, version 4 `"kind": "text"` and the `text` object
   beside it, version 5 `"kind": "linework"` and the `linework` object beside
-  it, version 6 16-bit colour. Everything each adds is optional, so v1 to v5
-  files still load unchanged.
-- **Version 6 is written only by a 16-bit document.** Every earlier bump was
-  unconditional because each added something an ordinary document might
-  contain; depth is a per-document choice most documents never make. An 8-bit
-  document keeps declaring 5, so saving from a build that has 16-bit does not
-  lock an ordinary painting out of an older Sable in exchange for nothing —
-  and a 16-bit file, which an older Sable genuinely would misread, is still
-  refused by name.
+  it, version 6 16-bit colour, version 7 layer masks. Everything each adds is
+  optional, so v1 to v6 files still load unchanged.
+- **Version 6 is written only by a 16-bit document, and version 7 only by a
+  document with a layer mask.** Every earlier bump was unconditional because
+  each added something an ordinary document might contain; depth and masks are
+  per-document choices most documents never make. An 8-bit document with no
+  mask keeps declaring 5, so saving from a build that has both does not lock an
+  ordinary painting out of an older Sable in exchange for nothing — and a file
+  an older Sable genuinely would misread is still refused by name. A masked
+  document needs that most: an older Sable would open it, show every layer
+  unmasked, and write the masks away on the next save.
+- A layer's `mask` object carries `enabled` and `outside`; its tiles are PNGs
+  under `mask/`, opaque grey, coverage in the red channel. **Every allocated
+  mask tile is written, including a fully transparent one** — unlike the
+  pixels, where transparent means empty. In a mask a transparent tile means
+  "hide all of this", and dropping it would let `outside` show the layer back
+  through the hole.
 - `colour.depth` is 8 or 16 (D-023). At 16 the tile PNGs are 16 bits per
   channel, which PNG carries natively, so they stay openable in any image
   viewer. Absent, or anything that is not 16, means 8.
@@ -785,8 +810,11 @@ at the original path. Never written over `Document::path`.
 
 ## What is deliberately not modelled yet
 
-Layer masks. They belong to Stage D of the PRD. Adding their fields now would
-be guessing at a shape we cannot test. Two cheap hooks keep them affordable
-later: `LayerKind` and `format_version` — which is exactly what perspective
-rulers (version 2), selection masks (version 3), text (`LayerKind::Text`,
-version 4) and linework (`LayerKind::Linework`, version 5) went on to use.
+Nothing that was listed here is still missing. Layer masks were the last of
+them, and they arrived at format version 7 through exactly the hook this
+section named — the same one perspective rulers (version 2), selection masks
+(version 3), text (version 4), linework (version 5) and 16-bit colour
+(version 6) used. See D-029, and #52 for the other half of the coverage story:
+a selection and a mask are the same per-pixel question asked about different
+things, and `maskCoverage()` and `Selection::coverage()` answer it in the same
+units on purpose.

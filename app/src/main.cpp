@@ -149,6 +149,10 @@ struct App {
     sbl::Stroke           stroke;
     std::vector<sbl::Dab> scratch;
     bool painting = false;
+    /// Where the next stroke lands: the active layer's mask instead of its
+    /// pixels (#48). A preference, not document state — like which tool is
+    /// selected, and unlike the mask itself.
+    bool paintOnMask = false;
 
     TextTool text;
     LineworkTool linework;
@@ -740,7 +744,8 @@ void paintWith(App& app, sbl::InputSample sample) {
         app.doc.selection.has_value() && !app.doc.selection->empty()
             ? &*app.doc.selection : nullptr;
     sbl::PaintTarget target{*layer, app.stroke.pending, app.stroke.touched,
-                            app.doc.width, app.doc.height, selection};
+                            app.doc.width, app.doc.height, selection, nullptr,
+                            app.paintOnMask};
     sbl::paintSample(app.stroke, target, sample, app.scratch);
     applyRulerImages(app, target);
 }
@@ -795,7 +800,8 @@ void endPaint(App& app) {
             const sbl::InputSample last = app.perspective.apply(
                 app.stabilizer.finish(app.stroke.samples.back()));
             sbl::PaintTarget target{*layer, app.stroke.pending, app.stroke.touched,
-                                    app.doc.width, app.doc.height};
+                                    app.doc.width, app.doc.height, nullptr, nullptr,
+                                    app.paintOnMask};
             sbl::paintSample(app.stroke, target, last, app.scratch);
             applyRulerImages(app, target);
         }
@@ -1969,6 +1975,7 @@ void drawLayerPanel(App& app) {
         // Document::layers is bottom-first.
         sbl::LayerId propsFor = sbl::NO_LAYER;
         sbl::LayerProps edited;
+        sbl::LayerId deleteMaskFor = sbl::NO_LAYER;   // #48, applied after the loop
 
         for (std::size_t i = app.doc.layers.size(); i-- > 0;) {
             sbl::Layer& layer = app.doc.layers[i];
@@ -1986,11 +1993,17 @@ void drawLayerPanel(App& app) {
             const bool active = layer.id == app.doc.activeLayer;
             if (layer.parent.has_value()) ImGui::Indent(16.0f);
             char label[160];
-            std::snprintf(label, sizeof label, "%s%s%s",
+            std::snprintf(label, sizeof label, "%s%s%s%s",
                           layer.kind == sbl::LayerKind::Folder   ? "[group] "
                           : layer.kind == sbl::LayerKind::Text   ? "[text] "
                           : layer.kind == sbl::LayerKind::Linework ? "[line] " : "",
-                          layer.name.c_str(), layer.locked ? "  [locked]" : "");
+                          layer.name.c_str(), layer.locked ? "  [locked]" : "",
+                          // Which layers are masked, without selecting each in
+                          // turn — a mask that is invisible until you click is
+                          // a mask an artist forgets is there.
+                          !layer.mask.has_value() ? ""
+                          : layer.mask->enabled   ? "  [mask]"
+                                                  : "  [mask off]");
             if (ImGui::Selectable(label, active)) app.doc.activeLayer = layer.id;
 
             if (active) {
@@ -2052,6 +2065,36 @@ void drawLayerPanel(App& app) {
                     edited.clipToBelow = clip;
                     propsFor = layer.id;
                 }
+
+                // The mask (#48). Adding one is a property change like any
+                // other — a mask with no tiles hides nothing and costs nothing,
+                // so there is no pixel work to undo. Deleting one is not: the
+                // tiles have to travel into the record, which is why it has a
+                // call of its own.
+                if (!layer.mask.has_value()) {
+                    if (ImGui::SmallButton("Add mask")) {
+                        edited = sbl::propsOf(layer);
+                        edited.mask = sbl::MaskProps{};
+                        propsFor = layer.id;
+                    }
+                } else {
+                    bool maskOn = layer.mask->enabled;
+                    if (ImGui::Checkbox("Mask", &maskOn)) {
+                        edited = sbl::propsOf(layer);
+                        edited.mask->enabled = maskOn;
+                        propsFor = layer.id;
+                    }
+                    ImGui::SameLine();
+                    // Which of the two the brush lands in. A preference rather
+                    // than a document property, and shown here because the mask
+                    // is the thing it is about — an artist who cannot see which
+                    // one they are painting paints the wrong one.
+                    ImGui::Checkbox("Paint on mask", &app.paintOnMask);
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Delete mask")) {
+                        deleteMaskFor = layer.id;
+                    }
+                }
                 // Text owns its layer's pixels, so painting on one and merging
                 // one down are both refused. This is the way out: give up the
                 // words and keep the picture. Undoable like any other property
@@ -2083,6 +2126,14 @@ void drawLayerPanel(App& app) {
         // does write through a Layer& that the loop is iterating over.
         if (propsFor != sbl::NO_LAYER) {
             sbl::UndoRecord rec = sbl::setLayerProps(app.doc, propsFor, edited);
+            if (!rec.empty()) {
+                app.canvas->releaseAll();
+                app.doc.undo.push(std::move(rec));
+                app.doc.dirty = true;
+            }
+        }
+        if (deleteMaskFor != sbl::NO_LAYER) {
+            sbl::UndoRecord rec = sbl::deleteLayerMask(app.doc, deleteMaskFor);
             if (!rec.empty()) {
                 app.canvas->releaseAll();
                 app.doc.undo.push(std::move(rec));

@@ -2765,11 +2765,12 @@ TEST_CASE("a PSD flattens to the composite the file itself carries") {
     CHECK(worst <= 2);
 }
 
-TEST_CASE("a PSD's layer masks reach the canvas (#35)") {
+TEST_CASE("a PSD's layer masks reach the canvas (#35) and stay masks (#48)") {
     // The bug was silence: the pixels arrived and the mask that hid half of
-    // them did not, so the import showed content the file does not. Sable has
-    // no mask of its own, so the importer multiplies it into the alpha — what
-    // is lost is the ability to edit the mask, not the artist's picture.
+    // them did not, so the import showed content the file does not. #35 fixed
+    // the picture by multiplying the mask into the alpha; #48 gives the mask
+    // somewhere to live, so the import is now faithful in BOTH — the drawing
+    // matches the file and the mask is still a mask afterwards.
     //
     // masked_flat.psd carries the same artwork composited in floating point by
     // the fixture script, so this compares against another implementation of
@@ -2793,9 +2794,13 @@ TEST_CASE("a PSD's layer masks reach the canvas (#35)") {
     CHECK(worst <= 2);
 
     // The layer whose mask rectangle is smaller than the layer: everything
-    // outside it takes the mask's default colour, which is zero here.
+    // outside it takes the mask's default colour, which is zero here. The
+    // PIXELS survive untouched — that is the whole of #48 in one assertion,
+    // because this is exactly what D-027 destroyed.
     const Layer* patch = layerNamed(*masked, "Patch");
     REQUIRE(patch != nullptr);
+    REQUIRE(patch->mask.has_value());
+    CHECK(patch->mask->outside == 0);
     CHECK(pickColour(*masked, 10, 10).a == 255);      // inside the mask rectangle
     CHECK(patch->find(TileKey{0, 0}) != nullptr);
     for (const auto& [key, tile] : patch->tiles)
@@ -2804,22 +2809,74 @@ TEST_CASE("a PSD's layer masks reach the canvas (#35)") {
                 const std::int32_t cx = key.first  * TILE_SIZE + x;
                 const std::int32_t cy = key.second * TILE_SIZE + y;
                 const bool masked_off = cx >= 32 || cy >= 24 || cx < 8 || cy < 8;
-                if (masked_off) REQUIRE(tile.pixel(x, y).a == 0);
+                // Painted, and hidden by the mask rather than by its own alpha.
+                if (masked_off && cx >= 8 && cy >= 8 && cx < 56 && cy < 40) {
+                    REQUIRE(tile.pixel(x, y).a == 65535);
+                    REQUIRE(maskCoverage(*patch->mask, cx, cy) == 0);
+                }
             }
 
+    // Partial coverage, which is what a mask is for and what an alpha of zero
+    // could never have carried back out to a PSD.
+    const Layer* bands = layerNamed(*masked, "Bands");
+    REQUIRE(bands != nullptr);
+    REQUIRE(bands->mask.has_value());
+    CHECK(maskCoverage(*bands->mask, 10, 10) == 255);
+    CHECK(maskCoverage(*bands->mask, 30, 10) == 128);
+    CHECK(maskCoverage(*bands->mask, 50, 10) == 0);
+
     // A disabled mask is not a mask. This one is all zeroes, so applying it
-    // anyway would delete the layer outright.
+    // anyway would delete the layer outright — and it is KEPT, switched off,
+    // because that is what the file says and the artist may want it back.
     const Layer* unmasked = layerNamed(*masked, "Unmasked");
     REQUIRE(unmasked != nullptr);
     CHECK(!unmasked->tiles.empty());
+    REQUIRE(unmasked->mask.has_value());
+    CHECK(!unmasked->mask->enabled);
     CHECK(pickColour(*masked, 50, 40) == StraightRgba8{255, 255, 0, 255});
 
-    // The drawing is right, so the warning (#40) is not about the picture — it
-    // is that the masks are no longer editable. Once for the file: a PSD from
-    // real work can carry forty of them, and forty lines of the same sentence
-    // is a channel nobody reads.
-    REQUIRE(masked->warnings.size() == 1);
-    CHECK(masked->warnings[0].find("2 layer masks") != std::string::npos);
+    // Nothing was given up, so there is nothing to warn about. #35's notice —
+    // "the masks can no longer be edited" — is not true of this reader, and a
+    // warning that is not true is worse than none.
+    CHECK(masked->warnings.empty());
+}
+
+TEST_CASE("a PSD's layer masks survive a round trip through PSD (#48)") {
+    // The other half of the acceptance criterion: imported with the mask
+    // intact, and re-exported WITH it. Baking made this impossible by
+    // construction — a baked mask leaves nothing to write to channel -2.
+    const auto masked = importDocument(testData("masked.psd"));
+    REQUIRE(masked.has_value());
+
+    const auto path = scratchFile("mask_roundtrip.psd");
+    REQUIRE(exportDocument(*masked, path).has_value());
+    const auto back = importDocument(path);
+    REQUIRE(back.has_value());
+
+    const Layer* bands = layerNamed(*back, "Bands");
+    REQUIRE(bands != nullptr);
+    REQUIRE(bands->mask.has_value());
+    CHECK(maskCoverage(*bands->mask, 10, 10) == 255);
+    CHECK(maskCoverage(*bands->mask, 30, 10) == 128);
+    CHECK(maskCoverage(*bands->mask, 50, 10) == 0);
+
+    const Layer* unmasked = layerNamed(*back, "Unmasked");
+    REQUIRE(unmasked != nullptr);
+    REQUIRE(unmasked->mask.has_value());
+    CHECK(!unmasked->mask->enabled);        // the disabled flag travels too
+
+    // And the picture is the same one, which is what says the mask went out
+    // as a mask rather than as a differently-shaped alpha.
+    const std::vector<StraightRgba8> before = flatten(*masked);
+    const std::vector<StraightRgba8> after  = flatten(*back);
+    REQUIRE(before.size() == after.size());
+    int worst = 0;
+    for (std::size_t i = 0; i < before.size(); ++i)
+        worst = std::max({worst, std::abs(before[i].r - after[i].r),
+                          std::abs(before[i].g - after[i].g),
+                          std::abs(before[i].b - after[i].b),
+                          std::abs(before[i].a - after[i].a)});
+    CHECK(worst <= 2);
 }
 
 TEST_CASE("an imported PSD round-trips through .sable") {
@@ -5260,15 +5317,27 @@ TEST_CASE("only a 16-bit file claims the newer format version") {
 
     CHECK(narrowManifest["format_version"] == SABLE_FORMAT_VERSION_8BIT);
     CHECK(narrowManifest["colour"]["depth"] == 8);
-    CHECK(wideManifest["format_version"] == SABLE_FORMAT_VERSION);
+    CHECK(wideManifest["format_version"] == SABLE_FORMAT_VERSION_16BIT);
     CHECK(wideManifest["colour"]["depth"] == 16);
     // Which is only worth anything if the two differ — otherwise the gate on
     // load has nothing to catch.
-    CHECK(SABLE_FORMAT_VERSION > SABLE_FORMAT_VERSION_8BIT);
+    CHECK(SABLE_FORMAT_VERSION_16BIT > SABLE_FORMAT_VERSION_8BIT);
+
+    // #48 takes the same deal, and needs it more: an older Sable would open a
+    // masked document, show every layer unmasked, and write the masks away on
+    // the next save. An 8-bit document with no mask is unaffected by either.
+    const auto maskedPath = dir / "sable_masked.sable";
+    Document maskedDoc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+    maskedDoc.layers[0].mask.emplace();
+    REQUIRE(saveProject(maskedDoc, maskedPath).has_value());
+    CHECK(manifestOf(maskedPath)["format_version"] == SABLE_FORMAT_VERSION_MASK);
+    CHECK(SABLE_FORMAT_VERSION_MASK > SABLE_FORMAT_VERSION_16BIT);
+    CHECK(SABLE_FORMAT_VERSION == SABLE_FORMAT_VERSION_MASK);   // the newest known
 
     std::error_code ec;
     std::filesystem::remove(narrowPath, ec);
     std::filesystem::remove(widePath, ec);
+    std::filesystem::remove(maskedPath, ec);
 }
 
 TEST_CASE("a 16-bit document composites, picks and exports") {
@@ -5663,4 +5732,307 @@ TEST_CASE("a curve through unevenly spaced points does not loop") {
         CHECK(at.x <= 201.5);
         CHECK(at.y == doctest::Approx(100.0).epsilon(0.001));
     }
+}
+
+// ----------------------------------------------------------- layer masks (#48)
+
+namespace {
+
+/// Paints into a layer's MASK with the ordinary brush, which is the whole
+/// bargain #48 struck: a mask tile is a tile, so this is `paintSquare` with one
+/// flag flipped and no second paint path anywhere behind it.
+void paintMaskSquare(Document& doc, LayerId id, StraightRgba8 grey, double x,
+                     double y, float size = 40.0f) {
+    Layer* layer = doc.layerById(id);
+    REQUIRE(layer != nullptr);
+    REQUIRE(layer->mask.has_value());
+    BrushPreset p = defaultPencil();
+    p.size     = size;
+    p.hardness = 1.0f;
+    p.pressure = PressureMapping{};
+    p.pressure.toSize = false;
+
+    Stroke s;
+    std::vector<Dab> scratch;
+    beginStroke(s, p, grey, id);
+    PaintTarget target{*layer,     s.pending, s.touched, doc.width,
+                       doc.height, nullptr,   nullptr,   true};
+    paintSample(s, target, at(x, y), scratch);
+    doc.undo.push(std::move(s.pending));
+}
+
+}  // namespace
+
+TEST_CASE("a mask hides the layer's pixels without destroying them") {
+    Document doc = makeDocument(120, 80, StraightRgba8{255, 255, 255, 255});
+    const LayerId id = doc.activeLayer;
+    paintSquare(doc, id, StraightRgba8{255, 0, 0, 255}, 40.0, 40.0);
+    const std::size_t painted = doc.layerById(id)->tiles.size();
+
+    // A new mask hides nothing: `outside` is 255 and it has no tiles at all,
+    // which is what stops "add a mask" costing a megabyte on a big canvas.
+    doc.layerById(id)->mask.emplace();
+    CHECK(doc.layerById(id)->mask->tiles.empty());
+    CHECK(pickColour(doc, 40, 40) == StraightRgba8{255, 0, 0, 255});
+
+    // Black hides. The pixels are untouched — that is the difference between a
+    // mask and the alpha D-027 folded one into.
+    paintMaskSquare(doc, id, StraightRgba8{0, 0, 0, 255}, 40.0, 40.0);
+    CHECK(pickColour(doc, 40, 40) == StraightRgba8{255, 255, 255, 255});
+    CHECK(doc.layerById(id)->tiles.size() == painted);
+    CHECK(doc.layerById(id)->find(TileKey{0, 0})->pixel(40, 40).a == 65535);
+
+    // And switching the mask off brings the layer straight back, which is the
+    // capability the baked version could not offer at any price.
+    doc.layerById(id)->mask->enabled = false;
+    CHECK(pickColour(doc, 40, 40) == StraightRgba8{255, 0, 0, 255});
+}
+
+TEST_CASE("a mask stroke on a layer with no mask paints nothing at all") {
+    // The tool stays switched on when the artist selects another layer, so the
+    // alternative is a stroke landing in the pixels of a layer they were not
+    // looking at — undoable, and invisible until much later.
+    Document doc = makeDocument(60, 60, StraightRgba8{255, 255, 255, 255});
+    Layer& layer = *doc.active();
+    const std::uint64_t before = hashCanvas(doc);
+
+    Stroke s;
+    std::vector<Dab> scratch;
+    beginStroke(s, defaultPencil(), StraightRgba8{0, 0, 0, 255}, layer.id);
+    PaintTarget target{layer,      s.pending, s.touched, doc.width,
+                       doc.height, nullptr,   nullptr,   true};
+    paintSample(s, target, at(30.0, 30.0), scratch);
+
+    CHECK(s.pending.empty());
+    CHECK(layer.tiles.empty());
+    CHECK(hashCanvas(doc) == before);
+}
+
+TEST_CASE("mask coverage scales the layer rather than switching it") {
+    // Half coverage is half the layer, not half of it rounded to on or off —
+    // this is what a soft-edged mask is made of, and what `clipToBelow` (a
+    // boolean borrowing another layer's alpha) has never been able to express.
+    Document doc = makeDocument(64, 64, StraightRgba8{0, 0, 0, 255});
+    const LayerId id = doc.activeLayer;
+    paintSquare(doc, id, StraightRgba8{255, 255, 255, 255}, 32.0, 32.0);
+    doc.layerById(id)->mask.emplace();
+    paintMaskSquare(doc, id, StraightRgba8{128, 128, 128, 255}, 32.0, 32.0);
+
+    CHECK(maskCoverage(*doc.layerById(id)->mask, 32, 32) == 128);
+    const StraightRgba8 seen = pickColour(doc, 32, 32);
+    CHECK(seen.r == 128);
+    CHECK(seen.g == 128);
+    CHECK(seen.b == 128);
+}
+
+TEST_CASE("pickColour and flatten agree with masks in play") {
+    // The agreement `compositeLevel` and `pickLevel` are pinned to, with every
+    // shape of mask the compositor has a separate branch for: a masked raster
+    // layer, a clipped layer over a masked base — whose clip has to come from
+    // the MASKED alpha — and a mask on a folder, which applies to what the
+    // group composited to and to nothing else.
+    Document doc = makeDocument(90, 70, StraightRgba8{200, 210, 220, 255});
+    const LayerId base = doc.activeLayer;
+    paintSquare(doc, base, StraightRgba8{255, 0, 0, 255}, 30.0, 30.0);
+    doc.layerById(base)->mask.emplace();
+    paintMaskSquare(doc, base, StraightRgba8{90, 90, 90, 255}, 36.0, 30.0, 30.0f);
+
+    doc.undo.push(addLayerAbove(doc, base, "Clipped"));
+    const LayerId clip = doc.activeLayer;
+    paintSquare(doc, clip, StraightRgba8{0, 255, 0, 255}, 40.0, 30.0);
+    doc.layerById(clip)->clipToBelow = true;
+
+    doc.undo.push(addLayerAbove(doc, clip, "Group"));
+    const LayerId group = doc.activeLayer;
+    doc.layerById(group)->kind = LayerKind::Folder;
+    doc.layerById(group)->mask.emplace();
+    doc.layerById(group)->mask->outside = 200;
+    doc.undo.push(addLayerAbove(doc, group, "In group"));
+    doc.layerById(doc.activeLayer)->parent = group;
+    paintSquare(doc, doc.activeLayer, StraightRgba8{0, 0, 255, 255}, 55.0, 40.0);
+    paintMaskSquare(doc, group, StraightRgba8{40, 40, 40, 255}, 60.0, 40.0, 24.0f);
+
+    const std::vector<StraightRgba8> full = flatten(doc);
+    for (std::int32_t y = 0; y < doc.height; ++y)
+        for (std::int32_t x = 0; x < doc.width; ++x)
+            REQUIRE(pickColour(doc, x, y) ==
+                    full[static_cast<std::size_t>(y) * doc.width + x]);
+}
+
+TEST_CASE("a mask stroke is one undo step, and undoing it is exact") {
+    Document doc = makeDocument(80, 80, StraightRgba8{255, 255, 255, 255});
+    const LayerId id = doc.activeLayer;
+    paintSquare(doc, id, StraightRgba8{0, 0, 255, 255}, 40.0, 40.0);
+    doc.layerById(id)->mask.emplace();
+    const std::uint64_t shown = hashCanvas(doc);
+
+    paintMaskSquare(doc, id, StraightRgba8{0, 0, 0, 255}, 40.0, 40.0);
+    const std::uint64_t hidden = hashCanvas(doc);
+    CHECK(hidden != shown);
+
+    doc.undo.undo(doc);
+    CHECK(hashCanvas(doc) == shown);
+    // Undoing the first mask stroke on a tile REMOVES it, or the mask stops
+    // being sparse in exactly the way D-005 exists to prevent.
+    CHECK(doc.layerById(id)->mask->tiles.empty());
+    doc.undo.redo(doc);
+    CHECK(hashCanvas(doc) == hidden);
+
+    // A second stroke snapshots the tile that is now there, and it costs the
+    // budget a whole tile — because a mask tile IS one, which is the entire
+    // reason `UndoRecord::memoryBytes` needed no case for it.
+    const std::size_t history = doc.undo.memoryBytes();
+    paintMaskSquare(doc, id, StraightRgba8{255, 255, 255, 255}, 20.0, 20.0);
+    CHECK(doc.undo.memoryBytes() >= history + tileBytes(ColourDepth::Bits8));
+}
+
+TEST_CASE("deleting a mask is one undoable step, pixels and all") {
+    Document doc = makeDocument(80, 80, StraightRgba8{255, 255, 255, 255});
+    const LayerId id = doc.activeLayer;
+    paintSquare(doc, id, StraightRgba8{0, 128, 0, 255}, 40.0, 40.0);
+    doc.layerById(id)->mask.emplace();
+    doc.layerById(id)->mask->outside = 90;
+    paintMaskSquare(doc, id, StraightRgba8{0, 0, 0, 255}, 40.0, 40.0);
+    const std::uint64_t masked = hashCanvas(doc);
+
+    doc.undo.push(deleteLayerMask(doc, id));
+    CHECK(!doc.layerById(id)->mask.has_value());
+    const std::uint64_t bare = hashCanvas(doc);
+    CHECK(bare != masked);
+
+    doc.undo.undo(doc);
+    REQUIRE(doc.layerById(id)->mask.has_value());
+    CHECK(doc.layerById(id)->mask->outside == 90);      // the flags came back
+    CHECK(hashCanvas(doc) == masked);                   // and so did the pixels
+
+    doc.undo.redo(doc);
+    CHECK(!doc.layerById(id)->mask.has_value());
+    CHECK(hashCanvas(doc) == bare);
+}
+
+TEST_CASE("an ordinary property change leaves the mask alone") {
+    // `applyProps` is what deletes a mask, so every OTHER caller has to carry
+    // the current flags through it. If `propsOf` ever stops doing that, renaming
+    // a layer silently throws its mask away.
+    Document doc = makeDocument(60, 60, StraightRgba8{255, 255, 255, 255});
+    const LayerId id = doc.activeLayer;
+    paintSquare(doc, id, StraightRgba8{0, 0, 0, 255}, 30.0, 30.0);
+    doc.layerById(id)->mask.emplace();
+    paintMaskSquare(doc, id, StraightRgba8{0, 0, 0, 255}, 30.0, 30.0);
+    const std::size_t tiles = doc.layerById(id)->mask->tiles.size();
+    REQUIRE(tiles > 0);
+
+    LayerProps renamed = propsOf(*doc.layerById(id));
+    renamed.name = "Renamed";
+    doc.undo.push(setLayerProps(doc, id, renamed));
+    REQUIRE(doc.layerById(id)->mask.has_value());
+    CHECK(doc.layerById(id)->mask->tiles.size() == tiles);
+}
+
+TEST_CASE("a mask survives a .sable round trip") {
+    // #48's first acceptance criterion: paint, mask, save, reload, same canvas.
+    Document doc = makeDocument(300, 200, StraightRgba8{250, 250, 250, 255});
+    const LayerId id = doc.activeLayer;
+    paintSquare(doc, id, StraightRgba8{200, 40, 90, 255}, 140.0, 100.0);
+    doc.layerById(id)->mask.emplace();
+    doc.layerById(id)->mask->outside = 210;
+    paintMaskSquare(doc, id, StraightRgba8{30, 30, 30, 255}, 150.0, 100.0);
+    const std::uint64_t before = hashCanvas(doc);
+
+    const auto path = scratchFile("mask_roundtrip.sable");
+    REQUIRE(saveProject(doc, path).has_value());
+    const auto back = loadProject(path);
+    REQUIRE(back.has_value());
+    REQUIRE(back->layers.size() == 1);
+    REQUIRE(back->layers[0].mask.has_value());
+    CHECK(back->layers[0].mask->outside == 210);
+    CHECK(back->layers[0].mask->enabled);
+    CHECK(hashCanvas(*back) == before);
+}
+
+TEST_CASE("cloning and duplicating carry the mask") {
+    // cloneDocument is the autosave hand-off (D-013). Without the mask the
+    // recovery file opens showing everything the artist masked away, which is
+    // a different painting from the one that was lost.
+    Document doc = makeDocument(80, 80, StraightRgba8{255, 255, 255, 255});
+    const LayerId id = doc.activeLayer;
+    paintSquare(doc, id, StraightRgba8{10, 20, 200, 255}, 40.0, 40.0);
+    doc.layerById(id)->mask.emplace();
+    paintMaskSquare(doc, id, StraightRgba8{0, 0, 0, 255}, 40.0, 40.0);
+
+    const Document copy = cloneDocument(doc);
+    REQUIRE(copy.layers[0].mask.has_value());
+    CHECK(hashCanvas(copy) == hashCanvas(doc));
+
+    const UndoRecord duplicated = duplicateLayer(doc, id);
+    CHECK(!duplicated.empty());
+    REQUIRE(doc.layers.size() == 2);
+    CHECK(doc.layers[1].mask.has_value());
+}
+
+TEST_CASE("merging down bakes the upper layer's mask into the pixels") {
+    // The upper layer stops existing, so its mask has to go somewhere or the
+    // merge puts back on screen exactly what the artist masked away.
+    Document doc = makeDocument(80, 80, StraightRgba8{255, 255, 255, 255});
+    const LayerId base = doc.activeLayer;
+    paintSquare(doc, base, StraightRgba8{255, 255, 255, 255}, 40.0, 40.0);
+    doc.undo.push(addLayerAbove(doc, base, "Top"));
+    const LayerId top = doc.activeLayer;
+    paintSquare(doc, top, StraightRgba8{0, 0, 0, 255}, 40.0, 40.0);
+    doc.layerById(top)->mask.emplace();
+    paintMaskSquare(doc, top, StraightRgba8{128, 128, 128, 255}, 40.0, 40.0);
+
+    const std::uint64_t before = hashCanvas(doc);
+    doc.undo.push(mergeLayerDown(doc, top));
+    REQUIRE(doc.layers.size() == 1);
+    CHECK(hashCanvas(doc) == before);          // not one pixel moved
+}
+
+TEST_CASE("a mask on a 16-bit document is still an 8-bit mask") {
+    // Coverage is eight bits everywhere it is stored, read or exported, so a
+    // 16-bit document must not pay double the undo budget for shades of grey
+    // nothing can show (D-023's own argument, applied to the mask).
+    Document doc = makeDocument(80, 80, StraightRgba8{255, 255, 255, 255},
+                                ColourDepth::Bits16);
+    const LayerId id = doc.activeLayer;
+    paintSquare(doc, id, StraightRgba8{200, 0, 0, 255}, 40.0, 40.0);
+    doc.layerById(id)->mask.emplace();
+    paintMaskSquare(doc, id, StraightRgba8{0, 0, 0, 255}, 40.0, 40.0);
+
+    const Tile* maskTile = doc.layerById(id)->mask->find(TileKey{0, 0});
+    REQUIRE(maskTile != nullptr);
+    CHECK(maskTile->depth() == ColourDepth::Bits8);
+    CHECK(doc.layerById(id)->find(TileKey{0, 0})->depth() == ColourDepth::Bits16);
+    CHECK(pickColour(doc, 40, 40) == StraightRgba8{255, 255, 255, 255});
+}
+
+TEST_CASE("an ORA export bakes the mask into the alpha it writes") {
+    // OpenRaster has no mask element — a layer is a PNG and nothing else — so
+    // the choice is between a file that looks like the painting and one that
+    // shows what the artist masked away. The .sable keeps the editable version.
+    Document doc = makeDocument(80, 80, StraightRgba8{255, 255, 255, 255});
+    const LayerId id = doc.activeLayer;
+    paintSquare(doc, id, StraightRgba8{200, 30, 30, 255}, 40.0, 40.0);
+    doc.layerById(id)->mask.emplace();
+    paintMaskSquare(doc, id, StraightRgba8{0, 0, 0, 255}, 40.0, 40.0);
+
+    const auto path = scratchFile("mask_export.ora");
+    REQUIRE(exportDocument(doc, path).has_value());
+    const auto back = importDocument(path);
+    REQUIRE(back.has_value());
+    CHECK(!back->layers[0].mask.has_value());     // nowhere to put one
+
+    // Within a step, not identical: baking multiplies straight alpha once and
+    // the compositor scales a premultiplied colour, so the soft edge of the
+    // brush rounds the other way on a handful of pixels.
+    const std::vector<StraightRgba8> ours   = flatten(doc);
+    const std::vector<StraightRgba8> theirs = flatten(*back);
+    REQUIRE(ours.size() == theirs.size());
+    int worst = 0;
+    for (std::size_t i = 0; i < ours.size(); ++i)
+        worst = std::max({worst, std::abs(ours[i].r - theirs[i].r),
+                          std::abs(ours[i].g - theirs[i].g),
+                          std::abs(ours[i].b - theirs[i].b),
+                          std::abs(ours[i].a - theirs[i].a)});
+    CHECK(worst <= 2);
 }

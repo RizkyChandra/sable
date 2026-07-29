@@ -65,15 +65,25 @@ constexpr std::uint32_t kChunkSlots = 8;
 
 constexpr std::uint32_t kNoSlot = 0xFFFFFFFFu;
 
+/// A slot index as the op list carries it: sixteen bits each for the layer's
+/// tile and its mask tile, so a masked layer still costs one uvec4 per op and
+/// the uniform block keeps its 192-op ceiling (#48).
+constexpr std::uint32_t kNoSlot16 = 0xFFFFu;
+static_assert(kArenaSlots < kNoSlot16, "an arena slot must fit in sixteen bits");
+
 struct CacheKey {
     LayerId layer;
     TileKey key;
+    /// The layer's mask tile at this key, which is a different 256 KiB from its
+    /// pixel tile at the same key and must not share a slot with it (#48).
+    bool    mask = false;
     friend bool operator==(const CacheKey&, const CacheKey&) = default;
 };
 
 struct CacheKeyHash {
     std::size_t operator()(const CacheKey& k) const noexcept {
-        return TileKeyHash{}(k.key) * 31u + std::hash<LayerId>{}(k.layer);
+        return TileKeyHash{}(k.key) * 31u + std::hash<LayerId>{}(k.layer) +
+               (k.mask ? 0x9E3779B9u : 0u);
     }
 };
 
@@ -119,9 +129,15 @@ struct DabParams {
 /// composite and only the arena slots are patched per tile.
 struct Op {
     std::uint32_t kind        = 0;         // 0 draw, 1 open folder, 2 close, 3 drop clip
-    LayerId       layer       = NO_LAYER;  // draw only
+    /// Draw, and close-a-folder: a folder's mask applies to what its children
+    /// composited to, so the closing op needs to know whose mask it is.
+    LayerId       layer       = NO_LAYER;
+    /// mode | clipToBelow << 8 | hasMask << 9 | mask default colour << 16.
+    /// The default is what the shader reads where the mask has no tile, which
+    /// is `LayerMask::outside` and usually most of the canvas.
     std::uint32_t modeAndClip = 0;
     std::uint32_t opacityBits = 0;
+    bool          masked      = false;     // host-side: patch a mask slot in
 };
 
 /// False when the document does not fit the shader's limits, which is the
@@ -142,17 +158,20 @@ bool buildProgram(const Document& doc, std::optional<LayerId> parent, int depth,
             continue;
         }
 
+        const bool masked = layer.mask.has_value() && layer.mask->enabled;
         const std::uint32_t modeAndClip =
-            static_cast<std::uint32_t>(layer.blend) | (layer.clipToBelow ? 0x100u : 0u);
+            static_cast<std::uint32_t>(layer.blend) | (layer.clipToBelow ? 0x100u : 0u) |
+            (masked ? 0x200u : 0u) |
+            (masked ? static_cast<std::uint32_t>(layer.mask->outside) << 16u : 0u);
         const std::uint32_t opacity = asBits(std::clamp(layer.opacity, 0.0f, 1.0f));
 
         if (layer.kind == LayerKind::Folder) {
-            out.push_back(Op{1, NO_LAYER, 0, 0});
+            out.push_back(Op{1, NO_LAYER, 0, 0, false});
             if (!buildProgram(doc, layer.id, depth + 1, out)) return false;
             if (out.size() >= kMaxOps) return false;
-            out.push_back(Op{2, NO_LAYER, modeAndClip, opacity});
+            out.push_back(Op{2, layer.id, modeAndClip, opacity, masked});
         } else {
-            out.push_back(Op{0, layer.id, modeAndClip, opacity});
+            out.push_back(Op{0, layer.id, modeAndClip, opacity, masked});
         }
     }
     return true;
@@ -202,7 +221,8 @@ private:
         Resident* entry = nullptr;
     };
 
-    [[nodiscard]] Resident* residentFor(LayerId id, TileKey key, const Tile* tile);
+    [[nodiscard]] Resident* residentFor(LayerId id, TileKey key, const Tile* tile,
+                                        bool mask = false);
     [[nodiscard]] std::uint32_t claimSlot();
     void releaseSlot(Resident& entry);
     void dropLayer(LayerId id);
@@ -349,14 +369,15 @@ void GpuBackend::releaseSlot(Resident& entry) {
     entry.slot = kNoSlot;
 }
 
-Resident* GpuBackend::residentFor(LayerId id, TileKey key, const Tile* tile) {
+Resident* GpuBackend::residentFor(LayerId id, TileKey key, const Tile* tile,
+                                  bool mask) {
     if (tile == nullptr) return nullptr;
     // Belt and braces behind applyDab's depth check. A 16-bit tile is 512 KiB
     // and the arena slot is 256, so uploading one would not merely be wrong, it
     // would read past the end of the tile; "no slot" is the existing, tested
     // way of saying "let the CPU do this one".
     if (tile->depth() != ColourDepth::Bits8) return nullptr;
-    const CacheKey ck{id, key};
+    const CacheKey ck{id, key, mask};
     Resident& entry = resident_[ck];
     entry.used = ++clock_;
 
@@ -412,8 +433,11 @@ bool GpuBackend::syncTiles(const std::vector<Behind>& work) {
 
 bool GpuBackend::syncLayer(Layer& layer) {
     behindScratch_.clear();
+    // Pixel tiles only. Nothing on the device ever writes a mask tile — mask
+    // dabs are handed to the CPU below — so a mask copy in the arena is never
+    // ahead of the host and has nothing to bring home.
     for (auto& [key, tile] : layer.tiles) {
-        const auto it = resident_.find(CacheKey{layer.id, key});
+        const auto it = resident_.find(CacheKey{layer.id, key, false});
         if (it == resident_.end() || !it->second.hostStale) continue;
         if (it->second.tile != &tile) {
             it->second.hostStale = false;    // a different tile lives here now
@@ -430,11 +454,18 @@ void GpuBackend::reconcile(const Document& doc) {
     // is the only place a slot comes back — which is why it runs when the
     // arena has filled up rather than on every call.
     for (auto& entry : resident_) entry.second.tile = nullptr;
-    for (const Layer& layer : doc.layers)
-        for (const auto& [key, tile] : layer.tiles)
-            if (const auto it = resident_.find(CacheKey{layer.id, key});
+    const auto keep = [this](LayerId id, const TileMap& tiles, bool mask) {
+        for (const auto& [key, tile] : tiles)
+            if (const auto it = resident_.find(CacheKey{id, key, mask});
                 it != resident_.end() && it->second.stamp == tile.stamp())
                 it->second.tile = &tile;
+    };
+    for (const Layer& layer : doc.layers) {
+        keep(layer.id, layer.tiles, false);
+        // Without this a mask tile's slot is reclaimed on every reconcile and
+        // re-uploaded on the next composite — correct, and pointlessly slow.
+        if (layer.mask.has_value()) keep(layer.id, layer.mask->tiles, true);
+    }
 
     for (auto it = resident_.begin(); it != resident_.end();) {
         if (it->second.tile != nullptr) { ++it; continue; }
@@ -568,7 +599,24 @@ void GpuBackend::submitPending() {
 }
 
 void GpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
-    if (t.layer.locked || t.layer.kind != LayerKind::Raster) return;
+    if (t.layer.locked) return;
+
+    // #48, and the same answer D-023 gave a 16-bit document: the reference
+    // implementation takes what this backend does not do. A mask dab is one
+    // `dab.comp` could paint — a mask tile is an ordinary 8-bit tile — but the
+    // batch is keyed on a layer id alone, so a mask stroke and a pixel stroke
+    // on the same layer would land in one dispatch on the wrong slot. Routing
+    // it to the CPU is four lines; a second key on the batch is a change to
+    // every dab path for a stroke that costs a few milliseconds either way.
+    // `submitPending` first, because the CPU is about to write host tiles this
+    // backend may still owe pixels to.
+    if (t.toMask) {
+        submitPending();
+        syncLayer(t.layer);
+        cpuBackend().applyDab(t, dab);
+        return;
+    }
+    if (t.layer.kind != LayerKind::Raster) return;
     if (dab.colour.a == 0 || dab.radius <= 0.0f) return;
 
     // D-023: the arena and both shaders are 8-bit RGBA. Hand a 16-bit layer
@@ -628,7 +676,7 @@ void GpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
                 snap.layer = t.layer.id;
                 snap.key   = key;
                 if (tile != nullptr) {
-                    const auto it = resident_.find(CacheKey{t.layer.id, key});
+                    const auto it = resident_.find(CacheKey{t.layer.id, key, false});
                     if (it != resident_.end() && it->second.hostStale &&
                         it->second.tile == tile) {
                         behindScratch_.assign(1, Behind{tile, &it->second});
@@ -710,8 +758,12 @@ std::vector<PremulRgba8> GpuBackend::compositeRect(const Document& doc, std::int
     // Every tile a chunk draws has to stay resident until the chunk has been
     // dispatched, so a chunk may never need more slots than the arena has —
     // otherwise it would evict its own inputs and composite the wrong pixels.
-    const auto draws = static_cast<std::uint32_t>(
-        std::ranges::count(program_, 0u, &Op::kind));
+    // A masked layer needs a second slot for its mask tile, and it has to stay
+    // resident just as long — a chunk that evicted its own mask would composite
+    // the layer unmasked (#48).
+    std::uint32_t draws = 0;
+    for (const Op& op : program_)
+        draws += (op.kind == 0 ? 1u : 0u) + (op.masked ? 1u : 0u);
     if (draws > arenaSlots_) return cpuFallback(doc, x, y, w, h);
     const std::size_t chunk =
         std::max<std::size_t>(1, std::min<std::uint32_t>(
@@ -736,19 +788,35 @@ std::vector<PremulRgba8> GpuBackend::compositeRect(const Document& doc, std::int
             for (std::size_t j = 0; j < program_.size(); ++j) {
                 const Op& op = program_[j];
                 p.ops[j][0] = op.kind;
+                // Both halves absent: no tile here, and no mask tile here.
                 p.ops[j][1] = kNoSlot;
                 p.ops[j][2] = op.modeAndClip;
                 p.ops[j][3] = op.opacityBits;
-                if (op.kind != 0) continue;
+                // Kind 2 closes a folder, which has no tile of its own but may
+                // well have a mask over what its children composited to.
+                if (op.kind != 0 && op.kind != 2) continue;
 
                 const Layer* layer = doc.layerById(op.layer);
                 if (layer == nullptr) continue;
-                const Tile* tile = layer->find(keyScratch_[base + i]);
-                if (tile == nullptr) continue;
-                const Resident* entry =
-                    residentFor(op.layer, keyScratch_[base + i], tile);
+                const TileKey key = keyScratch_[base + i];
+
+                if (op.kind == 0) {
+                    const Tile* tile = layer->find(key);
+                    if (tile != nullptr) {
+                        const Resident* entry = residentFor(op.layer, key, tile);
+                        if (entry == nullptr) return cpuFallback(doc, x, y, w, h);
+                        p.ops[j][1] = (p.ops[j][1] & ~kNoSlot16) | entry->slot;
+                    }
+                }
+                // No mask tile at this key is not a failure: the shader falls
+                // back to the mask's default colour, which is what most of a
+                // sparse mask is made of.
+                if (!op.masked) continue;
+                const Tile* maskTile = layer->mask->find(key);
+                if (maskTile == nullptr) continue;
+                const Resident* entry = residentFor(op.layer, key, maskTile, true);
                 if (entry == nullptr) return cpuFallback(doc, x, y, w, h);
-                p.ops[j][1] = entry->slot;
+                p.ops[j][1] = (p.ops[j][1] & kNoSlot16) | (entry->slot << 16u);
             }
         }
 

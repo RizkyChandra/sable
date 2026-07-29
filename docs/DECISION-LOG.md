@@ -1026,7 +1026,8 @@ transform mode of their own.
 
 ## D-027 — PSD layer masks are multiplied into the pixels on import
 
-**Status:** Decided
+**Status:** **Superseded by D-029** — `Layer` grows a mask, which is the
+alternative this entry rejected and named; the import no longer bakes
 **Affects:** `engine/src/psd.cpp`, `tests/data/make_psd_fixtures.py`, #35
 
 A PSD layer mask is read and multiplied into the layer's alpha as the pixels are
@@ -1121,6 +1122,110 @@ already makes, and the `.sable` file keeps the editable version.
 store, to hit-test, to draw and to teach, for a curve an interpolating spline
 already produces. If a use turns up that the spline genuinely cannot express,
 the format version is the hook — the same one this used.
+
+---
+
+## D-029 — Layer masks: sparse tiles of ordinary grey, coverage in the red channel
+
+**Status:** Decided
+**Affects:** `Layer`, `LayerProps`, `TileSnapshot`, `compositeLevel` and
+`pickLevel` in `engine/src/io.cpp`, `engine/src/gpu.cpp`,
+`engine/src/shaders/composite.comp`, `engine/src/psd.cpp`,
+`engine/src/openraster.cpp`, `.sable` format version 7
+**Supersedes:** D-027
+
+A `Layer` grows `std::optional<LayerMask>`: a `TileMap` of ordinary 8-bit tiles,
+a `bool enabled`, and a `uint8_t outside` giving the coverage where no tile has
+been allocated. Coverage is the RED channel of an opaque grey pixel.
+
+D-027 baked PSD masks into the alpha because there was nowhere to put them, and
+named this as the alternative: "the substantial fix, and the one that unblocks
+masks as a Sable feature… worth doing on its own terms, as a feature". #48 is
+that feature, so the bake goes.
+
+**Why a mask tile is an ordinary `Tile` and not a byte plane.** A byte plane is
+four times smaller and needs its own everything: its own paint path, its own
+undo snapshot, its own PNG codec, its own GPU upload, its own byte accounting.
+Reusing `Tile` makes "paint into the mask with the ordinary brush tools" one
+flag on `PaintTarget` — every preset, every pressure curve, the stabilizer, the
+rulers and the whole `UndoRecord` work on a mask because they cannot tell. The
+cost is stated plainly: **a mask tile is 256 KiB where 64 would do**, and it is
+paid only for tiles the artist has actually painted into. If mask memory ever
+shows up in a profile, a narrow tile type is the change, and it is confined to
+`LayerMask` and `maskCoverage`.
+
+**Why the red channel and not the alpha.** The brush paints premultiplied
+colour, so black at half pressure over white gives grey — which is the value an
+artist expects a mask to hold. Reading alpha instead would make every colour
+reveal and only the eraser hide. As a bonus the eraser still hides, because
+erasing takes every channel to zero, so the two obvious ways to make a hole
+agree.
+
+**Why `outside` rather than "absent means hidden".** The first mask an artist
+adds is the one that hides nothing, and a reveal-all mask made of stored tiles
+costs 64 MiB on a 4000 x 4000 canvas to say "no change yet". `outside` also is
+PSD's mask default colour, so an imported mask needs no expansion. The price is
+one line in `LayerMask::tileFor`: a new tile is filled with `outside`, because a
+tile that arrived at zero would turn 256 pixels black the moment a brush touched
+the corner of it.
+
+**Masks are always 8-bit, at both document depths.** Coverage is eight bits
+everywhere it is stored, read or exported, and a 16-bit mask would double the
+undo cost of a mask stroke to record shades nothing can show. This is D-023's
+own argument, applied to the one channel that does not need the width.
+
+**Coverage folds into the same `scale` as opacity and the clip mask** — one
+rounding, not three — and the alpha a masked layer publishes to the clip mask is
+the MASKED one, so a clipped layer cannot show through a hole its base does not
+have. The GPU shader is that arithmetic line for line, in the same order.
+
+**A folder may carry a mask.** It costs nothing extra: a folder's op already has
+a `src` in both compositors, so the mask applies to the group's composited
+result — the one thing a mask on each child could never express, and what D-027
+had to drop with a warning. That warning is gone.
+
+**The GPU composites masks; it does not paint them.** A mask dab is handed to
+`cpuBackend()`, exactly as a 16-bit document already is (D-023). The batch in
+`gpu.cpp` is keyed on a layer id alone, so a mask stroke and a pixel stroke on
+one layer would land in a single dispatch on the wrong slot; a second key is a
+change to every dab path, and the CPU finishes a mask stroke in milliseconds.
+Compositing is the half that had to be on the device, because that is what runs
+on every frame of every stroke — and `tests/differential.cpp` gained a masked
+scenario without either tolerance being touched (colour ≤ 1, alpha exactly 0).
+
+**A mask slot rides in the op list's spare bits.** `ops[i].y` becomes two
+sixteen-bit slots and `ops[i].z` gains a flag and the default colour, so the
+uniform block keeps its 192-op ceiling. Doubling the op width would have halved
+how much of a document the GPU can composite before falling back, in exchange
+for nothing an arena of 512 slots can use.
+
+**Format version 7, written only by a document that has a mask.** Same deal as
+`SABLE_FORMAT_VERSION_8BIT` (D-023), and masks need it more than depth did: an
+older Sable would open a masked document, show every layer unmasked, and write
+the masks away on the next save.
+
+**What this costs, stated plainly:**
+
+- **ORA export bakes the mask into the alpha.** OpenRaster has no mask element
+  — a layer is a PNG and nothing else — so the choice is between a file that
+  looks like the painting and one that shows what the artist masked away, and
+  D-027 already answered that. The `.sable` keeps the editable version. KRA
+  export does not exist, so there is nothing to bake there.
+- **Merging down bakes the upper layer's mask** into the pixels it contributes,
+  because the layer it belonged to stops existing. The LOWER layer keeps its own
+  mask, which therefore also applies to what was merged into it.
+- **Mask tiles are not selections and selections are not masks yet.**
+  `maskCoverage()` and `Selection::coverage()` deliberately answer in the same
+  units, with the same convention — 0 hides, 255 shows, in between is the soft
+  edge — so #52 can convert either way without a new definition of coverage. The
+  conversion itself is not written; writing it before #52 knows what it needs is
+  guessing.
+
+**Alternative rejected — a mask as a hidden `Layer`.** It would have made the
+paint path free (`PaintTarget` already takes a `Layer&`) but every layer walk in
+the program — `levelOf`, the layer panel, `layerById`, the PSD and ORA writers —
+would have had to learn to skip it, and the day one forgot, the mask would
+composite as a grey rectangle over the artist's drawing.
 
 ---
 

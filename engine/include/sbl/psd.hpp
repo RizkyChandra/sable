@@ -21,12 +21,11 @@ namespace sbl {
 /// The background is left fully transparent, because PSD has no notion of one:
 /// whatever backs the artwork is a layer in the file and stays a layer here.
 ///
-/// A layer mask is multiplied into that layer's alpha as it is read (D-027,
-/// #35). Sable has nowhere to keep a mask, and an import that dropped it showed
-/// content the file itself hides. The mask is therefore no longer editable
-/// afterwards — what it hid is gone, not hidden. A mask on a GROUP still is
-/// dropped: it applies to the folder's composited result, which is not any one
-/// child's pixels.
+/// A layer mask arrives as a `LayerMask` and stays editable (D-029, #48),
+/// including a mask on a GROUP — which used to be dropped because it applies to
+/// the folder's composited result rather than to any one child's pixels. It
+/// used to be multiplied into the layer's alpha instead (D-027), which made the
+/// picture right and the mask gone.
 ///
 /// Blend modes Sable cannot do degrade to Normal rather than failing the read.
 /// Depths other than 8 bits and colour modes other than RGB are refused with a
@@ -45,6 +44,10 @@ namespace sbl {
 /// bottom-most layer called "Background", because PSD has nowhere else to put
 /// one. Opening the result in Sable therefore gives one more layer than was
 /// exported, and identical pixels.
+///
+/// A layer mask goes out as PSD's channel -2 with its own rectangle and default
+/// colour (D-029), so it is still a mask in Photoshop and still a mask when it
+/// comes back.
 [[nodiscard]] std::expected<void, Error> writePsd(const Document& doc,
                                                   const std::filesystem::path& path);
 

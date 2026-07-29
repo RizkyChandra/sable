@@ -135,6 +135,17 @@ struct PaintTarget {
     /// process default. Per-stroke rather than only global so that a test can
     /// drive two backends over one document and compare (D-021, #14).
     PaintBackend* backend = nullptr;
+    /// Dabs land in the layer's MASK rather than its pixels (#48). Ignored on a
+    /// layer with no mask, so a stray true cannot paint into something that
+    /// does not exist.
+    ///
+    /// A flag here rather than a second dab path: a mask tile is an ordinary
+    /// tile, so every brush, every pressure curve and the whole undo record
+    /// already work on it — which is the point of storing a mask that way. It
+    /// is also why painting a mask is allowed on a Text, Linework or Folder
+    /// layer, whose PIXELS the paint tools refuse: the mask is not generated
+    /// from anything, so nothing will overwrite it.
+    bool toMask = false;
 };
 
 void beginStroke(Stroke& s, const BrushPreset& preset, StraightRgba8 colour,
