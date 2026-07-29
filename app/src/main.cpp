@@ -57,7 +57,11 @@ constexpr float kRightPanelBase = 250.0f;
 constexpr float kDegToRad      = 3.14159265358979323846f / 180.0f;
 
 /// What to do once the artist answers the "discard unsaved work?" prompt.
-enum class Pending { None, NewCanvas, Quit, Open, Import };
+///
+/// Only two things can lose work since #50: closing a tab, and quitting with
+/// tabs still open. New, Open and Import used to be here too — they replaced
+/// the one document — and now open a tab of their own instead.
+enum class Pending { None, Quit, CloseTab };
 
 enum class Tool { Brush, Eraser, Fill, Select, Lasso, Wand, Transform, Text, Linework,
                   Gradient };
@@ -97,13 +101,89 @@ struct PenAxisState {
     float distance = 0.0f;
 };
 
+/// Everything that belongs to ONE open document (#50).
+///
+/// Pulled out before any tab UI was written, so that the COMPILER rather than a
+/// careful reading found every place that had assumed there was only ever one.
+/// What stays on `App` below is what an artist expects to be the same in every
+/// tab — the brush, the colour, the tool, the tablet profile — and what belongs
+/// to the window rather than to a picture.
+struct OpenDocument {
+    sbl::Document doc;
+    View          view;
+
+    /// Its own texture cache, for the reason #46 shipped one level further
+    /// down: `CanvasView` keys textures by tile alone, so a cache shared
+    /// between two documents has tile (0,0) of each colliding on one texture
+    /// and the last one uploaded wins — the second document would be drawn with
+    /// the first one's pixels. Keying by (document, tile) would also work; a
+    /// cache per document cannot be got wrong.
+    ///
+    /// By pointer because CanvasView owns SDL textures and is deliberately
+    /// neither copyable nor movable.
+    std::unique_ptr<CanvasView> canvas;
+
+    /// An unfinished sentence and a half-drawn curve belong to the document
+    /// they are being typed and drawn into, not to the window they are seen in.
+    TextTool     text;
+    LineworkTool linework;
+
+    /// Where the next stroke lands: the active layer's mask instead of its
+    /// pixels (#48). Per document, because what it means depends on that
+    /// document's layers — a tab whose active layer has no mask has nothing for
+    /// it to say.
+    bool paintOnMask = false;
+
+    /// D-013 bookkeeping, per document: the recovery thread covers every open
+    /// tab, so each needs its own copy on disk and its own clock. One shared
+    /// pair would have the second tab's autosave overwrite the first tab's.
+    std::string   lastRecoveryFile;
+    std::uint64_t lastAutosaveMs = 0;
+
+    /// What the tab strip shows.
+    [[nodiscard]] std::string title() const {
+        return doc.path.empty() ? std::string("Untitled")
+                                : doc.path.filename().string();
+    }
+};
+
+/// What Copy took (#50), kept on the window rather than in a document — copying
+/// between drawings is most of the reason to have two open at once.
+///
+/// Held at 16 bits and premultiplied, which is how a tile stores its pixels:
+/// copying out of a 16-bit document must not quantise the artist's paint, and
+/// `narrow(widen(c)) == c` means an 8-bit copy round-trips byte for byte.
+struct Clipboard {
+    std::int32_t w = 0, h = 0;
+    std::int32_t x = 0, y = 0;      // where it was lifted from, for where to put it
+    std::vector<sbl::PremulRgba16> px;
+
+    [[nodiscard]] bool empty() const noexcept { return w <= 0 || h <= 0; }
+};
+
 struct App {
     SDL_Window*   window   = nullptr;
     SDL_Renderer* renderer = nullptr;
-    CanvasView*   canvas   = nullptr;
 
-    sbl::Document doc;
-    View          view;
+    /// Never empty: closing the last tab opens a fresh canvas rather than
+    /// leaving `cur()` with nothing to return, which is the invariant that
+    /// keeps every caller below free of a null check.
+    std::vector<std::unique_ptr<OpenDocument>> docs;
+    std::size_t activeDoc = 0;
+
+    [[nodiscard]] OpenDocument&       cur()       { return *docs[activeDoc]; }
+    [[nodiscard]] const OpenDocument& cur() const { return *docs[activeDoc]; }
+
+    Clipboard clipboard;
+    /// Set whenever something OTHER than the tab strip changes which document
+    /// is active, and consumed by the strip on the next frame.
+    ///
+    /// Not a per-frame `SetSelected`: ImGui applies a queued selection on the
+    /// frame AFTER it is asked for, so a strip that asserted `activeDoc` every
+    /// frame would queue the old tab on the frame a click was being applied,
+    /// then the new one on the frame after, and flip between the two for ever.
+    /// A click needs no assertion at all — the strip is already showing it.
+    bool tabStripFollow = true;
 
     std::vector<sbl::BrushPreset> brushes = sbl::defaultBrushes();
     std::size_t brushIndex = 0;
@@ -150,10 +230,6 @@ struct App {
     sbl::Stroke           stroke;
     std::vector<sbl::Dab> scratch;
     bool painting = false;
-    /// Where the next stroke lands: the active layer's mask instead of its
-    /// pixels (#48). A preference, not document state — like which tool is
-    /// selected, and unlike the mask itself.
-    bool paintOnMask = false;
 
     // --- gradient (#49). The drag anchor is in canvas coordinates, so the
     // preview follows the art rather than the screen when the view is rotated
@@ -166,9 +242,6 @@ struct App {
     /// therefore ours to take back off before drawing the next one.
     bool   gradientPreviewed = false;
     double gradientAnchorX = 0.0, gradientAnchorY = 0.0;
-
-    TextTool text;
-    LineworkTool linework;
 
     // --- tablet
     std::unordered_map<SDL_PenID, PenAxisState> penAxes;
@@ -232,12 +305,12 @@ struct App {
     float uiScale = 1.0f;
     float appliedScale = 0.0f;
 
-    // --- background recovery (D-013)
+    // --- background recovery (D-013). One worker for every open document: two
+    // threads writing at once would double the disk churn to save an interval
+    // that is measured in minutes.
     std::thread       autosaveWorker;
     std::atomic<bool> autosaveBusy{false};
-    std::uint64_t     lastAutosaveMs = 0;
     std::mutex        recoveryMutex;
-    std::string       lastRecoveryFile;
     std::vector<sbl::RecoveryEntry> offeredRecoveries;
     bool openRecovery = false;
     bool openAbout    = false;
@@ -260,9 +333,8 @@ struct App {
 
     NewCanvasForm form;
     Pending       pending       = Pending::None;
-    /// A Pending::Open that already knows its file — a dropped path. Empty
-    /// means the artist still has to choose one in the dialog.
-    std::string   pendingOpenPath;
+    /// Which tab a Pending::CloseTab is about.
+    std::size_t   pendingClose  = 0;
     bool          openNew       = false;
     bool          openDiscard   = false;
     bool          openOverwrite = false;
@@ -307,8 +379,8 @@ struct App {
 /// is drawn from. Not saved with the document — the ruler is a way of working,
 /// not part of the picture.
 void centreSymmetry(App& app) {
-    app.symmetry.centreX = app.doc.width  * 0.5;
-    app.symmetry.centreY = app.doc.height * 0.5;
+    app.symmetry.centreX = app.cur().doc.width  * 0.5;
+    app.symmetry.centreY = app.cur().doc.height * 0.5;
 }
 
 /// Lays out `count` vanishing points as a starting arrangement.
@@ -318,15 +390,15 @@ void centreSymmetry(App& app) {
 /// they can drag, and dragging it out is easier than hunting for one parked
 /// three canvas widths off screen.
 void setVanishingPoints(App& app, int count) {
-    const double w = app.doc.width, h = app.doc.height;
-    app.doc.vanishingPoints.clear();
-    if (count >= 1) app.doc.vanishingPoints.push_back({w * 0.05, h * 0.5, true});
-    if (count >= 2) app.doc.vanishingPoints.push_back({w * 0.95, h * 0.5, true});
+    const double w = app.cur().doc.width, h = app.cur().doc.height;
+    app.cur().doc.vanishingPoints.clear();
+    if (count >= 1) app.cur().doc.vanishingPoints.push_back({w * 0.05, h * 0.5, true});
+    if (count >= 2) app.cur().doc.vanishingPoints.push_back({w * 0.95, h * 0.5, true});
     // The third is vertical: the one that makes a building lean away.
-    if (count >= 3) app.doc.vanishingPoints.push_back({w * 0.5, h * 0.95, true});
+    if (count >= 3) app.cur().doc.vanishingPoints.push_back({w * 0.5, h * 0.95, true});
     // One-point perspective has one point, and it belongs in the middle.
-    if (count == 1) app.doc.vanishingPoints[0].x = w * 0.5;
-    app.doc.dirty = true;
+    if (count == 1) app.cur().doc.vanishingPoints[0].x = w * 0.5;
+    app.cur().doc.dirty = true;
 }
 
 // --------------------------------------------------------------- persistence
@@ -347,7 +419,7 @@ void applySettings(App& app, const Settings& settings) {
     // Its own level, like every brush: a line wants more smoothing than a
     // sketch does, and one shared number would have the artist re-setting it
     // every time they switch.
-    app.linework.stabilizerLevel = static_cast<std::uint8_t>(
+    app.cur().linework.stabilizerLevel = static_cast<std::uint8_t>(
         std::clamp(settings.getInt("linework.stabilizer", 0), 0, 3));
 
     const std::string presets = settings.getString("brush.sizePresets", "");
@@ -436,7 +508,7 @@ void collectSettings(const App& app, Settings& settings) {
     settings.setInt("eraser.stabilizer", app.eraser.stabilizerLevel);
     settings.setInt("brush.active", static_cast<int>(app.brushIndex));
     settings.setInt("fill.tolerance", app.fillTolerance);
-    settings.setInt("linework.stabilizer", app.linework.stabilizerLevel);
+    settings.setInt("linework.stabilizer", app.cur().linework.stabilizerLevel);
 
     std::string presets;
     for (std::size_t i = 0; i < app.sizePresets.size(); ++i) {
@@ -498,7 +570,7 @@ void collectSettings(const App& app, Settings& settings) {
 /// The undo budget lives on the stack, and every fresh Document brings a fresh
 /// stack — so it has to be reapplied rather than set once at startup.
 void applyUndoBudget(App& app) {
-    app.doc.undo.setMemoryBudget(static_cast<std::size_t>(app.undoBudgetMb) *
+    app.cur().doc.undo.setMemoryBudget(static_cast<std::size_t>(app.undoBudgetMb) *
                                  1024u * 1024u);
 }
 
@@ -522,7 +594,7 @@ void applyGpuMode(App& app) {
     // operation lands on the CPU — but the artist would be looking at a ticked
     // menu item, a status bar reading "GPU", and CPU performance. Say it
     // instead, once, and untick the box.
-    if (app.useGpu && app.doc.depth != sbl::ColourDepth::Bits8) {
+    if (app.useGpu && app.cur().doc.depth != sbl::ColourDepth::Bits8) {
         app.useGpu = false;
         app.notices = {"Staying on the CPU: this document is 16-bit, and the "
                        "GPU backend paints 8-bit only."};
@@ -541,33 +613,83 @@ void applyGpuMode(App& app) {
     }
     if (!app.useGpu && app.gpu != nullptr) {
         // The host tiles have to be the truth again before the backend that
-        // holds them stops being consulted.
-        if (const auto ready = app.gpu->readback(app.doc); !ready.has_value())
-            showError(app, ready.error());
+        // holds them stops being consulted — for EVERY open document, not just
+        // the one on screen. A backend that painted a tab the artist has since
+        // switched away from is still holding its pixels (#50).
+        for (const std::unique_ptr<OpenDocument>& open : app.docs)
+            if (const auto ready = app.gpu->readback(open->doc); !ready.has_value())
+                showError(app, ready.error());
     }
     sbl::setPaintBackend(app.useGpu ? app.gpu.get() : nullptr);
-    if (app.canvas != nullptr) app.canvas->markAllDirty();
+    if (app.cur().canvas != nullptr) app.cur().canvas->markAllDirty();
 }
 
-void resetDocument(App& app, std::int32_t w, std::int32_t h, bool transparent,
-                   sbl::ColourDepth depth = sbl::ColourDepth::Bits8) {
-    // Nothing may outlive the document it was editing — an import warning
-    // included, since it describes a document that no longer exists.
-    app.text.finish(app.window, app.doc);
-    app.notices.clear();
-    app.canvas->releaseAll();
-    app.doc = sbl::makeDocument(
-        w, h, transparent ? sbl::StraightRgba8{0, 0, 0, 0}
-                          : sbl::StraightRgba8{255, 255, 255, 255},
-        depth);
-    // The GPU cannot paint 16-bit tiles yet, so a new 16-bit document has to
-    // put the toggle back where the artist can see it rather than leave the
+/// A new tab: its own texture cache, and its own copy of the tool settings the
+/// artist has already chosen.
+///
+/// The linework tool's width, taper, smoothing and select mode are PREFERENCES
+/// that happen to live on a per-document tool object. A tab that started them
+/// at the defaults would have the artist re-setting their line weight every
+/// time they opened a file — and `collectSettings`, which reads them off the
+/// active tab, would then write those defaults over what they had chosen.
+[[nodiscard]] std::unique_ptr<OpenDocument> makeTab(App& app) {
+    auto fresh = std::make_unique<OpenDocument>();
+    fresh->canvas = std::make_unique<CanvasView>(app.renderer);
+    if (!app.docs.empty()) {
+        const LineworkTool& from = app.cur().linework;
+        fresh->linework.width           = from.width;
+        fresh->linework.minWidthRatio   = from.minWidthRatio;
+        fresh->linework.stabilizerLevel = from.stabilizerLevel;
+        fresh->linework.selectMode      = from.selectMode;
+    }
+    return fresh;
+}
+
+/// Opens `document` in a tab and makes it the active one.
+///
+/// With `reusePristine`, an untouched current tab is taken over rather than
+/// left behind. That is what OPENING a file wants: Sable starts on a blank
+/// canvas, and double-clicking a .sable would otherwise always give the artist
+/// an empty document to close by hand. "Pristine" is deliberately strict —
+/// never saved, never edited, nothing in its history, nothing being typed — so
+/// this can never take a tab that holds work.
+///
+/// New canvas passes false. "New tab" twice in a row that produced one tab
+/// would be a control that did nothing, which is worse than an extra tab.
+OpenDocument& adoptDocument(App& app, sbl::Document&& document,
+                            bool reusePristine = true) {
+    const auto pristine = [](const OpenDocument& open) {
+        return !open.doc.dirty && open.doc.path.empty() &&
+               open.doc.undo.size() == 0 && !open.text.active();
+    };
+    if (app.docs.empty() || !reusePristine || !pristine(app.cur())) {
+        app.docs.push_back(makeTab(app));
+        app.activeDoc = app.docs.size() - 1;
+        app.tabStripFollow = true;
+    }
+    OpenDocument& open = app.cur();
+    open.canvas->releaseAll();     // the textures described the old document
+    open.doc = std::move(document);
+
+    // The GPU cannot paint 16-bit tiles yet, so a 16-bit document arriving has
+    // to put the toggle back where the artist can see it rather than leave the
     // View menu ticked over a backend that is silently declining every dab.
     applyGpuMode(app);
     applyUndoBudget(app);
     centreSymmetry(app);
-    fitToViewport(app.view, app.doc, app.viewport);
-    if (app.view.zoom > 1.0f) zoomToActualSize(app.view, app.doc, app.viewport);
+    fitToViewport(open.view, open.doc, app.viewport);
+    return open;
+}
+
+void newDocument(App& app, std::int32_t w, std::int32_t h, bool transparent,
+                 sbl::ColourDepth depth = sbl::ColourDepth::Bits8) {
+    // An import warning must not outlive the document it describes.
+    app.notices.clear();
+    OpenDocument& open = adoptDocument(app, sbl::makeDocument(
+        w, h, transparent ? sbl::StraightRgba8{0, 0, 0, 0}
+                          : sbl::StraightRgba8{255, 255, 255, 255},
+        depth), false);
+    if (open.view.zoom > 1.0f) zoomToActualSize(open.view, open.doc, app.viewport);
 }
 
 /// Applies the tile changes an undo or redo reported. A tile that no longer
@@ -575,22 +697,22 @@ void resetDocument(App& app, std::int32_t w, std::int32_t h, bool transparent,
 void syncTextures(App& app,
                   const std::vector<std::pair<sbl::LayerId, sbl::TileKey>>& changed) {
     for (const auto& [layerId, key] : changed) {
-        const sbl::Layer* layer = app.doc.layerById(layerId);
-        if (layer != nullptr && layer->find(key) != nullptr) app.canvas->markDirty(key);
-        else                                                 app.canvas->release(key);
+        const sbl::Layer* layer = app.cur().doc.layerById(layerId);
+        if (layer != nullptr && layer->find(key) != nullptr) app.cur().canvas->markDirty(key);
+        else                                                 app.cur().canvas->release(key);
     }
 }
 
 void doUndo(App& app) {
-    if (!app.doc.undo.canUndo()) return;
-    syncTextures(app, app.doc.undo.undo(app.doc));
-    app.doc.dirty = true;
+    if (!app.cur().doc.undo.canUndo()) return;
+    syncTextures(app, app.cur().doc.undo.undo(app.cur().doc));
+    app.cur().doc.dirty = true;
 }
 
 void doRedo(App& app) {
-    if (!app.doc.undo.canRedo()) return;
-    syncTextures(app, app.doc.undo.redo(app.doc));
-    app.doc.dirty = true;
+    if (!app.cur().doc.undo.canRedo()) return;
+    syncTextures(app, app.cur().doc.undo.redo(app.cur().doc));
+    app.cur().doc.dirty = true;
 }
 
 /// True when "Paint on mask" is on and the tool about to run cannot honour it.
@@ -608,8 +730,8 @@ void doRedo(App& app) {
 /// reports one thing and does another. Refusing and saying so is worse than
 /// working and better than lying.
 bool refusesMask(App& app) {
-    const sbl::Layer* layer = app.doc.layerById(app.doc.activeLayer);
-    if (!app.paintOnMask || layer == nullptr || !layer->mask.has_value()) return false;
+    const sbl::Layer* layer = app.cur().doc.layerById(app.cur().doc.activeLayer);
+    if (!app.cur().paintOnMask || layer == nullptr || !layer->mask.has_value()) return false;
     app.notices = {"Paint on mask is on, and fill, bucket, gradient and clear "
                    "still write the layer rather than its mask (#58) — so they "
                    "are held back. Paint the mask with a brush, or switch Paint "
@@ -619,12 +741,12 @@ bool refusesMask(App& app) {
 
 void doClear(App& app) {
     if (refusesMask(app)) return;
-    sbl::Layer* layer = app.doc.active();
+    sbl::Layer* layer = app.cur().doc.active();
     if (layer == nullptr || layer->tiles.empty()) return;   // harmless when empty
     sbl::UndoRecord rec = sbl::clearLayer(*layer);
-    for (const auto& snap : rec.tiles) app.canvas->release(snap.key);
-    app.doc.undo.push(std::move(rec));
-    app.doc.dirty = true;
+    for (const auto& snap : rec.tiles) app.cur().canvas->release(snap.key);
+    app.cur().doc.undo.push(std::move(rec));
+    app.cur().doc.dirty = true;
 }
 
 void showError(App& app, const sbl::Error& error) {
@@ -633,51 +755,43 @@ void showError(App& app, const sbl::Error& error) {
     app.openError = true;
 }
 
-/// Marks every tile of every layer for re-upload. Used after anything that
-/// replaces the document wholesale.
-void refreshAllTextures(App& app) {
-    app.canvas->releaseAll();
-}
-
 void doSaveProject(App& app, const std::filesystem::path& path) {
     // Through the registry, so Save and Export share one dispatch.
-    if (const auto result = sbl::exportDocument(app.doc, path); !result.has_value()) {
+    if (const auto result = sbl::exportDocument(app.cur().doc, path); !result.has_value()) {
         showError(app, result.error());
         return;
     }
-    app.doc.path  = path;
-    app.doc.dirty = false;
+    app.cur().doc.path  = path;
+    app.cur().doc.dirty = false;
 
     // The artist has a real file now, so the recovery copy is no longer the
     // only thing standing between them and losing work.
     const std::lock_guard lock(app.recoveryMutex);
-    if (!app.lastRecoveryFile.empty()) {
-        sbl::clearRecovery(app.lastRecoveryFile);
-        app.lastRecoveryFile.clear();
+    if (!app.cur().lastRecoveryFile.empty()) {
+        sbl::clearRecovery(app.cur().lastRecoveryFile);
+        app.cur().lastRecoveryFile.clear();
     }
 }
 
 /// Open and Import are the same code path: the registry picks the reader, and
 /// it is what decides whether the document keeps a path to save back to.
+///
+/// The file is READ before any tab is disturbed, so a path that will not load
+/// leaves the artist exactly where they were rather than on a blank new tab
+/// (D-012).
 void doOpenDocument(App& app, const std::filesystem::path& path) {
-    app.text.finish(app.window, app.doc);
     auto loaded = sbl::importDocument(path);
     if (!loaded.has_value()) {
         showError(app, loaded.error());
         return;
     }
-    refreshAllTextures(app);
-    app.doc = std::move(*loaded);
     // #40: once, here, for every format — the registry is the one front door,
     // so no importer can be added that forgets to be listened to. Assigned
     // rather than appended, so opening a clean file clears the last file's.
-    app.notices = app.doc.warnings;
+    app.notices = loaded->warnings;
     for (const std::string& warning : app.notices)
         SDL_Log("%s: %s", path.filename().string().c_str(), warning.c_str());
-    applyGpuMode(app);         // a 16-bit file arriving turns the GPU back off
-    applyUndoBudget(app);
-    centreSymmetry(app);
-    fitToViewport(app.view, app.doc, app.viewport);
+    adoptDocument(app, std::move(*loaded));
 }
 
 /// Writes a recovery copy on a worker thread.
@@ -686,36 +800,54 @@ void doOpenDocument(App& app, const std::filesystem::path& path) {
 /// Document — no pointers, no references, not even "just reading" the layer
 /// vector while the main thread might reallocate it. In C++ nothing in the
 /// type system enforces that, so the discipline is the hand-off itself.
+///
+/// EVERY open document is a candidate, not just the one on screen (#50): a
+/// reference tab left dirty in the background is exactly the work an artist
+/// would not think to save, and a crash would take it with no copy on disk. One
+/// document per call — the interval is two minutes, so the round robin gets to
+/// all of them long before it matters, and two workers writing at once would
+/// double the disk churn for nothing.
+///
+/// The worker holds a raw `OpenDocument*` for its bookkeeping, which is only
+/// sound because closing a tab joins first. See `closeDocument`.
 void maybeAutosave(App& app, std::uint64_t nowMs) {
-    if (!app.doc.dirty || app.autosaveBusy.load()) return;
-    if (nowMs - app.lastAutosaveMs < kAutosaveIntervalMs) return;
-    app.lastAutosaveMs = nowMs;
+    if (app.autosaveBusy.load()) return;
+
+    OpenDocument* due = nullptr;
+    for (const std::unique_ptr<OpenDocument>& open : app.docs) {
+        if (!open->doc.dirty) continue;
+        if (nowMs - open->lastAutosaveMs < kAutosaveIntervalMs) continue;
+        due = open.get();
+        break;
+    }
+    if (due == nullptr) return;
+    due->lastAutosaveMs = nowMs;
 
     if (app.autosaveWorker.joinable()) app.autosaveWorker.join();
 
     // The worker gets host pixels or it gets nothing: it has no device
     // context, so a backend holding tiles elsewhere must put them back first.
     // Skipping one autosave beats writing a file of stale art.
-    if (const auto ready = sbl::paintBackend().readback(app.doc); !ready.has_value()) {
+    if (const auto ready = sbl::paintBackend().readback(due->doc); !ready.has_value()) {
         showError(app, ready.error());
         return;
     }
-    sbl::Document snapshot = sbl::cloneDocument(app.doc);   // main thread
-    const std::filesystem::path original = app.doc.path;
+    sbl::Document snapshot = sbl::cloneDocument(due->doc);   // main thread
+    const std::filesystem::path original = due->doc.path;
     app.autosaveBusy.store(true);
 
     app.autosaveWorker = std::thread(
-        [&app, snapshot = std::move(snapshot), original]() mutable {
+        [&app, due, snapshot = std::move(snapshot), original]() mutable {
             const auto written = sbl::writeRecovery(snapshot, original);
             {
                 const std::lock_guard lock(app.recoveryMutex);
                 if (written.has_value()) {
-                    // Replace the previous copy rather than accumulating one
-                    // every two minutes for the whole session.
-                    if (!app.lastRecoveryFile.empty() &&
-                        app.lastRecoveryFile != written->string())
-                        sbl::clearRecovery(app.lastRecoveryFile);
-                    app.lastRecoveryFile = written->string();
+                    // Replace this document's previous copy rather than
+                    // accumulating one every two minutes for the whole session.
+                    if (!due->lastRecoveryFile.empty() &&
+                        due->lastRecoveryFile != written->string())
+                        sbl::clearRecovery(due->lastRecoveryFile);
+                    due->lastRecoveryFile = written->string();
                 }
             }
             app.autosaveBusy.store(false);
@@ -727,7 +859,7 @@ void maybeAutosave(App& app, std::uint64_t nowMs) {
 }
 
 void doExport(App& app, const std::string& path) {
-    if (const auto result = sbl::exportDocument(app.doc, path); !result.has_value())
+    if (const auto result = sbl::exportDocument(app.cur().doc, path); !result.has_value())
         showError(app, result.error());
     // US-07.5: exporting changes nothing about the document, dirty flag included.
 }
@@ -751,7 +883,7 @@ void syncHsvFromColour(App& app) {
 }
 
 void beginPaint(App& app) {
-    sbl::Layer* layer = app.doc.active();
+    sbl::Layer* layer = app.cur().doc.active();
     if (layer == nullptr) return;
 
     // Size changes apply to the next stroke, never mid-stroke (US-12.5) —
@@ -761,7 +893,7 @@ void beginPaint(App& app) {
     app.stabilizer.reset();
     // A snapshot for the stroke, so dragging a guide mid-stroke cannot bend a
     // line that has already committed to it. The document keeps the originals.
-    app.perspective.points = app.doc.vanishingPoints;
+    app.perspective.points = app.cur().doc.vanishingPoints;
     app.perspective.reset();
     app.pressureFilter.reset();
     app.painting = true;
@@ -778,7 +910,7 @@ void beginPaint(App& app) {
 void applyRulerImages(App& app, sbl::PaintTarget& target) {
     const bool mirroring = app.symmetry.active();
     for (const sbl::Dab& dab : app.scratch) {
-        app.canvas->markDabArea(dab.x, dab.y, dab.radius, app.doc);
+        app.cur().canvas->markDabArea(dab.x, dab.y, dab.radius, app.cur().doc);
         if (!mirroring) continue;
 
         app.symmetry.map(dab.x, dab.y, dab.angle, app.mirrors);
@@ -789,13 +921,13 @@ void applyRulerImages(App& app, sbl::PaintTarget& target) {
             image.y     = app.mirrors[i].y;
             image.angle = app.mirrors[i].angle;
             sbl::applyDab(target, image);
-            app.canvas->markDabArea(image.x, image.y, image.radius, app.doc);
+            app.cur().canvas->markDabArea(image.x, image.y, image.radius, app.cur().doc);
         }
     }
 }
 
 void paintWith(App& app, sbl::InputSample sample) {
-    sbl::Layer* layer = app.doc.active();
+    sbl::Layer* layer = app.cur().doc.active();
     if (layer == nullptr) return;
 
     app.lastCanvasX = sample.x;
@@ -808,19 +940,19 @@ void paintWith(App& app, sbl::InputSample sample) {
     sample = app.perspective.apply(sample);
 
     const sbl::Selection* selection =
-        app.doc.selection.has_value() && !app.doc.selection->empty()
-            ? &*app.doc.selection : nullptr;
+        app.cur().doc.selection.has_value() && !app.cur().doc.selection->empty()
+            ? &*app.cur().doc.selection : nullptr;
     sbl::PaintTarget target{*layer, app.stroke.pending, app.stroke.touched,
-                            app.doc.width, app.doc.height, selection, nullptr,
-                            app.paintOnMask};
+                            app.cur().doc.width, app.cur().doc.height, selection, nullptr,
+                            app.cur().paintOnMask};
     sbl::paintSample(app.stroke, target, sample, app.scratch);
     applyRulerImages(app, target);
 }
 
 sbl::InputSample mouseSample(App& app, double sx, double sy) {
     sbl::InputSample sample;
-    sample.x = toCanvasX(app.view, sx, sy);
-    sample.y = toCanvasY(app.view, sx, sy);
+    sample.x = toCanvasX(app.cur().view, sx, sy);
+    sample.y = toCanvasY(app.cur().view, sx, sy);
     sample.pressure    = 1.0f;          // mouse: full pressure, synthetic
     sample.fromMouse   = true;
     sample.timestampMs = SDL_GetTicks();
@@ -835,8 +967,8 @@ sbl::InputSample penSample(App& app, SDL_PenID which, float sx, float sy) {
     const PenAxisState& axes = app.penAxes[which];
 
     sbl::InputSample sample;
-    sample.x = toCanvasX(app.view, sx, sy);
-    sample.y = toCanvasY(app.view, sx, sy);
+    sample.x = toCanvasX(app.cur().view, sx, sy);
+    sample.y = toCanvasY(app.cur().view, sx, sy);
     // The fixed normalisation order lives in the engine, not here: deadzone,
     // rescale, smoothing, then the artist's curve (US-09.7).
     sample.pressure = app.pressureFilter.apply(app.profile, axes.pressure);
@@ -862,21 +994,21 @@ void endPaint(App& app) {
     // Release the string so the stroke ends where the artist lifted, not short
     // of it (US-11.4).
     if (!app.stroke.samples.empty() && activeBrush(app).stabilizerLevel > 0) {
-        sbl::Layer* layer = app.doc.active();
+        sbl::Layer* layer = app.cur().doc.active();
         if (layer != nullptr) {
             const sbl::InputSample last = app.perspective.apply(
                 app.stabilizer.finish(app.stroke.samples.back()));
             sbl::PaintTarget target{*layer, app.stroke.pending, app.stroke.touched,
-                                    app.doc.width, app.doc.height, nullptr, nullptr,
-                                    app.paintOnMask};
+                                    app.cur().doc.width, app.cur().doc.height, nullptr, nullptr,
+                                    app.cur().paintOnMask};
             sbl::paintSample(app.stroke, target, last, app.scratch);
             applyRulerImages(app, target);
         }
     }
 
     if (!app.stroke.pending.empty()) {
-        app.doc.undo.push(std::move(app.stroke.pending));
-        app.doc.dirty = true;
+        app.cur().doc.undo.push(std::move(app.stroke.pending));
+        app.cur().doc.dirty = true;
     }
     app.stroke.samples.clear();
 
@@ -889,25 +1021,25 @@ void endPaint(App& app) {
 
 void doFill(App& app, double sx, double sy) {
     if (refusesMask(app)) return;
-    const auto x = static_cast<std::int32_t>(std::floor(toCanvasX(app.view, sx, sy)));
-    const auto y = static_cast<std::int32_t>(std::floor(toCanvasY(app.view, sx, sy)));
+    const auto x = static_cast<std::int32_t>(std::floor(toCanvasX(app.cur().view, sx, sy)));
+    const auto y = static_cast<std::int32_t>(std::floor(toCanvasY(app.cur().view, sx, sy)));
 
     sbl::UndoRecord rec =
-        sbl::bucketFill(app.doc, app.doc.activeLayer, x, y, app.foreground,
+        sbl::bucketFill(app.cur().doc, app.cur().doc.activeLayer, x, y, app.foreground,
                         app.fillTolerance);
     if (rec.empty()) return;
 
-    for (const auto& snap : rec.tiles) app.canvas->markDirty(snap.key);
-    app.doc.undo.push(std::move(rec));
-    app.doc.dirty = true;
+    for (const auto& snap : rec.tiles) app.cur().canvas->markDirty(snap.key);
+    app.cur().doc.undo.push(std::move(rec));
+    app.cur().doc.dirty = true;
 }
 
 void beginGradient(App& app, double sx, double sy) {
     if (refusesMask(app)) return;   // refuse before the drag, not after it draws
     app.gradientDragging  = true;
     app.gradientPreviewed = false;
-    app.gradientAnchorX   = toCanvasX(app.view, sx, sy);
-    app.gradientAnchorY   = toCanvasY(app.view, sx, sy);
+    app.gradientAnchorX   = toCanvasX(app.cur().view, sx, sy);
+    app.gradientAnchorY   = toCanvasY(app.cur().view, sx, sy);
 }
 
 /// Draws the gradient the drag currently describes, replacing the one the
@@ -929,7 +1061,7 @@ void beginGradient(App& app, double sx, double sy) {
 void previewGradient(App& app, double sx, double sy) {
     if (!app.gradientDragging) return;
     if (app.gradientPreviewed) {
-        syncTextures(app, app.doc.undo.undo(app.doc));
+        syncTextures(app, app.cur().doc.undo.undo(app.cur().doc));
         app.gradientPreviewed = false;
     }
 
@@ -937,20 +1069,20 @@ void previewGradient(App& app, double sx, double sy) {
     g.shape  = app.gradientShape;
     g.x0     = app.gradientAnchorX;
     g.y0     = app.gradientAnchorY;
-    g.x1     = toCanvasX(app.view, sx, sy);
-    g.y1     = toCanvasY(app.view, sx, sy);
+    g.x1     = toCanvasX(app.cur().view, sx, sy);
+    g.y1     = toCanvasY(app.cur().view, sx, sy);
     g.from   = app.foreground;
     g.to     = app.gradientToTransparent
                    ? sbl::StraightRgba8{0, 0, 0, 0} : app.background;
     g.dither = app.gradientDither;
 
-    sbl::UndoRecord rec = sbl::gradientFill(app.doc, app.doc.activeLayer, g);
+    sbl::UndoRecord rec = sbl::gradientFill(app.cur().doc, app.cur().doc.activeLayer, g);
     if (rec.empty()) return;                  // a drag too short to have an axis
 
-    for (const auto& snap : rec.tiles) app.canvas->markDirty(snap.key);
-    app.doc.undo.push(std::move(rec));
+    for (const auto& snap : rec.tiles) app.cur().canvas->markDirty(snap.key);
+    app.cur().doc.undo.push(std::move(rec));
     app.gradientPreviewed = true;
-    app.doc.dirty = true;
+    app.cur().doc.dirty = true;
 
     if (const auto failed = sbl::paintBackend().takeError(); failed.has_value())
         showError(app, *failed);
@@ -983,23 +1115,23 @@ void commitSelection(App& app, const sbl::Selection& shape) {
     const sbl::Selection base =
         app.selectBase.has_value() ? *app.selectBase : sbl::Selection{};
     sbl::Selection combined = sbl::combineSelections(base, shape, app.dragMode);
-    if (combined.empty()) app.doc.selection.reset();
-    else                  app.doc.selection = std::move(combined);
+    if (combined.empty()) app.cur().doc.selection.reset();
+    else                  app.cur().doc.selection = std::move(combined);
 }
 
 void beginSelectDrag(App& app, double sx, double sy) {
     app.selecting     = true;
     app.dragMode      = modeForDrag(app);
-    app.selectBase    = app.doc.selection;
-    app.selectAnchorX = toCanvasX(app.view, sx, sy);
-    app.selectAnchorY = toCanvasY(app.view, sx, sy);
+    app.selectBase    = app.cur().doc.selection;
+    app.selectAnchorX = toCanvasX(app.cur().view, sx, sy);
+    app.selectAnchorY = toCanvasY(app.cur().view, sx, sy);
     app.lassoPath.clear();
     app.lassoPath.push_back(sbl::Point{app.selectAnchorX, app.selectAnchorY});
 }
 
 void updateSelection(App& app, double sx, double sy) {
-    const double cx = toCanvasX(app.view, sx, sy);
-    const double cy = toCanvasY(app.view, sx, sy);
+    const double cx = toCanvasX(app.cur().view, sx, sy);
+    const double cy = toCanvasY(app.cur().view, sx, sy);
 
     sbl::Selection selection;
     selection.x = static_cast<std::int32_t>(std::floor(std::min(app.selectAnchorX, cx)));
@@ -1009,8 +1141,8 @@ void updateSelection(App& app, double sx, double sy) {
 
     // Clamped to the canvas, so a drag off the edge does not make a selection
     // that reaches somewhere no pixel exists.
-    const std::int32_t x1 = std::min(app.doc.width,  selection.x + selection.w);
-    const std::int32_t y1 = std::min(app.doc.height, selection.y + selection.h);
+    const std::int32_t x1 = std::min(app.cur().doc.width,  selection.x + selection.w);
+    const std::int32_t y1 = std::min(app.cur().doc.height, selection.y + selection.h);
     selection.x = std::max(0, selection.x);
     selection.y = std::max(0, selection.y);
     selection.w = std::max(0, x1 - selection.x);
@@ -1022,7 +1154,7 @@ void updateSelection(App& app, double sx, double sy) {
 /// reports far more motion than a polygon edge needs, and the lasso's cost is
 /// per vertex on every scanline.
 void extendLasso(App& app, double sx, double sy) {
-    const sbl::Point p{toCanvasX(app.view, sx, sy), toCanvasY(app.view, sx, sy)};
+    const sbl::Point p{toCanvasX(app.cur().view, sx, sy), toCanvasY(app.cur().view, sx, sy)};
     if (!app.lassoPath.empty()) {
         const sbl::Point& last = app.lassoPath.back();
         if (std::abs(p.x - last.x) < 1.0 && std::abs(p.y - last.y) < 1.0) return;
@@ -1037,15 +1169,15 @@ void endSelectDrag(App& app, double sx, double sy) {
     // whole loop on every motion event, for a shape that is not finished yet.
     if (app.tool == Tool::Lasso) {
         extendLasso(app, sx, sy);
-        commitSelection(app, sbl::lassoSelection(app.lassoPath, app.doc.width,
-                                                 app.doc.height));
+        commitSelection(app, sbl::lassoSelection(app.lassoPath, app.cur().doc.width,
+                                                 app.cur().doc.height));
         app.lassoPath.clear();
     }
     app.selectBase.reset();
     // A click with no drag clears the selection rather than leaving a
     // zero-sized one that silently blocks painting.
-    if (app.doc.selection.has_value() && app.doc.selection->empty())
-        app.doc.selection.reset();
+    if (app.cur().doc.selection.has_value() && app.cur().doc.selection->empty())
+        app.cur().doc.selection.reset();
 }
 
 /// The pointer moved while a selection is being drawn. Pen and mouse both.
@@ -1055,21 +1187,21 @@ void dragSelection(App& app, double sx, double sy) {
 }
 
 void wandAt(App& app, double sx, double sy) {
-    const auto x = static_cast<std::int32_t>(std::floor(toCanvasX(app.view, sx, sy)));
-    const auto y = static_cast<std::int32_t>(std::floor(toCanvasY(app.view, sx, sy)));
+    const auto x = static_cast<std::int32_t>(std::floor(toCanvasX(app.cur().view, sx, sy)));
+    const auto y = static_cast<std::int32_t>(std::floor(toCanvasY(app.cur().view, sx, sy)));
 
     app.dragMode   = modeForDrag(app);
-    app.selectBase = app.doc.selection;
-    commitSelection(app, sbl::magicWandSelection(app.doc, x, y, app.wandTolerance));
+    app.selectBase = app.cur().doc.selection;
+    commitSelection(app, sbl::magicWandSelection(app.cur().doc, x, y, app.wandTolerance));
     app.selectBase.reset();
 }
 
 void pickColourAt(App& app, double sx, double sy) {
-    const auto x = static_cast<std::int32_t>(std::floor(toCanvasX(app.view, sx, sy)));
-    const auto y = static_cast<std::int32_t>(std::floor(toCanvasY(app.view, sx, sy)));
-    if (x < 0 || y < 0 || x >= app.doc.width || y >= app.doc.height) return;
+    const auto x = static_cast<std::int32_t>(std::floor(toCanvasX(app.cur().view, sx, sy)));
+    const auto y = static_cast<std::int32_t>(std::floor(toCanvasY(app.cur().view, sx, sy)));
+    if (x < 0 || y < 0 || x >= app.cur().doc.width || y >= app.cur().doc.height) return;
 
-    const sbl::StraightRgba8 picked = sbl::pickColour(app.doc, x, y);
+    const sbl::StraightRgba8 picked = sbl::pickColour(app.cur().doc, x, y);
     app.foreground = sbl::StraightRgba8{picked.r, picked.g, picked.b, 255};
     syncHsvFromColour(app);
 }
@@ -1082,14 +1214,14 @@ void pickColourAt(App& app, double sx, double sy) {
 [[nodiscard]] int guideAt(const App& app, double sx, double sy) {
     const double reach = 10.0 * app.uiScale;
     const auto grabbed = [&](double cx, double cy) {
-        const double dx = toScreenX(app.view, cx, cy) - sx;
-        const double dy = toScreenY(app.view, cx, cy) - sy;
+        const double dx = toScreenX(app.cur().view, cx, cy) - sx;
+        const double dy = toScreenY(app.cur().view, cx, cy) - sy;
         return dx * dx + dy * dy <= reach * reach;
     };
     // Vanishing points first: they are the smaller, fiddlier target.
     if (app.perspective.enabled) {
-        for (std::size_t i = 0; i < app.doc.vanishingPoints.size(); ++i)
-            if (grabbed(app.doc.vanishingPoints[i].x, app.doc.vanishingPoints[i].y))
+        for (std::size_t i = 0; i < app.cur().doc.vanishingPoints.size(); ++i)
+            if (grabbed(app.cur().doc.vanishingPoints[i].x, app.cur().doc.vanishingPoints[i].y))
                 return static_cast<int>(i);
     }
     if (app.symmetry.enabled && grabbed(app.symmetry.centreX, app.symmetry.centreY))
@@ -1098,17 +1230,17 @@ void pickColourAt(App& app, double sx, double sy) {
 }
 
 void moveGuide(App& app, double sx, double sy) {
-    const double cx = toCanvasX(app.view, sx, sy);
-    const double cy = toCanvasY(app.view, sx, sy);
+    const double cx = toCanvasX(app.cur().view, sx, sy);
+    const double cy = toCanvasY(app.cur().view, sx, sy);
     if (app.draggingGuide == kSymmetryGuide) {
         app.symmetry.centreX = cx;
         app.symmetry.centreY = cy;      // not document state, so nothing dirties
     } else if (app.draggingGuide >= 0 &&
                static_cast<std::size_t>(app.draggingGuide) <
-                   app.doc.vanishingPoints.size()) {
-        app.doc.vanishingPoints[app.draggingGuide].x = cx;
-        app.doc.vanishingPoints[app.draggingGuide].y = cy;
-        app.doc.dirty = true;           // it is saved, so moving it is a change
+                   app.cur().doc.vanishingPoints.size()) {
+        app.cur().doc.vanishingPoints[app.draggingGuide].x = cx;
+        app.cur().doc.vanishingPoints[app.draggingGuide].y = cy;
+        app.cur().doc.dirty = true;           // it is saved, so moving it is a change
     }
 }
 
@@ -1118,9 +1250,9 @@ void moveGuide(App& app, double sx, double sy) {
 /// layer and pressing the tool's key — a rule with no hit-testing in it, and so
 /// with no invisible boxes for a click to land just outside of.
 void placeText(App& app, double sx, double sy) {
-    app.text.finish(app.window, app.doc);
-    app.text.begin(app.window, toCanvasX(app.view, sx, sy),
-                   toCanvasY(app.view, sx, sy), app.foreground);
+    app.cur().text.finish(app.window, app.cur().doc);
+    app.cur().text.begin(app.window, toCanvasX(app.cur().view, sx, sy),
+                   toCanvasY(app.cur().view, sx, sy), app.foreground);
 }
 
 
@@ -1136,7 +1268,7 @@ void placeText(App& app, double sx, double sy) {
 /// at 10% and would swallow the whole line at 800%.
 [[nodiscard]] double lineworkGrab(const App& app) {
     return 9.0 * static_cast<double>(app.uiScale) /
-           std::max(static_cast<double>(app.view.zoom), 0.01);
+           std::max(static_cast<double>(app.cur().view.zoom), 0.01);
 }
 
 /// Ctrl adds a control point on the curve, Shift takes one away, and a plain
@@ -1148,7 +1280,7 @@ void placeText(App& app, double sx, double sy) {
 /// everywhere else in the program.
 [[nodiscard]] LineworkAction lineworkAction(const App& app) {
     const SDL_Keymod mods = SDL_GetModState();
-    if (app.linework.selectMode)
+    if (app.cur().linework.selectMode)
         return (mods & SDL_KMOD_SHIFT) != 0 ? LineworkAction::SelectAdd
                                             : LineworkAction::Select;
     if ((mods & SDL_KMOD_CTRL)  != 0) return LineworkAction::Insert;
@@ -1157,31 +1289,237 @@ void placeText(App& app, double sx, double sy) {
 }
 
 void lineworkPress(App& app, double sx, double sy, float pressure) {
-    app.linework.colour = app.foreground;
-    app.linework.press(app.doc, toCanvasX(app.view, sx, sy),
-                       toCanvasY(app.view, sx, sy), pressure, lineworkAction(app),
+    app.cur().linework.colour = app.foreground;
+    app.cur().linework.press(app.cur().doc, toCanvasX(app.cur().view, sx, sy),
+                       toCanvasY(app.cur().view, sx, sy), pressure, lineworkAction(app),
                        lineworkGrab(app));
-    syncTextures(app, app.linework.takeChanged());
+    syncTextures(app, app.cur().linework.takeChanged());
 }
 
 void lineworkDrag(App& app, double sx, double sy, float pressure) {
-    if (!app.linework.busy()) return;
-    app.linework.drag(app.doc, toCanvasX(app.view, sx, sy),
-                      toCanvasY(app.view, sx, sy), pressure);
-    syncTextures(app, app.linework.takeChanged());
+    if (!app.cur().linework.busy()) return;
+    app.cur().linework.drag(app.cur().doc, toCanvasX(app.cur().view, sx, sy),
+                      toCanvasY(app.cur().view, sx, sy), pressure);
+    syncTextures(app, app.cur().linework.takeChanged());
 }
 
 void lineworkRelease(App& app) {
-    app.linework.release(app.doc);
-    syncTextures(app, app.linework.takeChanged());
+    app.cur().linework.release(app.cur().doc);
+    syncTextures(app, app.cur().linework.takeChanged());
 }
 
 /// Selects the text tool, resuming the active layer's text if it has any.
 void chooseTextTool(App& app) {
     app.tool = Tool::Text;
-    const sbl::Layer* layer = app.doc.layerById(app.doc.activeLayer);
+    const sbl::Layer* layer = app.cur().doc.layerById(app.cur().doc.activeLayer);
     if (layer != nullptr && layer->text.has_value())
-        app.text.resume(app.window, app.doc, layer->id);
+        app.cur().text.resume(app.window, app.cur().doc, layer->id);
+}
+
+// ----------------------------------------------------------------------- tabs
+// #50. The state each tab owns lives in OpenDocument above; what is left here
+// is switching between them, closing one, and the clipboard that is the reason
+// to have two open at all.
+
+/// Ends whatever gesture is in flight, so nothing carries across a switch.
+///
+/// The stroke, the lasso path and the gradient drag are still one per window
+/// rather than one per document, and they can be: a pointer draws in one place
+/// at a time, so the only way they could span two documents is if a switch
+/// happened halfway through — which is what this prevents. A half-finished text
+/// or linework session is a different thing entirely and stays with its own
+/// document, which is why neither is ended here.
+void settleGestures(App& app, double sx, double sy) {
+    app.panning       = false;
+    app.draggingGuide = kNoGuide;
+    endSelectDrag(app, sx, sy);
+    lineworkRelease(app);
+    endGradient(app, sx, sy);
+    endPaint(app);
+}
+
+void switchToDocument(App& app, std::size_t index) {
+    if (index >= app.docs.size() || index == app.activeDoc) return;
+    settleGestures(app, 0.0, 0.0);
+
+    // The backend paints whichever document is active and holds its tiles until
+    // asked for them. Fetch them before this tab stops being the one anything
+    // asks about, or an export, an autosave or a switch back finds host tiles
+    // that are a stroke or two out of date.
+    if (const auto ready = sbl::paintBackend().readback(app.cur().doc);
+        !ready.has_value())
+        showError(app, ready.error());
+
+    // SDL's text input is the window's, not the document's. The incoming tab's
+    // TextTool::frame turns it back on if it is mid-sentence; nothing else
+    // would ever turn it off.
+    if (app.cur().text.active()) SDL_StopTextInput(app.window);
+
+    app.activeDoc = index;
+    app.tabStripFollow = true;
+    app.notices.clear();          // they described the tab we just left
+}
+
+/// Ctrl+Tab. Wraps, so it reaches every tab from any of them.
+void cycleDocument(App& app, int delta) {
+    if (app.docs.size() < 2) return;
+    const auto count = static_cast<int>(app.docs.size());
+    const int next = (static_cast<int>(app.activeDoc) + delta % count + count) % count;
+    switchToDocument(app, static_cast<std::size_t>(next));
+}
+
+/// Closes a tab outright. The prompt is the CALLER's business — see
+/// `requestClose`, which is what every close gesture actually goes through.
+void closeDocument(App& app, std::size_t index) {
+    if (index >= app.docs.size()) return;
+    settleGestures(app, 0.0, 0.0);
+
+    // Before the OpenDocument is destroyed: the recovery worker holds a raw
+    // pointer to it for its bookkeeping. This is the one thing that makes that
+    // pointer sound, so it must not be moved below the erase.
+    if (app.autosaveWorker.joinable()) app.autosaveWorker.join();
+
+    OpenDocument& going = *app.docs[index];
+    going.text.finish(app.window, going.doc);
+    // A closed document's recovery copy has done its job — leaving it would
+    // offer the artist "unsaved work" on the next launch for a tab they closed
+    // on purpose.
+    {
+        const std::lock_guard lock(app.recoveryMutex);
+        if (!going.lastRecoveryFile.empty()) sbl::clearRecovery(going.lastRecoveryFile);
+    }
+    app.docs.erase(app.docs.begin() + static_cast<std::ptrdiff_t>(index));
+
+    // Never zero documents: `cur()` has no answer for that, and neither does an
+    // artist looking at an application with no canvas in it.
+    if (app.docs.empty()) {
+        auto fresh = makeTab(app);
+        fresh->doc = sbl::makeDocument(kDefaultCanvas, kDefaultCanvas,
+                                       sbl::StraightRgba8{255, 255, 255, 255});
+        app.docs.push_back(std::move(fresh));
+        app.activeDoc = 0;
+        app.tabStripFollow = true;
+        applyUndoBudget(app);
+        fitToViewport(app.cur().view, app.cur().doc, app.viewport);
+        return;
+    }
+    // Land on the neighbour rather than jumping to the start of the strip.
+    app.activeDoc = std::min(app.activeDoc >= index && app.activeDoc > 0
+                                 ? app.activeDoc - 1 : app.activeDoc,
+                             app.docs.size() - 1);
+    // The strip identifies tabs by index, and every index above the closed one
+    // has just moved down; tell it which document is active rather than leaving
+    // it holding an id that now means a different drawing.
+    app.tabStripFollow = true;
+    app.notices.clear();
+}
+
+// -------------------------------------------------------------- copy and paste
+// The clipboard is the window's, not a document's: carrying part of one drawing
+// into another is what #50 is for. Sable's own, not the system's — a system
+// clipboard means a platform image format, and that is a separate change.
+
+/// Copies the active layer's pixels under the selection, or the whole layer
+/// when there is none.
+///
+/// The active LAYER rather than the composite, which is what every other
+/// application means by copy: what is on the layer the artist is working on.
+/// Coverage is applied as it is lifted, so a lasso copies its own shape rather
+/// than the box around it — the same rule `transformRegion` follows.
+bool doCopy(App& app) {
+    const sbl::Layer* layer = app.cur().doc.layerById(app.cur().doc.activeLayer);
+    if (layer == nullptr) return false;
+    const sbl::Document& doc = app.cur().doc;
+
+    const bool masked = doc.selection.has_value() && !doc.selection->empty();
+    const sbl::Selection whole{0, 0, doc.width, doc.height};
+    const sbl::Selection& region = masked ? *doc.selection : whole;
+
+    const std::int32_t x0 = std::max(0, region.x);
+    const std::int32_t y0 = std::max(0, region.y);
+    const std::int32_t x1 = std::min(doc.width,  region.x + region.w);
+    const std::int32_t y1 = std::min(doc.height, region.y + region.h);
+    if (x0 >= x1 || y0 >= y1) return false;
+
+    Clipboard board;
+    board.x = x0;
+    board.y = y0;
+    board.w = x1 - x0;
+    board.h = y1 - y0;
+    board.px.assign(static_cast<std::size_t>(board.w) *
+                    static_cast<std::size_t>(board.h), sbl::PremulRgba16{});
+
+    for (std::int32_t y = y0; y < y1; ++y) {
+        for (std::int32_t x = x0; x < x1; ++x) {
+            const std::uint8_t cov = region.coverage(x, y);
+            if (cov == 0) continue;
+            const sbl::TileKey key{sbl::tileIndex(x), sbl::tileIndex(y)};
+            const sbl::Tile* tile = layer->find(key);
+            if (tile == nullptr) continue;   // never painted: stays transparent
+            sbl::PremulRgba16 c = tile->pixel(x - key.first * sbl::TILE_SIZE,
+                                              y - key.second * sbl::TILE_SIZE);
+            if (cov != 255) {
+                // Premultiplied, so scaling all four channels by the coverage is
+                // the whole of "this much of the pixel came".
+                const auto scale = [cov](std::uint16_t v) {
+                    return static_cast<std::uint16_t>(v * cov / 255);
+                };
+                c = sbl::PremulRgba16{scale(c.r), scale(c.g), scale(c.b), scale(c.a)};
+            }
+            board.px[static_cast<std::size_t>(y - y0) *
+                     static_cast<std::size_t>(board.w) +
+                     static_cast<std::size_t>(x - x0)] = c;
+        }
+    }
+    app.clipboard = std::move(board);
+    return true;
+}
+
+/// Pastes onto a NEW layer in the current document.
+///
+/// A new layer rather than over the active one, for the same reason every other
+/// application does it: a paste the artist did not mean is then one layer
+/// delete away rather than a hole in their painting. It is also what makes the
+/// undo step free — `swapRecord` moves the whole layer, tiles included, so
+/// undoing a paste takes its pixels with it and redoing brings them back.
+bool doPaste(App& app) {
+    if (app.clipboard.empty()) return false;
+    sbl::Document& doc = app.cur().doc;
+
+    sbl::UndoRecord rec = sbl::addLayerAbove(doc, doc.activeLayer, "Pasted");
+    if (rec.empty()) return false;
+    sbl::Layer* onto = doc.active();
+    if (onto == nullptr) return false;
+
+    // Where it came from, nudged back on-canvas. Pasting into a smaller
+    // document at the source coordinates would otherwise land the whole block
+    // off the edge, and an artist would see nothing and assume it failed.
+    const std::int32_t ox =
+        std::clamp(app.clipboard.x, 0, std::max(0, doc.width  - app.clipboard.w));
+    const std::int32_t oy =
+        std::clamp(app.clipboard.y, 0, std::max(0, doc.height - app.clipboard.h));
+
+    for (std::int32_t row = 0; row < app.clipboard.h; ++row) {
+        for (std::int32_t col = 0; col < app.clipboard.w; ++col) {
+            const sbl::PremulRgba16 c =
+                app.clipboard.px[static_cast<std::size_t>(row) *
+                                 static_cast<std::size_t>(app.clipboard.w) +
+                                 static_cast<std::size_t>(col)];
+            if (c.a == 0) continue;          // do not allocate tiles for nothing
+            const std::int32_t x = ox + col;
+            const std::int32_t y = oy + row;
+            if (x < 0 || y < 0 || x >= doc.width || y >= doc.height) continue;
+            const sbl::TileKey key{sbl::tileIndex(x), sbl::tileIndex(y)};
+            onto->tileFor(key).setPixel(x - key.first * sbl::TILE_SIZE,
+                                        y - key.second * sbl::TILE_SIZE, c);
+        }
+    }
+
+    app.cur().canvas->releaseAll();
+    rec.label = "Paste";
+    doc.undo.push(std::move(rec));
+    doc.dirty = true;
+    return true;
 }
 
 void stepSizePreset(App& app, int direction) {
@@ -1260,20 +1598,10 @@ void askForImportPath(App& app) {
     showFileDialog(app, sbl::FormatUse::Read, false, false);
 }
 
-/// Carries out a Pending::Open once nothing stands in its way. A path that
-/// arrived from outside the application — a drop, a command-line argument —
-/// opens straight away; without one the artist picks the file.
-void openPending(App& app) {
-    if (app.pendingOpenPath.empty()) { askForOpenPath(app); return; }
-    const std::filesystem::path path = std::move(app.pendingOpenPath);
-    app.pendingOpenPath.clear();
-    doOpenDocument(app, path);
-}
-
 /// Ctrl+S: straight to the known path, or the dialog if there is not one yet.
 void doSave(App& app) {
-    if (app.doc.path.empty()) askForSavePath(app);
-    else                      doSaveProject(app, app.doc.path);
+    if (app.cur().doc.path.empty()) askForSavePath(app);
+    else                            doSaveProject(app, app.cur().doc.path);
 }
 
 /// The extension of the filter the artist picked, for when they typed a bare
@@ -1319,20 +1647,38 @@ void pumpDialog(App& app) {
     }
 }
 
-/// Requests an action that would lose unsaved work, prompting first (US-01.3).
+/// Asks to close one tab, prompting first if it holds unsaved strokes (US-01.3).
 ///
-/// `path` belongs to Pending::Open and names a file chosen outside the
-/// application. Defaulting it also clears any stale one, so a drop the artist
-/// cancelled cannot be opened later by an unrelated Ctrl+O.
-void requestPending(App& app, Pending what, std::string path = {}) {
-    app.pending = what;
-    app.pendingOpenPath = std::move(path);
-    if (app.doc.dirty) { app.openDiscard = true; return; }
-    if (what == Pending::NewCanvas)   app.openNew = true;
-    else if (what == Pending::Open)   openPending(app);
-    else if (what == Pending::Import) askForImportPath(app);
-    else                              app.running = false;
+/// Since #50 this is the ONLY thing that can lose work: New and Open no longer
+/// replace the document in front of the artist, they open another tab beside
+/// it. Quit is the same question asked about every tab at once.
+void requestClose(App& app, std::size_t index) {
+    if (index >= app.docs.size()) return;
+    app.pending      = Pending::CloseTab;
+    app.pendingClose = index;
+    if (app.docs[index]->doc.dirty) { app.openDiscard = true; return; }
     app.pending = Pending::None;
+    closeDocument(app, index);
+}
+
+/// Quit, which is every open tab's unsaved work at once.
+void requestQuit(App& app) {
+    app.pending = Pending::Quit;
+    for (const std::unique_ptr<OpenDocument>& open : app.docs) {
+        if (!open->doc.dirty) continue;
+        app.openDiscard = true;
+        return;
+    }
+    app.pending = Pending::None;
+    app.running = false;
+}
+
+/// How many open documents have unsaved strokes, for the prompt to say.
+[[nodiscard]] std::size_t dirtyCount(const App& app) {
+    std::size_t n = 0;
+    for (const std::unique_ptr<OpenDocument>& open : app.docs)
+        if (open->doc.dirty) ++n;
+    return n;
 }
 
 // ----------------------------------------------------------------------- input
@@ -1345,7 +1691,7 @@ bool overCanvas(const App& app, float x, float y) {
 /// Rotation changes the mapping only — no dirty flag, no undo entry, no tile
 /// upload, the same guarantee US-05.5 makes for pan and zoom.
 void rotateView(App& app, double delta) {
-    rotateAbout(app.view, app.viewport.x + app.viewport.w * 0.5,
+    rotateAbout(app.cur().view, app.viewport.x + app.viewport.w * 0.5,
                 app.viewport.y + app.viewport.h * 0.5, delta);
 }
 
@@ -1356,7 +1702,7 @@ void handleKey(App& app, const SDL_KeyboardEvent& key) {
     // Keyboard-only placement (PRD §6): with the text tool chosen and nothing
     // being typed yet, Enter starts a text in the middle of what is on screen.
     // Without this the tool would need a pointing device to begin at all.
-    if (app.tool == Tool::Text && !app.text.active() &&
+    if (app.tool == Tool::Text && !app.cur().text.active() &&
         (key.key == SDLK_RETURN || key.key == SDLK_KP_ENTER)) {
         placeText(app, app.viewport.x + app.viewport.w * 0.5,
                        app.viewport.y + app.viewport.h * 0.5);
@@ -1376,37 +1722,45 @@ void handleKey(App& app, const SDL_KeyboardEvent& key) {
     }
 
     switch (app.shortcuts.lookup(key.key, static_cast<SDL_Keymod>(key.mod))) {
-        case Action::NewCanvas:   requestPending(app, Pending::NewCanvas); break;
-        case Action::OpenProject: requestPending(app, Pending::Open); break;
+        // New and Open open a TAB rather than replacing what is on screen
+        // (#50), so neither can lose work and neither prompts any more.
+        case Action::NewCanvas:   app.openNew = true; break;
+        case Action::OpenProject: askForOpenPath(app); break;
         case Action::Save:        doSave(app); break;
         case Action::SaveAs:      askForSavePath(app); break;
         case Action::ExportPng:   askForExportPath(app); break;
-        case Action::Quit:        requestPending(app, Pending::Quit); break;
+        case Action::Quit:        requestQuit(app); break;
+
+        case Action::CloseDocument:    requestClose(app, app.activeDoc); break;
+        case Action::NextDocument:     cycleDocument(app, +1); break;
+        case Action::PreviousDocument: cycleDocument(app, -1); break;
 
         case Action::Undo:  doUndo(app); break;
         case Action::Redo:  doRedo(app); break;
+        case Action::Copy:  doCopy(app); break;
+        case Action::Paste: doPaste(app); break;
         case Action::Clear: doClear(app); break;
         case Action::FillSelection: {
             if (refusesMask(app)) break;
             sbl::UndoRecord rec =
-                sbl::fillSelection(app.doc, app.doc.activeLayer, app.foreground);
+                sbl::fillSelection(app.cur().doc, app.cur().doc.activeLayer, app.foreground);
             if (!rec.empty()) {
-                for (const auto& snap : rec.tiles) app.canvas->markDirty(snap.key);
-                app.doc.undo.push(std::move(rec));
-                app.doc.dirty = true;
+                for (const auto& snap : rec.tiles) app.cur().canvas->markDirty(snap.key);
+                app.cur().doc.undo.push(std::move(rec));
+                app.cur().doc.dirty = true;
             }
             break;
         }
-        case Action::Deselect: app.doc.selection.reset(); break;
+        case Action::Deselect: app.cur().doc.selection.reset(); break;
 
-        case Action::FitToWindow: fitToViewport(app.view, app.doc, app.viewport); break;
-        case Action::ActualSize:  zoomToActualSize(app.view, app.doc, app.viewport); break;
+        case Action::FitToWindow: fitToViewport(app.cur().view, app.cur().doc, app.viewport); break;
+        case Action::ActualSize:  zoomToActualSize(app.cur().view, app.cur().doc, app.viewport); break;
         case Action::ZoomIn:
         case Action::ZoomOut: {
             const float factor =
                 app.shortcuts.lookup(key.key, static_cast<SDL_Keymod>(key.mod)) ==
                     Action::ZoomIn ? kZoomStep : 1.0f / kZoomStep;
-            zoomAbout(app.view, app.viewport.x + app.viewport.w * 0.5f,
+            zoomAbout(app.cur().view, app.viewport.x + app.viewport.w * 0.5f,
                       app.viewport.y + app.viewport.h * 0.5f, factor);
             break;
         }
@@ -1414,30 +1768,30 @@ void handleKey(App& app, const SDL_KeyboardEvent& key) {
         // whatever the artist is looking at stays where they are looking.
         case Action::RotateLeft:  rotateView(app, -kRotateStep); break;
         case Action::RotateRight: rotateView(app, +kRotateStep); break;
-        case Action::ResetRotation: rotateView(app, -app.view.rotation); break;
+        case Action::ResetRotation: rotateView(app, -app.cur().view.rotation); break;
 
         // Leaving the text tool commits what was typed. A tool change is an
         // unambiguous "I have finished with this", and the alternative — a
         // session left running under the brush — loses the text on the first
         // stroke that lands on its layer. Every tool that is not Text has to
         // say so, so a tool added later cannot quietly skip it.
-        case Action::ToolBrush:  app.text.finish(app.window, app.doc); app.tool = Tool::Brush;  break;
-        case Action::ToolLasso:  app.text.finish(app.window, app.doc); app.tool = Tool::Lasso;  break;
-        case Action::ToolWand:   app.text.finish(app.window, app.doc); app.tool = Tool::Wand;   break;
-        case Action::ToolEraser: app.text.finish(app.window, app.doc); app.tool = Tool::Eraser; break;
-        case Action::ToolFill:   app.text.finish(app.window, app.doc); app.tool = Tool::Fill;   break;
-        case Action::ToolSelect: app.text.finish(app.window, app.doc); app.tool = Tool::Select; break;
+        case Action::ToolBrush:  app.cur().text.finish(app.window, app.cur().doc); app.tool = Tool::Brush;  break;
+        case Action::ToolLasso:  app.cur().text.finish(app.window, app.cur().doc); app.tool = Tool::Lasso;  break;
+        case Action::ToolWand:   app.cur().text.finish(app.window, app.cur().doc); app.tool = Tool::Wand;   break;
+        case Action::ToolEraser: app.cur().text.finish(app.window, app.cur().doc); app.tool = Tool::Eraser; break;
+        case Action::ToolFill:   app.cur().text.finish(app.window, app.cur().doc); app.tool = Tool::Fill;   break;
+        case Action::ToolSelect: app.cur().text.finish(app.window, app.cur().doc); app.tool = Tool::Select; break;
         case Action::ToolTransform:
-            app.text.finish(app.window, app.doc);
+            app.cur().text.finish(app.window, app.cur().doc);
             app.tool = Tool::Transform;
             break;
         case Action::ToolText: chooseTextTool(app); break;
         case Action::ToolLinework:
-            app.text.finish(app.window, app.doc);
+            app.cur().text.finish(app.window, app.cur().doc);
             app.tool = Tool::Linework;
             break;
         case Action::ToolGradient:
-            app.text.finish(app.window, app.doc);
+            app.cur().text.finish(app.window, app.cur().doc);
             app.tool = Tool::Gradient;
             break;
 
@@ -1474,12 +1828,12 @@ void handleEvent(App& app, const SDL_Event& e) {
 
     switch (e.type) {
         case SDL_EVENT_QUIT:
-            requestPending(app, Pending::Quit);
+            requestQuit(app);
             break;
 
         case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
             if (e.window.windowID == SDL_GetWindowID(app.window))
-                requestPending(app, Pending::Quit);
+                requestQuit(app);
             break;
 
         // D-002 cost #2, answered: characters reach the canvas through SDL's
@@ -1489,8 +1843,8 @@ void handleEvent(App& app, const SDL_Event& e) {
         case SDL_EVENT_TEXT_INPUT:
         case SDL_EVENT_TEXT_EDITING:
             if (!io.WantCaptureKeyboard &&
-                app.text.handleEvent(e, app.doc, app.window))
-                syncTextures(app, app.text.takeChanged());
+                app.cur().text.handleEvent(e, app.cur().doc, app.window))
+                syncTextures(app, app.cur().text.takeChanged());
             break;
 
         case SDL_EVENT_KEY_DOWN:
@@ -1498,20 +1852,20 @@ void handleEvent(App& app, const SDL_Event& e) {
             if (io.WantCaptureKeyboard) break;
             // A live text session owns the keyboard: `b` types a b rather than
             // switching to the brush and abandoning the sentence.
-            if (app.text.handleEvent(e, app.doc, app.window)) {
-                syncTextures(app, app.text.takeChanged());
+            if (app.cur().text.handleEvent(e, app.cur().doc, app.window)) {
+                syncTextures(app, app.cur().text.takeChanged());
                 break;
             }
             handleKey(app, e.key);
             break;
 
         case SDL_EVENT_DROP_FILE:
-            // A drop is an open like any other, so it goes through the same
-            // unsaved-work prompt. SDL owns e.drop.data only for this event,
-            // hence the copy — the path may sit in `pending` for many frames
-            // while the artist decides.
+            // A drop is an open like any other, and since #50 an open costs the
+            // artist nothing: it arrives in a tab of its own beside whatever
+            // they were working on. SDL owns e.drop.data only for this event,
+            // so it is used before this case returns and never stored.
             if (e.drop.data != nullptr)
-                requestPending(app, Pending::Open, e.drop.data);
+                doOpenDocument(app, std::filesystem::path(e.drop.data));
             break;
 
         // ------------------------------------------------------------- pen
@@ -1551,7 +1905,7 @@ void handleEvent(App& app, const SDL_Event& e) {
             // reachable only with a mouse would be one most artists never use.
             if (app.tool == Tool::Text) {
                 placeText(app, e.ptouch.x, e.ptouch.y);
-                syncTextures(app, app.text.takeChanged());
+                syncTextures(app, app.cur().text.takeChanged());
                 break;
             }
             if (app.tool == Tool::Linework) {
@@ -1585,7 +1939,7 @@ void handleEvent(App& app, const SDL_Event& e) {
                 moveGuide(app, e.pmotion.x, e.pmotion.y);
             else if (app.selecting)
                 dragSelection(app, e.pmotion.x, e.pmotion.y);
-            else if (app.linework.busy())
+            else if (app.cur().linework.busy())
                 lineworkDrag(app, e.pmotion.x, e.pmotion.y,
                              penSample(app, e.pmotion.which,
                                        e.pmotion.x, e.pmotion.y).pressure);
@@ -1617,8 +1971,8 @@ void handleEvent(App& app, const SDL_Event& e) {
                 // Screen space on both sides, so this stays right at any
                 // rotation: pan translates the whole mapping, it does not
                 // travel along the canvas axes.
-                app.panAnchorX = e.button.x - app.view.panX;
-                app.panAnchorY = e.button.y - app.view.panY;
+                app.panAnchorX = e.button.x - app.cur().view.panX;
+                app.panAnchorY = e.button.y - app.cur().view.panY;
             } else if (e.button.button == SDL_BUTTON_LEFT) {
                 // A guide handle takes the press before any tool does, so the
                 // artist never has to switch tools to move a ruler.
@@ -1630,7 +1984,7 @@ void handleEvent(App& app, const SDL_Event& e) {
                     doFill(app, e.button.x, e.button.y);
                 } else if (app.tool == Tool::Text) {
                     placeText(app, e.button.x, e.button.y);
-                    syncTextures(app, app.text.takeChanged());
+                    syncTextures(app, app.cur().text.takeChanged());
                 } else if (app.tool == Tool::Linework) {
                     lineworkPress(app, e.button.x, e.button.y, 1.0f);
                 } else if (app.tool == Tool::Wand) {
@@ -1651,13 +2005,13 @@ void handleEvent(App& app, const SDL_Event& e) {
             if (app.panning) {
                 // Panning never alters pixels: no undo state, no dirty flag,
                 // no tile upload (US-05.5).
-                app.view.panX = e.motion.x - app.panAnchorX;
-                app.view.panY = e.motion.y - app.panAnchorY;
+                app.cur().view.panX = e.motion.x - app.panAnchorX;
+                app.cur().view.panY = e.motion.y - app.panAnchorY;
             } else if (app.draggingGuide != kNoGuide) {
                 moveGuide(app, e.motion.x, e.motion.y);
             } else if (app.selecting) {
                 dragSelection(app, e.motion.x, e.motion.y);
-            } else if (app.linework.busy()) {
+            } else if (app.cur().linework.busy()) {
                 lineworkDrag(app, e.motion.x, e.motion.y, 1.0f);
             } else if (app.gradientDragging) {
                 previewGradient(app, e.motion.x, e.motion.y);
@@ -1683,7 +2037,7 @@ void handleEvent(App& app, const SDL_Event& e) {
             if (!io.WantCaptureMouse) {
                 float mx = 0.0f, my = 0.0f;
                 SDL_GetMouseState(&mx, &my);
-                zoomAbout(app.view, mx, my,
+                zoomAbout(app.cur().view, mx, my,
                           e.wheel.y > 0 ? kZoomStep : 1.0f / kZoomStep);
             }
             break;
@@ -1726,13 +2080,70 @@ void buildDefaultLayout(ImGuiID dockspace) {
     ImGui::DockBuilderFinish(dockspace);
 }
 
+/// The tab strip (#50). Drawn inside the dockspace host window, above the
+/// DockSpace call, so the panels and the canvas both shrink to make room for it
+/// and no hard-coded rectangle has to be kept in step with the layout.
+///
+/// One tab per open document, and nothing else: a strip that also carried
+/// per-tab controls would be a second toolbar in the one place the artist looks
+/// to answer "which drawing am I in".
+void drawTabStrip(App& app) {
+    if (app.docs.size() < 2) return;   // one document: nothing to choose between
+
+    // ImGui closes a tab with the middle mouse button whenever it has a close
+    // button to offer, which is where "middle-click to close" comes from — it
+    // is not wired up separately here.
+    if (!ImGui::BeginTabBar("sable.documents",
+                            ImGuiTabBarFlags_Reorderable |
+                            ImGuiTabBarFlags_FittingPolicyScroll)) return;
+
+    // Collected and applied after the bar is finished: closing a tab erases
+    // from `app.docs`, and doing that while ImGui is walking the same indices
+    // is how a list-mutating-under-its-own-loop bug gets in.
+    std::size_t closeRequest = app.docs.size();
+    std::size_t selected     = app.activeDoc;
+
+    for (std::size_t i = 0; i < app.docs.size(); ++i) {
+        const OpenDocument& open = *app.docs[i];
+        // The id has to be the INDEX, not the name: two untitled canvases, or
+        // two files of the same name from different directories, would
+        // otherwise share one tab as far as ImGui is concerned.
+        const std::string label =
+            open.title() + (open.doc.dirty ? " *" : "") + "###tab" + std::to_string(i);
+        bool stayOpen = true;
+        // SetSelected pushes a switch made elsewhere — Ctrl+Tab, a close, a
+        // file opening — back into the bar, ONCE. See App::tabStripFollow for
+        // why it is not asserted every frame.
+        const ImGuiTabItemFlags flags =
+            app.tabStripFollow && i == app.activeDoc ? ImGuiTabItemFlags_SetSelected
+                                                     : 0;
+        if (ImGui::BeginTabItem(label.c_str(), &stayOpen, flags)) {
+            selected = i;
+            ImGui::EndTabItem();
+        }
+        if (!stayOpen) closeRequest = i;
+    }
+    ImGui::EndTabBar();
+    app.tabStripFollow = false;
+
+    switchToDocument(app, selected);
+    if (closeRequest < app.docs.size()) requestClose(app, closeRequest);
+}
+
 void drawMenuBar(App& app, float& menuHeight) {
     if (!ImGui::BeginMainMenuBar()) return;
     menuHeight = ImGui::GetWindowSize().y;
 
     if (ImGui::BeginMenu("File")) {
-        if (ImGui::MenuItem("New", app.shortcuts.get(Action::NewCanvas).label().c_str())) requestPending(app, Pending::NewCanvas);
-        if (ImGui::MenuItem("Open...", app.shortcuts.get(Action::OpenProject).label().c_str())) requestPending(app, Pending::Open);
+        // "New tab" and "Open in a tab" are what these do since #50, and the
+        // labels say so: an artist who expects New to replace what they are
+        // looking at should find out from the menu, not from a surprise.
+        if (ImGui::MenuItem("New tab", app.shortcuts.get(Action::NewCanvas).label().c_str()))
+            app.openNew = true;
+        if (ImGui::MenuItem("Open in a tab...", app.shortcuts.get(Action::OpenProject).label().c_str()))
+            askForOpenPath(app);
+        if (ImGui::MenuItem("Close tab", app.shortcuts.get(Action::CloseDocument).label().c_str()))
+            requestClose(app, app.activeDoc);
         ImGui::Separator();
         if (ImGui::MenuItem("Save", app.shortcuts.get(Action::Save).label().c_str())) doSave(app);
         if (ImGui::MenuItem("Save as...", app.shortcuts.get(Action::SaveAs).label().c_str())) askForSavePath(app);
@@ -1741,67 +2152,82 @@ void drawMenuBar(App& app, float& menuHeight) {
         // greys out rather than opening a dialog with nothing in it.
         if (ImGui::MenuItem("Import...", nullptr, false,
                             !sbl::dialogFilters(sbl::FormatUse::Read, false).empty()))
-            requestPending(app, Pending::Import);
+            askForImportPath(app);
         if (ImGui::MenuItem("Export...", app.shortcuts.get(Action::ExportPng).label().c_str(), false,
                             !sbl::dialogFilters(sbl::FormatUse::Write, false).empty()))
             askForExportPath(app);
         ImGui::Separator();
-        if (ImGui::MenuItem("Quit", app.shortcuts.get(Action::Quit).label().c_str())) requestPending(app, Pending::Quit);
+        if (ImGui::MenuItem("Quit", app.shortcuts.get(Action::Quit).label().c_str())) requestQuit(app);
         ImGui::EndMenu();
     }
 
     if (ImGui::BeginMenu("Edit")) {
         // US-04.6: correct enabled/disabled state, with the action's label.
         const std::string undoLabel =
-            app.doc.undo.canUndo() ? "Undo " + app.doc.undo.undoLabel() : "Undo";
+            app.cur().doc.undo.canUndo() ? "Undo " + app.cur().doc.undo.undoLabel() : "Undo";
         const std::string redoLabel =
-            app.doc.undo.canRedo() ? "Redo " + app.doc.undo.redoLabel() : "Redo";
+            app.cur().doc.undo.canRedo() ? "Redo " + app.cur().doc.undo.redoLabel() : "Redo";
         if (ImGui::MenuItem(undoLabel.c_str(), app.shortcuts.get(Action::Undo).label().c_str(), false,
-                            app.doc.undo.canUndo())) doUndo(app);
+                            app.cur().doc.undo.canUndo())) doUndo(app);
         if (ImGui::MenuItem(redoLabel.c_str(), app.shortcuts.get(Action::Redo).label().c_str(), false,
-                            app.doc.undo.canRedo())) doRedo(app);
+                            app.cur().doc.undo.canRedo())) doRedo(app);
         ImGui::Separator();
-        const sbl::Layer* layer = app.doc.layerById(app.doc.activeLayer);
+        // #50. Sable's own clipboard, so it reaches across tabs; the label says
+        // what is on it, because a paste into the wrong document is otherwise
+        // the only way to find out.
+        if (ImGui::MenuItem("Copy", app.shortcuts.get(Action::Copy).label().c_str(),
+                            false, app.cur().doc.active() != nullptr))
+            doCopy(app);
+        const std::string pasteLabel =
+            app.clipboard.empty()
+                ? std::string("Paste")
+                : "Paste " + std::to_string(app.clipboard.w) + " x " +
+                      std::to_string(app.clipboard.h);
+        if (ImGui::MenuItem(pasteLabel.c_str(), app.shortcuts.get(Action::Paste).label().c_str(),
+                            false, !app.clipboard.empty()))
+            doPaste(app);
+        ImGui::Separator();
+        const sbl::Layer* layer = app.cur().doc.layerById(app.cur().doc.activeLayer);
         if (ImGui::MenuItem("Clear", nullptr, false,
                             layer != nullptr && !layer->tiles.empty())) doClear(app);
         ImGui::Separator();
         if (ImGui::MenuItem("Fill selection", nullptr, false, layer != nullptr) &&
             !refusesMask(app)) {
             sbl::UndoRecord rec =
-                sbl::fillSelection(app.doc, app.doc.activeLayer, app.foreground);
+                sbl::fillSelection(app.cur().doc, app.cur().doc.activeLayer, app.foreground);
             if (!rec.empty()) {
-                for (const auto& snap : rec.tiles) app.canvas->markDirty(snap.key);
-                app.doc.undo.push(std::move(rec));
-                app.doc.dirty = true;
+                for (const auto& snap : rec.tiles) app.cur().canvas->markDirty(snap.key);
+                app.cur().doc.undo.push(std::move(rec));
+                app.cur().doc.dirty = true;
             }
         }
         if (ImGui::MenuItem("Deselect", app.shortcuts.get(Action::Deselect).label().c_str(), false,
-                            app.doc.selection.has_value()))
-            app.doc.selection.reset();
+                            app.cur().doc.selection.has_value()))
+            app.cur().doc.selection.reset();
         ImGui::Separator();
         ImGui::TextDisabled("History: %zu steps, %.1f MB of %d MB",
-                            app.doc.undo.size(),
-                            static_cast<double>(app.doc.undo.memoryBytes()) /
+                            app.cur().doc.undo.size(),
+                            static_cast<double>(app.cur().doc.undo.memoryBytes()) /
                                 (1024.0 * 1024.0),
                             app.undoBudgetMb);
-        if (app.doc.undo.droppedRecords() > 0)
+        if (app.cur().doc.undo.droppedRecords() > 0)
             ImGui::TextDisabled("%zu older step(s) dropped to stay in budget.",
-                                app.doc.undo.droppedRecords());
+                                app.cur().doc.undo.droppedRecords());
         ImGui::EndMenu();
     }
 
     if (ImGui::BeginMenu("View")) {
         if (ImGui::MenuItem("Fit to window", app.shortcuts.get(Action::FitToWindow).label().c_str()))
-            fitToViewport(app.view, app.doc, app.viewport);
+            fitToViewport(app.cur().view, app.cur().doc, app.viewport);
         if (ImGui::MenuItem("Actual size", app.shortcuts.get(Action::ActualSize).label().c_str()))
-            zoomToActualSize(app.view, app.doc, app.viewport);
+            zoomToActualSize(app.cur().view, app.cur().doc, app.viewport);
         if (ImGui::MenuItem("Rotate left", app.shortcuts.get(Action::RotateLeft).label().c_str()))
             rotateView(app, -kRotateStep);
         if (ImGui::MenuItem("Rotate right", app.shortcuts.get(Action::RotateRight).label().c_str()))
             rotateView(app, +kRotateStep);
         if (ImGui::MenuItem("Reset rotation", app.shortcuts.get(Action::ResetRotation).label().c_str(),
-                            false, app.view.rotation != 0.0))
-            rotateView(app, -app.view.rotation);
+                            false, app.cur().view.rotation != 0.0))
+            rotateView(app, -app.cur().view.rotation);
         ImGui::Separator();
         // D-021: one binary, one toggle, defaulting to the CPU. Disabled
         // rather than hidden when there is no device, so a bug report can say
@@ -1843,7 +2269,7 @@ void drawToolPanel(App& app) {
             if (!iconRadio(icon, label, app.tool == tool)) return;
             // Same rule as the keyboard: picking another tool commits the text.
             if (tool == Tool::Text) chooseTextTool(app);
-            else { app.text.finish(app.window, app.doc); app.tool = tool; }
+            else { app.cur().text.finish(app.window, app.cur().doc); app.tool = tool; }
         };
         toolRow(Icon::Brush,     "Brush",     Tool::Brush,     Action::ToolBrush);
         toolRow(Icon::Eraser,    "Eraser",    Tool::Eraser,    Action::ToolEraser);
@@ -1857,21 +2283,21 @@ void drawToolPanel(App& app) {
         toolRow(Icon::Linework,  "Linework",  Tool::Linework,  Action::ToolLinework);
 
         if (app.tool == Tool::Text) {
-            app.text.drawPanel(app.doc);
-            syncTextures(app, app.text.takeChanged());
+            app.cur().text.drawPanel(app.cur().doc);
+            syncTextures(app, app.cur().text.takeChanged());
         }
 
         if (app.tool == Tool::Linework) {
             // The foreground colour is what a new stroke takes and what the
             // panel writes over a selected one, so it is read here rather than
             // only at pen-down: the artist picks the colour, then applies it.
-            app.linework.colour = app.foreground;
-            app.linework.drawPanel(app.doc);
-            syncTextures(app, app.linework.takeChanged());
+            app.cur().linework.colour = app.foreground;
+            app.cur().linework.drawPanel(app.cur().doc);
+            syncTextures(app, app.cur().linework.takeChanged());
         }
 
         if (app.tool == Tool::Transform) {
-            if (!app.doc.selection.has_value() || app.doc.selection->empty()) {
+            if (!app.cur().doc.selection.has_value() || app.cur().doc.selection->empty()) {
                 ImGui::TextDisabled("Select a region first.");
             } else {
                 ImGui::SetNextItemWidth(-1.0f);
@@ -1891,12 +2317,12 @@ void drawToolPanel(App& app) {
 
                 if (ImGui::Button("Apply", ImVec2(-1.0f, 0.0f))) {
                     sbl::UndoRecord rec = sbl::transformRegion(
-                        app.doc, app.doc.activeLayer, *app.doc.selection,
+                        app.cur().doc, app.cur().doc.activeLayer, *app.cur().doc.selection,
                         app.pendingTransform);
                     if (!rec.empty()) {
-                        app.canvas->releaseAll();
-                        app.doc.undo.push(std::move(rec));
-                        app.doc.dirty = true;
+                        app.cur().canvas->releaseAll();
+                        app.cur().doc.undo.push(std::move(rec));
+                        app.cur().doc.dirty = true;
                     }
                     app.pendingTransform = sbl::Transform{};
                 }
@@ -1915,7 +2341,7 @@ void drawToolPanel(App& app) {
             if (ImGui::RadioButton("Radial", app.gradientShape == sbl::GradientShape::Radial))
                 app.gradientShape = sbl::GradientShape::Radial;
             ImGui::Checkbox("To transparent", &app.gradientToTransparent);
-            if (app.doc.depth == sbl::ColourDepth::Bits8) {
+            if (app.cur().doc.depth == sbl::ColourDepth::Bits8) {
                 ImGui::Checkbox("Dither", &app.gradientDither);
                 ImGui::TextDisabled("breaks up 8-bit banding");
             } else {
@@ -1944,8 +2370,8 @@ void drawToolPanel(App& app) {
             modeRow("Add (Shift)",    sbl::SelectMode::Add);
             modeRow("Subtract (Alt)", sbl::SelectMode::Subtract);
             modeRow("Intersect",      sbl::SelectMode::Intersect);
-            if (app.doc.selection.has_value() &&
-                ImGui::SmallButton("Deselect")) app.doc.selection.reset();
+            if (app.cur().doc.selection.has_value() &&
+                ImGui::SmallButton("Deselect")) app.cur().doc.selection.reset();
         }
 
         ImGui::Spacing();
@@ -2043,14 +2469,14 @@ void drawToolPanel(App& app) {
                 ImGui::SameLine();
             }
             if (ImGui::SmallButton("None")) setVanishingPoints(app, 0);
-            for (std::size_t i = 0; i < app.doc.vanishingPoints.size(); ++i) {
+            for (std::size_t i = 0; i < app.cur().doc.vanishingPoints.size(); ++i) {
                 ImGui::PushID(static_cast<int>(i));
-                ImGui::Checkbox("##on", &app.doc.vanishingPoints[i].enabled);
+                ImGui::Checkbox("##on", &app.cur().doc.vanishingPoints[i].enabled);
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(-1.0f);
                 if (ImGui::DragScalarN("##xy", ImGuiDataType_Double,
-                                       &app.doc.vanishingPoints[i].x, 2, 1.0f))
-                    app.doc.dirty = true;
+                                       &app.cur().doc.vanishingPoints[i].x, 2, 1.0f))
+                    app.cur().doc.dirty = true;
                 ImGui::PopID();
             }
             ImGui::Unindent();
@@ -2084,9 +2510,9 @@ void drawToolPanel(App& app) {
 /// texture cache and let the next frame rebuild what it needs.
 void pushLayerAction(App& app, sbl::UndoRecord&& rec) {
     if (rec.empty()) return;
-    app.canvas->releaseAll();
-    app.doc.undo.push(std::move(rec));
-    app.doc.dirty = true;
+    app.cur().canvas->releaseAll();
+    app.cur().doc.undo.push(std::move(rec));
+    app.cur().doc.dirty = true;
 }
 
 void drawLayerPanel(App& app) {
@@ -2094,53 +2520,53 @@ void drawLayerPanel(App& app) {
         ImGui::TextDisabled("LAYERS");
 
         if (iconButton(Icon::Plus, "##addlayer", "New layer"))
-            pushLayerAction(app, sbl::addLayerAbove(app.doc, app.doc.activeLayer,
-                                                    "Layer " + std::to_string(app.doc.nextLayerId)));
+            pushLayerAction(app, sbl::addLayerAbove(app.cur().doc, app.cur().doc.activeLayer,
+                                                    "Layer " + std::to_string(app.cur().doc.nextLayerId)));
         ImGui::SameLine();
         if (iconButton(Icon::Duplicate, "##duplayer", "Duplicate layer"))
-            pushLayerAction(app, sbl::duplicateLayer(app.doc, app.doc.activeLayer));
+            pushLayerAction(app, sbl::duplicateLayer(app.cur().doc, app.cur().doc.activeLayer));
         ImGui::SameLine();
         // Disabled rather than hidden when it would be a no-op, so the row
         // does not reflow under the pointer.
-        ImGui::BeginDisabled(app.doc.layers.size() <= 1);
+        ImGui::BeginDisabled(app.cur().doc.layers.size() <= 1);
         if (iconButton(Icon::Delete, "##dellayer", "Delete layer"))
-            pushLayerAction(app, sbl::deleteLayer(app.doc, app.doc.activeLayer));
+            pushLayerAction(app, sbl::deleteLayer(app.cur().doc, app.cur().doc.activeLayer));
         ImGui::EndDisabled();
         ImGui::SameLine();
         if (iconButton(Icon::Merge, "##mergelayer", "Merge down"))
-            pushLayerAction(app, sbl::mergeLayerDown(app.doc, app.doc.activeLayer));
+            pushLayerAction(app, sbl::mergeLayerDown(app.cur().doc, app.cur().doc.activeLayer));
 
         if (iconButton(Icon::Group, "##grouplayer", "Group this layer")) {
             // A folder above the active layer, with that layer moved inside —
             // which is what "group this" means without a drag-and-drop tree.
-            const sbl::LayerId child = app.doc.activeLayer;
-            sbl::UndoRecord rec = sbl::addLayerAbove(app.doc, child, "Group");
+            const sbl::LayerId child = app.cur().doc.activeLayer;
+            sbl::UndoRecord rec = sbl::addLayerAbove(app.cur().doc, child, "Group");
             if (!rec.empty()) {
-                const sbl::LayerId folder = app.doc.activeLayer;
-                if (sbl::Layer* group = app.doc.layerById(folder); group != nullptr)
+                const sbl::LayerId folder = app.cur().doc.activeLayer;
+                if (sbl::Layer* group = app.cur().doc.layerById(folder); group != nullptr)
                     group->kind = sbl::LayerKind::Folder;
-                if (sbl::Layer* inner = app.doc.layerById(child); inner != nullptr)
+                if (sbl::Layer* inner = app.cur().doc.layerById(child); inner != nullptr)
                     inner->parent = folder;
                 pushLayerAction(app, std::move(rec));
-                app.doc.activeLayer = folder;
+                app.cur().doc.activeLayer = folder;
             }
         }
         ImGui::SameLine();
         if (iconButton(Icon::Ungroup, "##ungrouplayer", "Move out of its group")) {
-            if (sbl::Layer* layer = app.doc.layerById(app.doc.activeLayer);
+            if (sbl::Layer* layer = app.cur().doc.layerById(app.cur().doc.activeLayer);
                 layer != nullptr && layer->parent.has_value()) {
                 sbl::LayerProps props = sbl::propsOf(*layer);
                 props.parent.reset();
-                pushLayerAction(app, sbl::setLayerProps(app.doc, layer->id, props));
+                pushLayerAction(app, sbl::setLayerProps(app.cur().doc, layer->id, props));
             }
         }
 
         ImGui::SameLine();
         if (iconButton(Icon::Raise, "##raiselayer", "Raise layer"))
-            pushLayerAction(app, sbl::moveLayer(app.doc, app.doc.activeLayer, +1));
+            pushLayerAction(app, sbl::moveLayer(app.cur().doc, app.cur().doc.activeLayer, +1));
         ImGui::SameLine();
         if (iconButton(Icon::Lower, "##lowerlayer", "Lower layer"))
-            pushLayerAction(app, sbl::moveLayer(app.doc, app.doc.activeLayer, -1));
+            pushLayerAction(app, sbl::moveLayer(app.cur().doc, app.cur().doc.activeLayer, -1));
 
         ImGui::Separator();
 
@@ -2150,8 +2576,8 @@ void drawLayerPanel(App& app) {
         sbl::LayerProps edited;
         sbl::LayerId deleteMaskFor = sbl::NO_LAYER;   // #48, applied after the loop
 
-        for (std::size_t i = app.doc.layers.size(); i-- > 0;) {
-            sbl::Layer& layer = app.doc.layers[i];
+        for (std::size_t i = app.cur().doc.layers.size(); i-- > 0;) {
+            sbl::Layer& layer = app.cur().doc.layers[i];
             ImGui::PushID(static_cast<int>(layer.id));
 
             if (iconToggle(layer.visible ? Icon::Eye : Icon::EyeClosed, "##vis",
@@ -2163,7 +2589,7 @@ void drawLayerPanel(App& app) {
             }
             ImGui::SameLine();
 
-            const bool active = layer.id == app.doc.activeLayer;
+            const bool active = layer.id == app.cur().doc.activeLayer;
             if (layer.parent.has_value()) ImGui::Indent(16.0f);
             char label[160];
             std::snprintf(label, sizeof label, "%s%s%s%s",
@@ -2177,7 +2603,7 @@ void drawLayerPanel(App& app) {
                           !layer.mask.has_value() ? ""
                           : layer.mask->enabled   ? "  [mask]"
                                                   : "  [mask off]");
-            if (ImGui::Selectable(label, active)) app.doc.activeLayer = layer.id;
+            if (ImGui::Selectable(label, active)) app.cur().doc.activeLayer = layer.id;
 
             if (active) {
                 ImGui::Indent(12.0f);
@@ -2187,8 +2613,8 @@ void drawLayerPanel(App& app) {
                     layer.opacity = opacity;    // live while dragging...
                     // Opacity is baked into the composited tiles now, so the
                     // drag is only visible if they are rebuilt.
-                    app.canvas->markAllDirty();
-                    app.doc.dirty = true;
+                    app.cur().canvas->markAllDirty();
+                    app.cur().doc.dirty = true;
                 }
                 // ...and one undo step when the drag ends, not one per frame.
                 if (ImGui::IsItemDeactivatedAfterEdit()) {
@@ -2262,7 +2688,7 @@ void drawLayerPanel(App& app) {
                     // than a document property, and shown here because the mask
                     // is the thing it is about — an artist who cannot see which
                     // one they are painting paints the wrong one.
-                    ImGui::Checkbox("Paint on mask", &app.paintOnMask);
+                    ImGui::Checkbox("Paint on mask", &app.cur().paintOnMask);
                     ImGui::SameLine();
                     if (ImGui::SmallButton("Delete mask")) {
                         deleteMaskFor = layer.id;
@@ -2274,7 +2700,7 @@ void drawLayerPanel(App& app) {
                 // change, which is what makes it safe to offer.
                 if (layer.kind == sbl::LayerKind::Text &&
                     ImGui::SmallButton("Rasterise text")) {
-                    app.text.finish(app.window, app.doc);
+                    app.cur().text.finish(app.window, app.cur().doc);
                     edited = sbl::propsOf(layer);
                     edited.text.reset();
                     propsFor = layer.id;
@@ -2284,7 +2710,7 @@ void drawLayerPanel(App& app) {
                 // back. #17's last acceptance criterion.
                 if (layer.kind == sbl::LayerKind::Linework &&
                     ImGui::SmallButton("Rasterise linework")) {
-                    app.linework.release(app.doc);
+                    app.cur().linework.release(app.cur().doc);
                     edited = sbl::propsOf(layer);
                     edited.linework.reset();
                     propsFor = layer.id;
@@ -2298,19 +2724,19 @@ void drawLayerPanel(App& app) {
         // Applied after the loop: setLayerProps can reorder nothing, but it
         // does write through a Layer& that the loop is iterating over.
         if (propsFor != sbl::NO_LAYER) {
-            sbl::UndoRecord rec = sbl::setLayerProps(app.doc, propsFor, edited);
+            sbl::UndoRecord rec = sbl::setLayerProps(app.cur().doc, propsFor, edited);
             if (!rec.empty()) {
-                app.canvas->releaseAll();
-                app.doc.undo.push(std::move(rec));
-                app.doc.dirty = true;
+                app.cur().canvas->releaseAll();
+                app.cur().doc.undo.push(std::move(rec));
+                app.cur().doc.dirty = true;
             }
         }
         if (deleteMaskFor != sbl::NO_LAYER) {
-            sbl::UndoRecord rec = sbl::deleteLayerMask(app.doc, deleteMaskFor);
+            sbl::UndoRecord rec = sbl::deleteLayerMask(app.cur().doc, deleteMaskFor);
             if (!rec.empty()) {
-                app.canvas->releaseAll();
-                app.doc.undo.push(std::move(rec));
-                app.doc.dirty = true;
+                app.cur().canvas->releaseAll();
+                app.cur().doc.undo.push(std::move(rec));
+                app.cur().doc.dirty = true;
             }
         }
     }
@@ -2528,22 +2954,22 @@ void drawStatusBar(const App& app, float windowW, float windowH, float height) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     if (ImGui::Begin("##status", nullptr, kStatusFlags)) {
         ImGui::Text("%d%%   %ld deg   %d x %d%s",
-                    static_cast<int>(std::lround(app.view.zoom * 100.0f)),
-                    std::lround(rotationDegrees(app.view)),
-                    app.doc.width, app.doc.height, app.doc.dirty ? "   *" : "");
+                    static_cast<int>(std::lround(app.cur().view.zoom * 100.0f)),
+                    std::lround(rotationDegrees(app.cur().view)),
+                    app.cur().doc.width, app.cur().doc.height, app.cur().doc.dirty ? "   *" : "");
         ImGui::SameLine();
         ImGui::SameLine();
         ImGui::TextDisabled("   %s %.1f px   %s   %s",
                             toolName(app),
                             static_cast<double>(activeBrush(const_cast<App&>(app)).size),
                             app.penSeen ? "pen" : "mouse",
-                            app.doc.path.empty()
+                            app.cur().doc.path.empty()
                                 ? "(unsaved)"
-                                : app.doc.path.filename().string().c_str());
-        if (app.doc.selection.has_value() && !app.doc.selection->empty()) {
+                                : app.cur().doc.path.filename().string().c_str());
+        if (app.cur().doc.selection.has_value() && !app.cur().doc.selection->empty()) {
             ImGui::SameLine();
             ImGui::TextDisabled("   sel %d x %d",
-                                app.doc.selection->w, app.doc.selection->h);
+                                app.cur().doc.selection->w, app.cur().doc.selection->h);
         }
         // #15: which backend is actually painting, always. The View menu says
         // what was ASKED for; only this says what happened, which is the
@@ -2554,9 +2980,9 @@ void drawStatusBar(const App& app, float windowW, float windowH, float height) {
         // "8-bit" on the bar is noise on every document that never chose. When
         // it IS 16-bit it explains the halved history the undo numbers beside
         // it are about to report.
-        if (app.doc.depth != sbl::ColourDepth::Bits8) {
+        if (app.cur().doc.depth != sbl::ColourDepth::Bits8) {
             ImGui::SameLine();
-            const std::string_view name = sbl::depthName(app.doc.depth);
+            const std::string_view name = sbl::depthName(app.cur().doc.depth);
             ImGui::TextDisabled("   %.*s", static_cast<int>(name.size()), name.data());
         }
         // Two memory numbers, because there are two memories. The undo budget
@@ -2571,11 +2997,11 @@ void drawStatusBar(const App& app, float windowW, float windowH, float height) {
         }
         // D-102 asks for a VISIBLE policy, not just a cap. Say it plainly, and
         // only once there is something to say.
-        if (app.doc.undo.droppedRecords() > 0) {
+        if (app.cur().doc.undo.droppedRecords() > 0) {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.35f, 1.0f),
                                "   %zu older undo step(s) dropped (%d MB limit)",
-                               app.doc.undo.droppedRecords(), app.undoBudgetMb);
+                               app.cur().doc.undo.droppedRecords(), app.undoBudgetMb);
         }
         // #40 and #15. Non-modal on purpose: an import that dropped a filter
         // layer must not stand between the artist and their drawing, but it
@@ -2628,8 +3054,10 @@ void drawModals(App& app) {
                 doOpenDocument(app, entry.recoveryFile);
                 // Opened from recovery, so it is NOT the artist's file — clear
                 // the path so Ctrl+S cannot quietly overwrite the original.
-                app.doc.path.clear();
-                app.doc.dirty = true;
+                // Each recovery lands in a tab of its own, so a session that
+                // died with three documents open comes back with three.
+                app.cur().doc.path.clear();
+                app.cur().doc.dirty = true;
                 ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine();
@@ -2687,8 +3115,8 @@ void drawModals(App& app) {
 
         ImGui::Separator();
         if (ImGui::Button("Create", ImVec2(110, 0))) {
-            resetDocument(app, app.form.width, app.form.height, app.form.transparent,
-                          depth);
+            newDocument(app, app.form.width, app.form.height, app.form.transparent,
+                        depth);
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
@@ -2699,26 +3127,32 @@ void drawModals(App& app) {
 
     if (ImGui::BeginPopupModal("Unsaved changes", nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextUnformatted("This canvas has unsaved strokes.");
+        // Which document, by name: with several open, "this canvas" is not an
+        // answer the artist can act on.
+        if (app.pending == Pending::CloseTab &&
+            app.pendingClose < app.docs.size()) {
+            ImGui::Text("%s has unsaved strokes.",
+                        app.docs[app.pendingClose]->title().c_str());
+        } else {
+            const std::size_t dirty = dirtyCount(app);
+            ImGui::Text("%zu open canvas%s unsaved strokes.", dirty,
+                        dirty == 1 ? " has" : "es have");
+        }
         ImGui::Separator();
         if (ImGui::Button("Discard", ImVec2(110, 0))) {
-            const Pending what = app.pending;
+            const Pending what  = app.pending;
+            const std::size_t which = app.pendingClose;
             app.pending = Pending::None;
-            // The flag is NOT cleared here. Whatever replaces the document
-            // brings its own (both makeDocument and loadProject start clean),
-            // so clearing it early only mattered when the follow-up never
-            // happened — a cancelled dialog or a path that would not load
-            // would leave real unsaved strokes marked as saved.
             ImGui::CloseCurrentPopup();
-            if (what == Pending::NewCanvas) app.openNew = true;
-            else if (what == Pending::Open) openPending(app);
-            else if (what == Pending::Import) askForImportPath(app);
+            // Only the tab being closed loses anything. The others stay open,
+            // dirty flags and all — which is the whole difference between a
+            // close and a quit.
+            if (what == Pending::CloseTab) closeDocument(app, which);
             else if (what == Pending::Quit) app.running = false;
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel", ImVec2(110, 0))) {
             app.pending = Pending::None;
-            app.pendingOpenPath.clear();   // the drop was refused, not deferred
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
@@ -2767,8 +3201,8 @@ void drawModals(App& app) {
 /// knowing it did.
 void rebuildAnts(App& app) {
     static const sbl::Selection kNothing;
-    const bool live = app.doc.selection.has_value() && !app.doc.selection->empty();
-    const sbl::Selection& s = live ? *app.doc.selection : kNothing;
+    const bool live = app.cur().doc.selection.has_value() && !app.cur().doc.selection->empty();
+    const sbl::Selection& s = live ? *app.cur().doc.selection : kNothing;
     if (app.ants.from == s) return;
 
     app.ants.from = s;
@@ -2792,15 +3226,15 @@ void rebuildAnts(App& app) {
 
 void drawSelectionOutline(App& app) {
     rebuildAnts(app);
-    if (!app.doc.selection.has_value() || app.doc.selection->empty()) return;
-    const sbl::Selection& s = *app.doc.selection;
+    if (!app.cur().doc.selection.has_value() || app.cur().doc.selection->empty()) return;
+    const sbl::Selection& s = *app.cur().doc.selection;
 
     // Everything goes through the view transform, never screen-space
     // arithmetic: the selection is axis-aligned on the CANVAS, so it leans when
     // the canvas is turned and an upright box would sit over the wrong pixels.
     const auto at = [&](double cx, double cy) {
-        return ImVec2(static_cast<float>(toScreenX(app.view, cx, cy)),
-                      static_cast<float>(toScreenY(app.view, cx, cy)));
+        return ImVec2(static_cast<float>(toScreenX(app.cur().view, cx, cy)),
+                      static_cast<float>(toScreenY(app.cur().view, cx, cy)));
     };
     ImDrawList* draw = ImGui::GetForegroundDrawList();
 
@@ -2829,10 +3263,10 @@ void drawLassoInProgress(const App& app) {
     for (std::size_t i = 0; i < app.lassoPath.size(); ++i) {
         const sbl::Point& a = app.lassoPath[i];
         const sbl::Point& b = app.lassoPath[(i + 1) % app.lassoPath.size()];
-        const ImVec2 pa(static_cast<float>(toScreenX(app.view, a.x, a.y)),
-                        static_cast<float>(toScreenY(app.view, a.x, a.y)));
-        const ImVec2 pb(static_cast<float>(toScreenX(app.view, b.x, b.y)),
-                        static_cast<float>(toScreenY(app.view, b.x, b.y)));
+        const ImVec2 pa(static_cast<float>(toScreenX(app.cur().view, a.x, a.y)),
+                        static_cast<float>(toScreenY(app.cur().view, a.x, a.y)));
+        const ImVec2 pb(static_cast<float>(toScreenX(app.cur().view, b.x, b.y)),
+                        static_cast<float>(toScreenY(app.cur().view, b.x, b.y)));
         draw->AddLine(pa, pb, IM_COL32(0, 0, 0, 200), 3.0f);
         draw->AddLine(pa, pb, IM_COL32(255, 255, 255, 230), 1.0f);
     }
@@ -2846,12 +3280,12 @@ void drawLassoInProgress(const App& app) {
 /// one compositor (#1).
 void drawLineworkHandles(const App& app) {
     if (app.tool != Tool::Linework) return;
-    const sbl::LineworkContent* content = LineworkTool::contentOf(app.doc);
+    const sbl::LineworkContent* content = LineworkTool::contentOf(app.cur().doc);
     if (content == nullptr) return;
 
     ImDrawList* draw = ImGui::GetForegroundDrawList();
-    const std::optional<sbl::PointRef> held = app.linework.held();
-    const std::vector<std::size_t>& selected = app.linework.selection();
+    const std::optional<sbl::PointRef> held = app.cur().linework.held();
+    const std::vector<std::size_t>& selected = app.cur().linework.selection();
     const float r = 4.0f * app.uiScale;
 
     for (std::size_t s = 0; s < content->strokes.size(); ++s) {
@@ -2861,8 +3295,8 @@ void drawLineworkHandles(const App& app) {
             std::find(selected.begin(), selected.end(), s) != selected.end();
         for (std::size_t i = 0; i < content->strokes[s].points.size(); ++i) {
             const sbl::LinePoint& p = content->strokes[s].points[i];
-            const ImVec2 at(static_cast<float>(toScreenX(app.view, p.x, p.y)),
-                            static_cast<float>(toScreenY(app.view, p.x, p.y)));
+            const ImVec2 at(static_cast<float>(toScreenX(app.cur().view, p.x, p.y)),
+                            static_cast<float>(toScreenY(app.cur().view, p.x, p.y)));
             const bool grabbed = held.has_value() && held->stroke == s && held->point == i;
             // Two-tone like every other overlay, so a handle stays visible on
             // both the white of a fresh canvas and the black of the line.
@@ -2884,8 +3318,8 @@ void drawLineworkHandles(const App& app) {
 void drawRulerGuides(const App& app) {
     ImDrawList* draw = ImGui::GetForegroundDrawList();
     const auto at = [&](double cx, double cy) {
-        return ImVec2(static_cast<float>(toScreenX(app.view, cx, cy)),
-                      static_cast<float>(toScreenY(app.view, cx, cy)));
+        return ImVec2(static_cast<float>(toScreenX(app.cur().view, cx, cy)),
+                      static_cast<float>(toScreenY(app.cur().view, cx, cy)));
     };
     // Two-tone like the selection outline, so a guide stays readable over both
     // dark and light art.
@@ -2899,8 +3333,8 @@ void drawRulerGuides(const App& app) {
         draw->AddCircle(p, r, tint, 0, 1.5f);
     };
 
-    const auto w = static_cast<double>(app.doc.width);
-    const auto h = static_cast<double>(app.doc.height);
+    const auto w = static_cast<double>(app.cur().doc.width);
+    const auto h = static_cast<double>(app.cur().doc.height);
 
     if (app.symmetry.enabled) {
         constexpr ImU32 tint = IM_COL32(120, 220, 255, 200);
@@ -2921,8 +3355,8 @@ void drawRulerGuides(const App& app) {
     }
 
     if (!app.perspective.enabled) return;
-    for (std::size_t i = 0; i < app.doc.vanishingPoints.size(); ++i) {
-        const sbl::VanishingPoint& vp = app.doc.vanishingPoints[i];
+    for (std::size_t i = 0; i < app.cur().doc.vanishingPoints.size(); ++i) {
+        const sbl::VanishingPoint& vp = app.cur().doc.vanishingPoints[i];
         // The guide the live stroke locked onto is lit, so "which point am I
         // drawing to" is answered on the canvas rather than guessed at.
         const bool live = app.painting &&
@@ -2960,7 +3394,7 @@ void drawBrushCursor(const App& app) {
     // one shape rotation leaves alone. It follows the view because the pointer
     // does.
     const float radius =
-        activeBrush(const_cast<App&>(app)).size * 0.5f * app.view.zoom;
+        activeBrush(const_cast<App&>(app)).size * 0.5f * app.cur().view.zoom;
     if (radius < 1.0f) return;
 
     ImDrawList* draw = ImGui::GetForegroundDrawList();
@@ -3021,6 +3455,8 @@ void renderFrame(App& app, bool present = true) {
                  ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoBackground);
     ImGui::PopStyleVar(3);
 
+    drawTabStrip(app);
+
     const ImGuiID dockspace = ImGui::GetID("sable.dockspace");
     if (app.resetLayout || ImGui::DockBuilderGetNode(dockspace) == nullptr) {
         buildDefaultLayout(dockspace);
@@ -3066,9 +3502,9 @@ void renderFrame(App& app, bool present = true) {
     drawBrushCursor(app);
     // Recolouring text is the colour panel, not a control of its own: while a
     // session is live the text simply IS the foreground colour.
-    app.text.setColour(app.doc, app.foreground);
-    syncTextures(app, app.text.takeChanged());
-    app.text.frame(app.window, app.view, app.uiScale);   // draws the caret
+    app.cur().text.setColour(app.cur().doc, app.foreground);
+    syncTextures(app, app.cur().text.takeChanged());
+    app.cur().text.frame(app.window, app.cur().view, app.uiScale);   // draws the caret
     overlay->PopClipRect();
 
     ImGui::Render();
@@ -3076,7 +3512,7 @@ void renderFrame(App& app, bool present = true) {
     if (app.lightTheme) SDL_SetRenderDrawColor(app.renderer, 205, 205, 210, 255);
     else                SDL_SetRenderDrawColor(app.renderer, 48, 48, 52, 255);
     SDL_RenderClear(app.renderer);
-    app.canvas->render(app.doc, app.view, app.viewport);
+    app.cur().canvas->render(app.cur().doc, app.cur().view, app.viewport);
     ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), app.renderer);
     if (present) SDL_RenderPresent(app.renderer);
 
@@ -3133,8 +3569,12 @@ int main(int argc, char** argv) {
     App app;
     app.window   = window;
     app.renderer = renderer;
-    CanvasView canvas(renderer);
-    app.canvas = &canvas;
+
+    // The one document Sable starts on. Every other tab arrives through
+    // adoptDocument, which is also what may reuse this one while it is still
+    // pristine — so opening a file from the command line below does not leave
+    // an empty canvas sitting beside it.
+    app.docs.push_back(makeTab(app));
 
     // The engine cannot ask the platform where user data lives (D-003), so
     // tell it. Without this, recovery lands in a temporary directory on
@@ -3161,10 +3601,10 @@ int main(int argc, char** argv) {
     app.viewport = SDL_FRect{leftPanel(app), 24.0f,
                              static_cast<float>(outW) - leftPanel(app) - rightPanel(app),
                              static_cast<float>(outH) - 48.0f};
-    app.doc = sbl::makeDocument(kDefaultCanvas, kDefaultCanvas,
-                                sbl::StraightRgba8{255, 255, 255, 255});
+    app.cur().doc = sbl::makeDocument(kDefaultCanvas, kDefaultCanvas,
+                                      sbl::StraightRgba8{255, 255, 255, 255});
     applyUndoBudget(app);
-    zoomToActualSize(app.view, app.doc, app.viewport);
+    zoomToActualSize(app.cur().view, app.cur().doc, app.viewport);
     // After the document exists: switching backends reads the tiles back.
     applyGpuMode(app);
 
@@ -3191,8 +3631,8 @@ int main(int argc, char** argv) {
             const double cx = 100.0 + t * 400.0;
             const double cy = 100.0 + t * 250.0;
             sbl::InputSample sample =
-                mouseSample(app, toScreenX(app.view, cx, cy),
-                                 toScreenY(app.view, cx, cy));
+                mouseSample(app, toScreenX(app.cur().view, cx, cy),
+                                 toScreenY(app.cur().view, cx, cy));
             sample.fromMouse = false;
             sample.pressure = static_cast<float>(1.0 - std::abs(0.5 - t) * 2.0);
             paintWith(app, sample);
@@ -3201,20 +3641,20 @@ int main(int argc, char** argv) {
 
         // Exercise the Milestone 3 paths too: a second layer with a blend
         // mode, a bucket fill, a selection, and a project save/load round trip.
-        pushLayerAction(app, sbl::addLayerAbove(app.doc, app.doc.activeLayer, "Shading"));
-        app.doc.layerById(app.doc.activeLayer)->blend = sbl::BlendMode::Multiply;
+        pushLayerAction(app, sbl::addLayerAbove(app.cur().doc, app.cur().doc.activeLayer, "Shading"));
+        app.cur().doc.layerById(app.cur().doc.activeLayer)->blend = sbl::BlendMode::Multiply;
         app.foreground = sbl::StraightRgba8{60, 120, 220, 255};
-        app.doc.selection = sbl::Selection{200, 200, 300, 300};
-        doFill(app, toScreenX(app.view, 300.0, 300.0),
-                    toScreenY(app.view, 300.0, 300.0));
-        app.doc.selection.reset();
+        app.cur().doc.selection = sbl::Selection{200, 200, 300, 300};
+        doFill(app, toScreenX(app.cur().view, 300.0, 300.0),
+                    toScreenY(app.cur().view, 300.0, 300.0));
+        app.cur().doc.selection.reset();
 
         // Rulers, driven through the same path a real stroke takes. Two things
         // a unit test cannot see: the mirror appears while the stroke is being
         // drawn rather than at pen-up, and however many dabs symmetry
         // multiplied it into, it is still ONE undo step.
         {
-            const std::size_t undoBefore = app.doc.undo.size();
+            const std::size_t undoBefore = app.cur().doc.undo.size();
             app.foreground = sbl::StraightRgba8{20, 20, 20, 255};
             // The probe below compares a pixel against its mirror byte for
             // byte, and paper grain is nailed to the CANVAS rather than to the
@@ -3235,15 +3675,15 @@ int main(int argc, char** argv) {
                 // band of the canvas is the stroke under test.
                 const double cx = 120.0 + i * 9.0;
                 const double cy = 700.0 + (i % 2 == 0 ? 6.0 : -6.0);
-                paintWith(app, mouseSample(app, toScreenX(app.view, cx, cy),
-                                                toScreenY(app.view, cx, cy)));
+                paintWith(app, mouseSample(app, toScreenX(app.cur().view, cx, cy),
+                                                toScreenY(app.cur().view, cx, cy)));
             }
             // Counted BEFORE endPaint: "live, not on stroke end" is the whole
             // acceptance criterion, and only this ordering tests it.
             // Dark, not merely opaque: the background is opaque white, so an
             // alpha test here would pass without a single dab being painted.
             const auto painted = [&](int x, int y) {
-                return sbl::pickColour(app.doc, x, y).r < 128;
+                return sbl::pickColour(app.cur().doc, x, y).r < 128;
             };
             int mirroredDuringStroke = 0;
             for (int x = 520; x < 900; x += 7)
@@ -3256,9 +3696,9 @@ int main(int argc, char** argv) {
                         "while the stroke was live");
                 return 1;
             }
-            if (app.doc.undo.size() != undoBefore + 1) {
+            if (app.cur().doc.undo.size() != undoBefore + 1) {
                 SDL_Log("selftest FAILED: a mirrored stroke pushed %zu undo steps",
-                        app.doc.undo.size() - undoBefore);
+                        app.cur().doc.undo.size() - undoBefore);
                 return 1;
             }
 
@@ -3266,8 +3706,8 @@ int main(int argc, char** argv) {
             int probes = 0;
             for (int x = 120; x < 500; x += 7) {
                 for (int y = 505; y < 780; y += 7) {
-                    const sbl::StraightRgba8 a = sbl::pickColour(app.doc, x, y);
-                    const sbl::StraightRgba8 b = sbl::pickColour(app.doc, 1023 - x, y);
+                    const sbl::StraightRgba8 a = sbl::pickColour(app.cur().doc, x, y);
+                    const sbl::StraightRgba8 b = sbl::pickColour(app.cur().doc, 1023 - x, y);
                     if (a.a != b.a || a.r != b.r) {
                         SDL_Log("selftest FAILED: %d,%d is not the mirror of %d,%d",
                                 x, y, 1023 - x, y);
@@ -3287,7 +3727,7 @@ int main(int argc, char** argv) {
             // the guides they placed.
             app.symmetry.enabled    = false;
             app.perspective.enabled = false;
-            if (app.doc.vanishingPoints.size() != 2 ||
+            if (app.cur().doc.vanishingPoints.size() != 2 ||
                 app.symmetry.centreX != 512.0) {
                 SDL_Log("selftest FAILED: switching a ruler off moved its guides");
                 return 1;
@@ -3304,21 +3744,21 @@ int main(int argc, char** argv) {
                 {700.0, 150.0}, {950.0, 150.0}, {825.0, 380.0}};
             app.selectBase.reset();
             app.dragMode = sbl::SelectMode::Replace;
-            commitSelection(app, sbl::lassoSelection(triangle, app.doc.width,
-                                                     app.doc.height));
-            if (!app.doc.selection.has_value() || app.doc.selection->mask.empty()) {
+            commitSelection(app, sbl::lassoSelection(triangle, app.cur().doc.width,
+                                                     app.cur().doc.height));
+            if (!app.cur().doc.selection.has_value() || app.cur().doc.selection->mask.empty()) {
                 SDL_Log("selftest FAILED: the lasso produced no mask");
                 return 1;
             }
 
             app.foreground = sbl::StraightRgba8{220, 40, 40, 255};
             sbl::UndoRecord rec =
-                sbl::fillSelection(app.doc, app.doc.activeLayer, app.foreground);
-            app.canvas->releaseAll();
-            app.doc.undo.push(std::move(rec));
+                sbl::fillSelection(app.cur().doc, app.cur().doc.activeLayer, app.foreground);
+            app.cur().canvas->releaseAll();
+            app.cur().doc.undo.push(std::move(rec));
 
             const auto red = [&](int x, int y) {
-                const sbl::StraightRgba8 c = sbl::pickColour(app.doc, x, y);
+                const sbl::StraightRgba8 c = sbl::pickColour(app.cur().doc, x, y);
                 return c.r > 150 && c.g < 110;
             };
             // Inside the loop, and a corner of its bounding box that the loop
@@ -3328,8 +3768,8 @@ int main(int argc, char** argv) {
                 return 1;
             }
 
-            const sbl::Selection wand = sbl::magicWandSelection(app.doc, 825, 200, 8);
-            const sbl::Selection& lasso = *app.doc.selection;
+            const sbl::Selection wand = sbl::magicWandSelection(app.cur().doc, 825, 200, 8);
+            const sbl::Selection& lasso = *app.cur().doc.selection;
             if (wand.empty() || std::abs(wand.x - lasso.x) > 4 ||
                 std::abs(wand.w - lasso.w) > 8) {
                 SDL_Log("selftest FAILED: the wand found %d,%d %dx%d where the lasso "
@@ -3347,8 +3787,8 @@ int main(int argc, char** argv) {
             }
             SDL_Log("selftest: lasso clips a fill, wand agrees with it, subtract works");
 
-            app.doc.undo.undo(app.doc);       // put the canvas back
-            app.canvas->releaseAll();
+            app.cur().doc.undo.undo(app.cur().doc);       // put the canvas back
+            app.cur().canvas->releaseAll();
             app.foreground = sbl::StraightRgba8{0, 0, 0, 255};
         }
 
@@ -3358,26 +3798,26 @@ int main(int argc, char** argv) {
         // artist is pointing at. Left turned on, so the frames below also
         // exercise the rotated blit and the turned outline.
         {
-            const bool dirtyBefore = app.doc.dirty;
-            const std::size_t undoBefore    = app.doc.undo.size();
-            const std::size_t uploadsBefore = app.canvas->uploadCount();
+            const bool dirtyBefore = app.cur().doc.dirty;
+            const std::size_t undoBefore    = app.cur().doc.undo.size();
+            const std::size_t uploadsBefore = app.cur().canvas->uploadCount();
             rotateView(app, kRotateStep * 2.0);
-            if (app.doc.dirty != dirtyBefore ||
-                app.doc.undo.size() != undoBefore ||
-                app.canvas->uploadCount() != uploadsBefore) {
+            if (app.cur().doc.dirty != dirtyBefore ||
+                app.cur().doc.undo.size() != undoBefore ||
+                app.cur().canvas->uploadCount() != uploadsBefore) {
                 SDL_Log("selftest FAILED: rotating the view altered the document");
                 return 1;
             }
             const sbl::InputSample probe =
-                mouseSample(app, toScreenX(app.view, 400.0, 250.0),
-                                 toScreenY(app.view, 400.0, 250.0));
+                mouseSample(app, toScreenX(app.cur().view, 400.0, 250.0),
+                                 toScreenY(app.cur().view, 400.0, 250.0));
             if (std::abs(probe.x - 400.0) > 1e-6 || std::abs(probe.y - 250.0) > 1e-6) {
                 SDL_Log("selftest FAILED: rotated screen->canvas lands at %.6f, %.6f",
                         probe.x, probe.y);
                 return 1;
             }
             SDL_Log("selftest: rotation at %ld deg alters no pixels",
-                    std::lround(rotationDegrees(app.view)));
+                    std::lround(rotationDegrees(app.cur().view)));
         }
 
         for (int frame = 0; frame < 3; ++frame) renderFrame(app);
@@ -3391,13 +3831,13 @@ int main(int argc, char** argv) {
         {
             SDL_SetRenderDrawColor(app.renderer, 0, 0, 0, 255);
             SDL_RenderClear(app.renderer);
-            app.canvas->render(app.doc, app.view, app.viewport);
+            app.cur().canvas->render(app.cur().doc, app.cur().view, app.viewport);
 
             constexpr int probe = 350;
             const double centreX = probe + 0.5, centreY = probe + 0.5;
             const SDL_Rect one{
-                static_cast<int>(std::lround(toScreenX(app.view, centreX, centreY))),
-                static_cast<int>(std::lround(toScreenY(app.view, centreX, centreY))),
+                static_cast<int>(std::lround(toScreenX(app.cur().view, centreX, centreY))),
+                static_cast<int>(std::lround(toScreenY(app.cur().view, centreX, centreY))),
                 1, 1};
             SDL_Surface* shot = SDL_RenderReadPixels(app.renderer, &one);
             Uint8 r = 0, g = 0, b = 0, a = 0;
@@ -3405,7 +3845,7 @@ int main(int argc, char** argv) {
             // is not a failure — but a mismatch is.
             if (shot != nullptr && SDL_ReadSurfacePixel(shot, 0, 0, &r, &g, &b, &a)) {
                 const std::vector<sbl::PremulRgba8> want =
-                    sbl::compositeRect(app.doc, probe, probe, 1, 1);
+                    sbl::compositeRect(app.cur().doc, probe, probe, 1, 1);
                 const int dr = std::abs(int{r} - int{want[0].r});
                 const int dg = std::abs(int{g} - int{want[0].g});
                 const int db = std::abs(int{b} - int{want[0].b});
@@ -3453,8 +3893,8 @@ int main(int argc, char** argv) {
             // panel itself differs.
             for (int warm = 0; warm < 3; ++warm) renderFrame(app);
             SDL_Surface* shotA = shoot(80.0, 80.0);
-            SDL_Surface* shotB  = shoot(static_cast<double>(app.doc.width) - 80.0,
-                                      static_cast<double>(app.doc.height) - 80.0);
+            SDL_Surface* shotB  = shoot(static_cast<double>(app.cur().doc.width) - 80.0,
+                                      static_cast<double>(app.cur().doc.height) - 80.0);
             if (shotA != nullptr && shotB != nullptr &&
                 shotA->w == shotB->w && shotA->h == shotB->h) {
                 const ImVec2 display = ImGui::GetIO().DisplaySize;
@@ -3523,7 +3963,7 @@ int main(int argc, char** argv) {
         // The lasso selection left in place above, back off disk with its
         // coverage mask intact (#18).
         if (!reloaded->selection.has_value() || reloaded->selection->mask.empty() ||
-            reloaded->selection->mask != app.doc.selection->mask) {
+            reloaded->selection->mask != app.cur().doc.selection->mask) {
             SDL_Log("selftest FAILED: the selection mask did not survive the file");
             return 1;
         }
@@ -3533,27 +3973,18 @@ int main(int argc, char** argv) {
 
         // The argument and drag-and-drop entry points, which have no unit test
         // because they live above the engine boundary. A path that cannot be
-        // loaded must leave the document exactly as it was, and a drop onto a
-        // dirty canvas must prompt rather than discard the artist's strokes.
+        // loaded must leave the document exactly as it was — and since #50 it
+        // must not open an empty tab for the file it could not read either.
+        const std::size_t tabsBefore = app.docs.size();
         doOpenDocument(app, std::filesystem::path("/sable-selftest/no-such.sable"));
-        if (!app.openError || app.doc.layers.size() != 2) {
+        if (!app.openError || app.cur().doc.layers.size() != 2 ||
+            app.docs.size() != tabsBefore) {
             SDL_Log("selftest FAILED: a bad path did not fall back to the error modal");
             return 1;
         }
         app.openError = false;
         app.errorMessage.clear();
-
-        app.doc.dirty = true;
-        requestPending(app, Pending::Open, "/sable-selftest/dropped.sable");
-        if (!app.openDiscard || app.pendingOpenPath.empty()) {
-            SDL_Log("selftest FAILED: a drop over unsaved work did not prompt");
-            return 1;
-        }
-        app.openDiscard = false;
-        app.pending     = Pending::None;
-        app.pendingOpenPath.clear();
-        app.doc.dirty   = false;
-        SDL_Log("selftest: bad path recovers, drop over unsaved work prompts");
+        SDL_Log("selftest: a bad path recovers and opens no tab");
 
         // The text tool, driven through the events a keyboard and an input
         // method actually produce. Three things no engine test can see: that
@@ -3566,13 +3997,13 @@ int main(int argc, char** argv) {
         // not tried with a real IME.
         bool textTested = false;
         if (!sbl::systemFonts().empty()) {
-            const std::size_t layersBefore = app.doc.layers.size();
-            const std::size_t undoBefore   = app.doc.undo.size();
+            const std::size_t layersBefore = app.cur().doc.layers.size();
+            const std::size_t undoBefore   = app.cur().doc.undo.size();
 
             app.foreground = sbl::StraightRgba8{20, 20, 20, 255};
             app.tool = Tool::Text;
-            placeText(app, toScreenX(app.view, 60.0, 900.0),
-                           toScreenY(app.view, 60.0, 900.0));
+            placeText(app, toScreenX(app.cur().view, 60.0, 900.0),
+                           toScreenY(app.cur().view, 60.0, 900.0));
 
             // A font that actually carries the characters below, where there is
             // one. Without this the kanji come out as the empty box every
@@ -3581,7 +4012,7 @@ int main(int argc, char** argv) {
             for (const sbl::FontEntry& entry : sbl::systemFonts()) {
                 auto face = sbl::FontFace::load(entry.path);
                 if (!face.has_value() || !face->hasGlyph(0x6F22)) continue;
-                cjkFont = app.text.useFont(app.doc, entry.path);
+                cjkFont = app.cur().text.useFont(app.cur().doc, entry.path);
                 if (cjkFont) SDL_Log("selftest: typing 漢字 in %s", entry.name.c_str());
                 break;
             }
@@ -3601,7 +4032,7 @@ int main(int argc, char** argv) {
                 int n = 0;
                 for (int x = 40; x < 900; x += 3)
                     for (int y = 830; y < 940; y += 3)
-                        if (sbl::pickColour(app.doc, x, y).r < 128) ++n;
+                        if (sbl::pickColour(app.cur().doc, x, y).r < 128) ++n;
                 return n;
             };
             if (darkPixels() != 0) {
@@ -3617,7 +4048,7 @@ int main(int argc, char** argv) {
             editing.edit.text   = "\xE3\x81\x8B\xE3\x82\x93";   // かん, mid-composition
             editing.edit.start  = 2;
             editing.edit.length = 0;
-            app.text.handleEvent(editing, app.doc, app.window);
+            app.cur().text.handleEvent(editing, app.cur().doc, app.window);
             const int duringComposition = darkPixels();
             if (duringComposition == 0) {
                 SDL_Log("selftest FAILED: a composition in progress drew nothing");
@@ -3625,7 +4056,7 @@ int main(int argc, char** argv) {
             }
             // Composition is NOT the document. It is on the canvas so the
             // artist can see it, and it must not be in the file.
-            const sbl::Layer* textLayer = app.doc.active();
+            const sbl::Layer* textLayer = app.cur().doc.active();
             if (textLayer == nullptr || !textLayer->text.has_value() ||
                 !textLayer->text->utf8.empty()) {
                 SDL_Log("selftest FAILED: an unfinished composition reached the document");
@@ -3637,21 +4068,21 @@ int main(int argc, char** argv) {
             SDL_Event input{};
             input.type      = SDL_EVENT_TEXT_INPUT;
             input.text.text = "\xE6\xBC\xA2\xE5\xAD\x97";       // 漢字
-            app.text.handleEvent(input, app.doc, app.window);
+            app.cur().text.handleEvent(input, app.cur().doc, app.window);
 
             SDL_Event key{};
             key.type = SDL_EVENT_KEY_DOWN;
             key.key.key  = SDLK_B;      // a bare letter types, it does not
             key.key.down = true;        // switch to the brush
-            app.text.handleEvent(key, app.doc, app.window);
+            app.cur().text.handleEvent(key, app.cur().doc, app.window);
             if (app.tool != Tool::Text) {
                 SDL_Log("selftest FAILED: typing a letter changed the tool");
                 return 1;
             }
             input.text.text = "b";
-            app.text.handleEvent(input, app.doc, app.window);
+            app.cur().text.handleEvent(input, app.cur().doc, app.window);
 
-            const sbl::Layer* typed = app.doc.active();
+            const sbl::Layer* typed = app.cur().doc.active();
             if (typed == nullptr || typed->kind != sbl::LayerKind::Text ||
                 !typed->text.has_value() ||
                 typed->text->utf8 != "\xE6\xBC\xA2\xE5\xAD\x97" "b") {
@@ -3665,26 +4096,26 @@ int main(int argc, char** argv) {
             }
 
             key.key.key = SDLK_ESCAPE;
-            app.text.handleEvent(key, app.doc, app.window);
-            if (app.text.active()) {
+            app.cur().text.handleEvent(key, app.cur().doc, app.window);
+            if (app.cur().text.active()) {
                 SDL_Log("selftest FAILED: Escape did not finish the text");
                 return 1;
             }
 
             // One layer, and one step for the words and the glyphs together —
             // plus the step that created the layer.
-            if (app.doc.layers.size() != layersBefore + 1 ||
-                app.doc.undo.size() != undoBefore + 2) {
+            if (app.cur().doc.layers.size() != layersBefore + 1 ||
+                app.cur().doc.undo.size() != undoBefore + 2) {
                 SDL_Log("selftest FAILED: a text session left %zu layers and %zu steps",
-                        app.doc.layers.size() - layersBefore,
-                        app.doc.undo.size() - undoBefore);
+                        app.cur().doc.layers.size() - layersBefore,
+                        app.cur().doc.undo.size() - undoBefore);
                 return 1;
             }
 
             doUndo(app);
             // The words go back with the pixels: the layer is as blank as it
             // was the moment before the first character arrived.
-            const sbl::Layer* reverted = app.doc.active();
+            const sbl::Layer* reverted = app.cur().doc.active();
             if (darkPixels() != 0 || reverted == nullptr ||
                 (reverted->text.has_value() && !reverted->text->utf8.empty())) {
                 SDL_Log("selftest FAILED: undoing the text left %d pixels and \"%s\"",
@@ -3710,14 +4141,14 @@ int main(int argc, char** argv) {
         // synthetic pen events: where the pointer is belongs to SDL, but what a
         // press MEANS is the tool's, and that is the half worth checking.
         {
-            const std::size_t layersBefore = app.doc.layers.size();
-            const std::size_t undoBefore   = app.doc.undo.size();
+            const std::size_t layersBefore = app.cur().doc.layers.size();
+            const std::size_t undoBefore   = app.cur().doc.undo.size();
             // The linework layer's OWN pixels, not the composite: the canvas
             // already carries the strokes and the fill this self-test painted
             // earlier, and a probe that could be answered by those would prove
             // nothing about the line.
             const auto inkAt = [&](std::int32_t x, std::int32_t y) {
-                const sbl::Layer* on = app.doc.active();
+                const sbl::Layer* on = app.cur().doc.active();
                 if (on == nullptr) return false;
                 const sbl::TileKey key{sbl::tileIndex(x), sbl::tileIndex(y)};
                 const sbl::Tile* tile = on->find(key);
@@ -3728,37 +4159,37 @@ int main(int argc, char** argv) {
 
             app.tool = Tool::Linework;
             app.foreground = sbl::StraightRgba8{0, 0, 0, 255};
-            app.linework.width = 8.0f;
-            app.linework.colour = app.foreground;
-            app.linework.press(app.doc, 100.0, 500.0, 1.0f, LineworkAction::Draw, 9.0);
+            app.cur().linework.width = 8.0f;
+            app.cur().linework.colour = app.foreground;
+            app.cur().linework.press(app.cur().doc, 100.0, 500.0, 1.0f, LineworkAction::Draw, 9.0);
             for (double x = 120.0; x <= 400.0; x += 20.0)
-                app.linework.drag(app.doc, x, 500.0, 1.0f);
-            app.linework.release(app.doc);
-            syncTextures(app, app.linework.takeChanged());
+                app.cur().linework.drag(app.cur().doc, x, 500.0, 1.0f);
+            app.cur().linework.release(app.cur().doc);
+            syncTextures(app, app.cur().linework.takeChanged());
 
             if (!inkAt(300, 500)) {
                 SDL_Log("selftest FAILED: a linework stroke drew nothing");
                 return 1;
             }
             // One layer, and two steps: the layer, then the whole gesture.
-            if (app.doc.layers.size() != layersBefore + 1 ||
-                app.doc.undo.size() != undoBefore + 2) {
+            if (app.cur().doc.layers.size() != layersBefore + 1 ||
+                app.cur().doc.undo.size() != undoBefore + 2) {
                 SDL_Log("selftest FAILED: linework left %zu layers and %zu steps",
-                        app.doc.layers.size() - layersBefore,
-                        app.doc.undo.size() - undoBefore);
+                        app.cur().doc.layers.size() - layersBefore,
+                        app.cur().doc.undo.size() - undoBefore);
                 return 1;
             }
 
             // Re-shaping: grab the far end and drag it away. The line has to
             // follow, and leave where it was.
-            app.linework.press(app.doc, 400.0, 500.0, 1.0f, LineworkAction::Draw, 12.0);
-            if (!app.linework.busy()) {
+            app.cur().linework.press(app.cur().doc, 400.0, 500.0, 1.0f, LineworkAction::Draw, 12.0);
+            if (!app.cur().linework.busy()) {
                 SDL_Log("selftest FAILED: no control point where one was drawn");
                 return 1;
             }
-            app.linework.drag(app.doc, 400.0, 640.0, 1.0f);
-            app.linework.release(app.doc);
-            syncTextures(app, app.linework.takeChanged());
+            app.cur().linework.drag(app.cur().doc, 400.0, 640.0, 1.0f);
+            app.cur().linework.release(app.cur().doc);
+            syncTextures(app, app.cur().linework.takeChanged());
             if (!inkAt(398, 640) || inkAt(400, 500)) {
                 SDL_Log("selftest FAILED: the line did not follow its control point");
                 return 1;
@@ -3773,7 +4204,7 @@ int main(int argc, char** argv) {
             }
             doRedo(app);
 
-            const sbl::Layer* line = app.doc.active();
+            const sbl::Layer* line = app.cur().doc.active();
             if (line == nullptr || !line->linework.has_value() ||
                 line->linework->strokes.size() != 1) {
                 SDL_Log("selftest FAILED: the curves did not survive the gesture");
@@ -3786,24 +4217,24 @@ int main(int argc, char** argv) {
             // and moves as one. The engine's geometry is tested headlessly; what
             // only a running app can show is that the tool's selection survives
             // press, drag and release, and leaves one undo step behind.
-            app.linework.selectMode = true;
-            const std::size_t beforeMove = app.doc.undo.size();
-            app.linework.press(app.doc, 200.0, 500.0, 1.0f, LineworkAction::Select, 12.0);
-            if (app.linework.selection().size() != 1) {
+            app.cur().linework.selectMode = true;
+            const std::size_t beforeMove = app.cur().doc.undo.size();
+            app.cur().linework.press(app.cur().doc, 200.0, 500.0, 1.0f, LineworkAction::Select, 12.0);
+            if (app.cur().linework.selection().size() != 1) {
                 SDL_Log("selftest FAILED: clicking a line selected %zu strokes",
-                        app.linework.selection().size());
+                        app.cur().linework.selection().size());
                 return 1;
             }
-            app.linework.drag(app.doc, 200.0, 300.0, 1.0f);
-            app.linework.release(app.doc);
-            syncTextures(app, app.linework.takeChanged());
+            app.cur().linework.drag(app.cur().doc, 200.0, 300.0, 1.0f);
+            app.cur().linework.release(app.cur().doc);
+            syncTextures(app, app.cur().linework.takeChanged());
             if (!inkAt(300, 300) || inkAt(300, 500)) {
                 SDL_Log("selftest FAILED: the whole stroke did not move");
                 return 1;
             }
-            if (app.doc.undo.size() != beforeMove + 1) {
+            if (app.cur().doc.undo.size() != beforeMove + 1) {
                 SDL_Log("selftest FAILED: moving a stroke left %zu undo steps",
-                        app.doc.undo.size() - beforeMove);
+                        app.cur().doc.undo.size() - beforeMove);
                 return 1;
             }
             doUndo(app);
@@ -3811,7 +4242,7 @@ int main(int argc, char** argv) {
                 SDL_Log("selftest FAILED: undoing the move left the wrong line");
                 return 1;
             }
-            app.linework.selectMode = false;
+            app.cur().linework.selectMode = false;
             SDL_Log("selftest: a whole linework stroke selects, moves and undoes");
         }
 
@@ -3819,20 +4250,20 @@ int main(int argc, char** argv) {
         // testable here is the drag: several previews must collapse into ONE
         // undo step, and the last one must be the one left on the canvas.
         {
-            sbl::Layer& onto = app.doc.addLayer("gradient");
-            app.doc.activeLayer = onto.id;
+            sbl::Layer& onto = app.cur().doc.addLayer("gradient");
+            app.cur().doc.activeLayer = onto.id;
             // The lasso check above left a selection, and clipping to it is the
             // engine's job and already tested there. This is about the drag.
-            app.doc.selection.reset();
+            app.cur().doc.selection.reset();
             app.tool = Tool::Gradient;
             app.gradientShape = sbl::GradientShape::Linear;
             app.gradientToTransparent = false;
             app.foreground = sbl::StraightRgba8{0, 0, 0, 255};
             app.background = sbl::StraightRgba8{255, 255, 255, 255};
 
-            const std::size_t undoBefore = app.doc.undo.size();
+            const std::size_t undoBefore = app.cur().doc.undo.size();
             const auto screen = [&](double cx, double cy) {
-                return std::pair{toScreenX(app.view, cx, cy), toScreenY(app.view, cx, cy)};
+                return std::pair{toScreenX(app.cur().view, cx, cy), toScreenY(app.cur().view, cx, cy)};
             };
             const auto [ax, ay] = screen(0.0, 0.0);
             beginGradient(app, ax, ay);
@@ -3852,9 +4283,9 @@ int main(int argc, char** argv) {
                     tile->pixel(x - key.first * sbl::TILE_SIZE,
                                 y - key.second * sbl::TILE_SIZE).r));
             };
-            if (app.doc.undo.size() != undoBefore + 1) {
+            if (app.cur().doc.undo.size() != undoBefore + 1) {
                 SDL_Log("selftest FAILED: a gradient drag left %zu undo steps",
-                        app.doc.undo.size() - undoBefore);
+                        app.cur().doc.undo.size() - undoBefore);
                 return 1;
             }
             // Halfway along the LAST axis, not the first: a preview that was
@@ -3878,21 +4309,21 @@ int main(int argc, char** argv) {
         // because the whole point is what does NOT happen, and a tool that
         // quietly paints the wrong target is invisible to every other check.
         {
-            sbl::Layer* layer = app.doc.active();
+            sbl::Layer* layer = app.cur().doc.active();
             layer->mask.emplace();
-            app.paintOnMask = true;
-            const std::size_t before = app.doc.undo.size();
+            app.cur().paintOnMask = true;
+            const std::size_t before = app.cur().doc.undo.size();
             const std::size_t tiles  = layer->tiles.size();
-            const sbl::StraightRgba8 spot = sbl::pickColour(app.doc, 500, 20);
+            const sbl::StraightRgba8 spot = sbl::pickColour(app.cur().doc, 500, 20);
 
-            doFill(app, toScreenX(app.view, 500.0, 20.0),
-                        toScreenY(app.view, 500.0, 20.0));
+            doFill(app, toScreenX(app.cur().view, 500.0, 20.0),
+                        toScreenY(app.cur().view, 500.0, 20.0));
             doClear(app);
-            beginGradient(app, toScreenX(app.view, 10.0, 10.0),
-                               toScreenY(app.view, 10.0, 10.0));
+            beginGradient(app, toScreenX(app.cur().view, 10.0, 10.0),
+                               toScreenY(app.cur().view, 10.0, 10.0));
 
-            if (app.doc.undo.size() != before || layer->tiles.size() != tiles ||
-                !(sbl::pickColour(app.doc, 500, 20) == spot)) {
+            if (app.cur().doc.undo.size() != before || layer->tiles.size() != tiles ||
+                !(sbl::pickColour(app.cur().doc, 500, 20) == spot)) {
                 SDL_Log("selftest FAILED: a fill tool wrote the layer while Paint "
                         "on mask was on");
                 return 1;
@@ -3907,7 +4338,7 @@ int main(int argc, char** argv) {
                         "the failure this check exists to prevent");
                 return 1;
             }
-            app.paintOnMask = false;
+            app.cur().paintOnMask = false;
             layer->mask.reset();
             app.notices.clear();
             SDL_Log("selftest: the fill tools refuse a mask out loud rather than "
@@ -3920,28 +4351,28 @@ int main(int argc, char** argv) {
         // the self-test actually triggers it.
         // Recovery only runs for a document with unsaved changes, and the
         // project save just above cleared that flag.
-        app.doc.dirty = true;
-        app.lastAutosaveMs = 0;
+        app.cur().doc.dirty = true;
+        app.cur().lastAutosaveMs = 0;
         maybeAutosave(app, kAutosaveIntervalMs + 1);
         if (app.autosaveWorker.joinable()) app.autosaveWorker.join();
         {
             const std::lock_guard lock(app.recoveryMutex);
-            if (app.lastRecoveryFile.empty()) {
+            if (app.cur().lastRecoveryFile.empty()) {
                 SDL_Log("selftest FAILED: no recovery file was written");
                 return 1;
             }
-            SDL_Log("selftest: recovery written to %s", app.lastRecoveryFile.c_str());
+            SDL_Log("selftest: recovery written to %s", app.cur().lastRecoveryFile.c_str());
             // Clean up after ourselves — a self-test must not leave the next
             // real launch offering to recover work that never existed.
-            sbl::clearRecovery(app.lastRecoveryFile);
-            app.lastRecoveryFile.clear();
+            sbl::clearRecovery(app.cur().lastRecoveryFile);
+            app.cur().lastRecoveryFile.clear();
         }
 
         const auto out = std::filesystem::temp_directory_path() / "sable_selftest.png";
-        const auto result = sbl::exportPng(app.doc, out);
+        const auto result = sbl::exportPng(app.cur().doc, out);
         SDL_Log("selftest: %zu undo steps, %zu tiles, %zu uploads, export %s",
-                app.doc.undo.size(), app.doc.active()->tiles.size(),
-                app.canvas->uploadCount(),
+                app.cur().doc.undo.size(), app.cur().doc.active()->tiles.size(),
+                app.cur().canvas->uploadCount(),
                 result.has_value() ? out.string().c_str()
                                    : result.error().detail.c_str());
         app.running = false;
@@ -3954,9 +4385,9 @@ int main(int argc, char** argv) {
         // release, and the whole drag is a single entry (D-030).
         const std::size_t expectedUndo   = (textTested ? 6u : 4u) + 3u + 1u;
         const std::size_t expectedLayers = (textTested ? 3u : 2u) + 1u + 1u;
-        if (!result.has_value() || app.doc.undo.size() != expectedUndo ||
-            app.doc.layers.size() != expectedLayers ||
-            app.doc.active()->tiles.empty()) {
+        if (!result.has_value() || app.cur().doc.undo.size() != expectedUndo ||
+            app.cur().doc.layers.size() != expectedLayers ||
+            app.cur().doc.active()->tiles.empty()) {
             SDL_Log("selftest FAILED");
             return 1;
         }
@@ -3965,9 +4396,9 @@ int main(int argc, char** argv) {
         // engine tests are where the two backends are compared pixel for
         // pixel. What this checks is the wiring: that flicking the switch
         // mid-session repaints the same canvas rather than a different one.
-        const std::vector<sbl::StraightRgba8> onCpu = sbl::flatten(app.doc);
-        const std::size_t undoBefore   = app.doc.undo.size();
-        const std::size_t layersBefore = app.doc.layers.size();
+        const std::vector<sbl::StraightRgba8> onCpu = sbl::flatten(app.cur().doc);
+        const std::size_t undoBefore   = app.cur().doc.undo.size();
+        const std::size_t layersBefore = app.cur().doc.layers.size();
 
         // #15 asks that a switch preserve the stroke in progress. It does so by
         // refusing to happen: the backend is holding a batch of dabs for the
@@ -3985,7 +4416,7 @@ int main(int argc, char** argv) {
 
         applyGpuMode(app);
         if (app.useGpu) {
-            const std::vector<sbl::StraightRgba8> onGpu = sbl::flatten(app.doc);
+            const std::vector<sbl::StraightRgba8> onGpu = sbl::flatten(app.cur().doc);
             int worst = 0;
             for (std::size_t i = 0; i < onCpu.size() && i < onGpu.size(); ++i)
                 worst = std::max({worst, std::abs(onCpu[i].r - onGpu[i].r),
@@ -4002,9 +4433,9 @@ int main(int argc, char** argv) {
             // Back on the CPU, with the tiles read out of VRAM: the document
             // and its history have to be exactly what they were before the
             // round trip, or a switch costs the artist work.
-            if (app.doc.undo.size() != undoBefore ||
-                app.doc.layers.size() != layersBefore ||
-                sbl::flatten(app.doc) != onCpu) {
+            if (app.cur().doc.undo.size() != undoBefore ||
+                app.cur().doc.layers.size() != layersBefore ||
+                sbl::flatten(app.cur().doc) != onCpu) {
                 SDL_Log("selftest FAILED: switching backends changed the document");
                 return 1;
             }
@@ -4018,14 +4449,14 @@ int main(int argc, char** argv) {
         // --- #21: a 16-bit document, through the application rather than the
         // engine. The unit tests cover the maths; this covers the wiring the
         // artist actually touches — the New-canvas checkbox, the paint path,
-        // Ctrl+S and reopening. Last, because it replaces the document every
-        // phase above was counting.
+        // Ctrl+S and reopening. Last, because everything below is counted
+        // against the tab it opens rather than the one above.
         {
             // Asked for, so that the decline is what turns it off rather than
             // it having happened to be off already.
             app.useGpu = true;
-            resetDocument(app, 512, 512, false, sbl::ColourDepth::Bits16);
-            if (app.doc.depth != sbl::ColourDepth::Bits16) {
+            newDocument(app, 512, 512, false, sbl::ColourDepth::Bits16);
+            if (app.cur().doc.depth != sbl::ColourDepth::Bits16) {
                 SDL_Log("selftest FAILED: the new canvas is not 16-bit");
                 return 1;
             }
@@ -4043,8 +4474,8 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < 24; ++i) {
                     const double cx = 120.0 + i * 8.0;
                     sbl::InputSample sample =
-                        mouseSample(app, toScreenX(app.view, cx, 300.0),
-                                         toScreenY(app.view, cx, 300.0));
+                        mouseSample(app, toScreenX(app.cur().view, cx, 300.0),
+                                         toScreenY(app.cur().view, cx, 300.0));
                     sample.fromMouse = false;
                     sample.pressure  = 0.8f;
                     paintWith(app, sample);
@@ -4054,7 +4485,7 @@ int main(int argc, char** argv) {
 
             const auto path = std::filesystem::temp_directory_path() /
                               "sable_selftest_16bit.sable";
-            app.doc.path = path;
+            app.cur().doc.path = path;
             doSaveProject(app, path);
             auto reopened = sbl::importDocument(path);
             if (!reopened.has_value() ||
@@ -4065,7 +4496,7 @@ int main(int argc, char** argv) {
             // The pixels, not merely the manifest: a save that narrowed them
             // would reload as a perfectly valid 16-bit document full of 8-bit
             // values, which is the failure that looks like success.
-            const sbl::Tile* saved = app.doc.layers.front().find(sbl::TileKey{0, 1});
+            const sbl::Tile* saved = app.cur().doc.layers.front().find(sbl::TileKey{0, 1});
             const sbl::Tile* back  = reopened->layers.front().find(sbl::TileKey{0, 1});
             if (saved == nullptr || back == nullptr) {
                 SDL_Log("selftest FAILED: the 16-bit stroke wrote no tile");
@@ -4088,6 +4519,242 @@ int main(int argc, char** argv) {
                     "(alpha within %d of 65535), GPU declined it", worst16);
         }
 
+        // --- #50: several documents open at once. Nothing below is reachable
+        // from a unit test — tests.cpp links the engine, and every one of these
+        // is about what the APPLICATION keeps per tab.
+        {
+            // Two fresh canvases, each in a tab of its own. Different sizes, so
+            // "fit to window" gives them different zooms and a view that leaked
+            // between them shows up as a number rather than as a feeling.
+            newDocument(app, 1600, 1600, false);
+            const std::size_t tabA = app.activeDoc;
+            newDocument(app, 256, 256, false);
+            const std::size_t tabB = app.activeDoc;
+            if (tabA == tabB || app.docs.size() < 2) {
+                SDL_Log("selftest FAILED: a second New tab did not open a second tab");
+                return 1;
+            }
+
+            // A flat fill each, in colours no phase above painted, plus a real
+            // brush stroke so the undo checks are about strokes rather than
+            // about a synthetic record.
+            const sbl::StraightRgba8 inkA{220, 30, 30, 255};
+            const sbl::StraightRgba8 inkB{30, 60, 220, 255};
+            const auto floodAndStroke = [&](sbl::StraightRgba8 colour) {
+                app.foreground = colour;
+                sbl::UndoRecord rec = sbl::fillSelection(
+                    app.cur().doc, app.cur().doc.activeLayer, colour);
+                app.cur().canvas->releaseAll();
+                app.cur().doc.undo.push(std::move(rec));
+                app.cur().doc.dirty = true;
+
+                app.tool = Tool::Brush;
+                app.foreground = sbl::StraightRgba8{0, 0, 0, 255};
+                beginPaint(app);
+                for (int i = 0; i <= 20; ++i)
+                    paintWith(app, mouseSample(
+                        app, toScreenX(app.cur().view, 40.0 + i * 4.0, 40.0),
+                             toScreenY(app.cur().view, 40.0 + i * 4.0, 40.0)));
+                endPaint(app);
+            };
+            switchToDocument(app, tabA);
+            floodAndStroke(inkA);
+            const float zoomA = app.cur().view.zoom;
+            const std::size_t undoA = app.cur().doc.undo.size();
+            switchToDocument(app, tabB);
+            floodAndStroke(inkB);
+            const float zoomB = app.cur().view.zoom;
+
+            if (zoomA == zoomB) {
+                SDL_Log("selftest FAILED: two differently sized canvases fitted to "
+                        "the same zoom, so the view is not per document");
+                return 1;
+            }
+
+            // Each keeps its own pixels. Read out of the document rather than
+            // off the screen, which the GPU check below does separately.
+            const auto inkOf = [&](std::size_t tab) {
+                return sbl::pickColour(app.docs[tab]->doc, 200, 200);
+            };
+            if (!(inkOf(tabA) == inkA) || !(inkOf(tabB) == inkB)) {
+                SDL_Log("selftest FAILED: tab A reads %d,%d,%d and tab B %d,%d,%d — "
+                        "one document's pixels reached the other",
+                        inkOf(tabA).r, inkOf(tabA).g, inkOf(tabA).b,
+                        inkOf(tabB).r, inkOf(tabB).g, inkOf(tabB).b);
+                return 1;
+            }
+
+            // Undo in one document must not touch the other. The stroke goes,
+            // the fill stays, and A is untouched throughout.
+            const sbl::StraightRgba8 strokeA = sbl::pickColour(app.docs[tabA]->doc, 60, 40);
+            const std::size_t stackA = app.docs[tabA]->doc.undo.size();
+            doUndo(app);            // still on tab B
+            doUndo(app);
+            if (app.docs[tabA]->doc.undo.size() != stackA ||
+                !(sbl::pickColour(app.docs[tabA]->doc, 60, 40) == strokeA) ||
+                !(inkOf(tabA) == inkA)) {
+                SDL_Log("selftest FAILED: undo in one document changed the other");
+                return 1;
+            }
+            if (app.cur().doc.undo.size() != undoA - 2 || inkOf(tabB) == inkB) {
+                SDL_Log("selftest FAILED: undo did not take back the tab it was in");
+                return 1;
+            }
+            doRedo(app);
+            doRedo(app);
+            if (!(inkOf(tabB) == inkB)) {
+                SDL_Log("selftest FAILED: redo did not put the tab back");
+                return 1;
+            }
+            SDL_Log("selftest: two tabs keep their own pixels, history and view "
+                    "(%.0f%% and %.0f%%)", static_cast<double>(zoomA) * 100.0,
+                    static_cast<double>(zoomB) * 100.0);
+
+            // Copy between documents, which is most of the point of #50.
+            switchToDocument(app, tabA);
+            app.cur().doc.selection = sbl::Selection{100, 100, 64, 64};
+            if (!doCopy(app)) {
+                SDL_Log("selftest FAILED: copy took nothing");
+                return 1;
+            }
+            app.cur().doc.selection.reset();
+            switchToDocument(app, tabB);
+            const std::size_t layersB = app.cur().doc.layers.size();
+            const std::size_t stepsB  = app.cur().doc.undo.size();
+            if (!doPaste(app)) {
+                SDL_Log("selftest FAILED: paste put nothing down");
+                return 1;
+            }
+            if (app.cur().doc.layers.size() != layersB + 1 ||
+                app.cur().doc.undo.size() != stepsB + 1) {
+                SDL_Log("selftest FAILED: a paste left %zu layers and %zu steps",
+                        app.cur().doc.layers.size() - layersB,
+                        app.cur().doc.undo.size() - stepsB);
+                return 1;
+            }
+            // A's red, on top of B's blue, in B's document.
+            if (!(sbl::pickColour(app.cur().doc, 120, 120) == inkA)) {
+                SDL_Log("selftest FAILED: the pasted pixels are not the ones copied");
+                return 1;
+            }
+            doUndo(app);
+            if (!(inkOf(tabB) == inkB) ||
+                app.cur().doc.layers.size() != layersB) {
+                SDL_Log("selftest FAILED: undoing a paste left it behind");
+                return 1;
+            }
+            doRedo(app);
+            SDL_Log("selftest: %d x %d copied from one document and pasted into "
+                    "another as one undo step", app.clipboard.w, app.clipboard.h);
+
+            // --- the failure #46 shipped, one level up. `CanvasView` keys its
+            // textures by TILE, so a cache shared between two documents has
+            // tile (0,0) of each landing on one texture and the last upload
+            // winning — the second document would be drawn with the first one's
+            // pixels, on screen only, with every document check above still
+            // green. Read it off the frame; reasoning about it is what let it
+            // ship the first time.
+            //
+            // Under the GPU backend where this machine has one, since that is
+            // the configuration the bug was reported in.
+            app.useGpu = sbl::gpuBackendCompiledIn();
+            applyGpuMode(app);
+            const auto shownAt = [&](double cx, double cy)
+                -> std::optional<sbl::StraightRgba8> {
+                SDL_SetRenderDrawColor(app.renderer, 0, 0, 0, 255);
+                SDL_RenderClear(app.renderer);
+                app.cur().canvas->render(app.cur().doc, app.cur().view, app.viewport);
+                const SDL_Rect one{
+                    static_cast<int>(std::lround(toScreenX(app.cur().view, cx, cy))),
+                    static_cast<int>(std::lround(toScreenY(app.cur().view, cx, cy))),
+                    1, 1};
+                SDL_Surface* shot = SDL_RenderReadPixels(app.renderer, &one);
+                if (shot == nullptr) return std::nullopt;
+                Uint8 r = 0, g = 0, b = 0, a = 0;
+                const bool read = SDL_ReadSurfacePixel(shot, 0, 0, &r, &g, &b, &a);
+                SDL_DestroySurface(shot);
+                if (!read) return std::nullopt;
+                return sbl::StraightRgba8{r, g, b, a};
+            };
+            const auto similar = [](sbl::StraightRgba8 got, sbl::StraightRgba8 want) {
+                return std::abs(int{got.r} - int{want.r}) <= 8 &&
+                       std::abs(int{got.g} - int{want.g}) <= 8 &&
+                       std::abs(int{got.b} - int{want.b}) <= 8;
+            };
+            // B first, then A, then B again: a shared cache fails on the second
+            // one whichever order it is asked in, and the third rules out the
+            // trivial explanation that only one of them ever draws.
+            switchToDocument(app, tabB);
+            const auto seenB1 = shownAt(200.0, 200.0);
+            switchToDocument(app, tabA);
+            const auto seenA  = shownAt(200.0, 200.0);
+            switchToDocument(app, tabB);
+            const auto seenB2 = shownAt(200.0, 200.0);
+            if (seenB1.has_value() && seenA.has_value() && seenB2.has_value()) {
+                if (!similar(*seenB1, inkB) || !similar(*seenA, inkA) ||
+                    !similar(*seenB2, inkB)) {
+                    SDL_Log("selftest FAILED: the canvas showed %d,%d,%d then "
+                            "%d,%d,%d then %d,%d,%d where the two documents are "
+                            "%d,%d,%d and %d,%d,%d — the texture cache is shared "
+                            "between them (#46, one level up)",
+                            seenB1->r, seenB1->g, seenB1->b,
+                            seenA->r, seenA->g, seenA->b,
+                            seenB2->r, seenB2->g, seenB2->b,
+                            inkB.r, inkB.g, inkB.b, inkA.r, inkA.g, inkA.b);
+                    return 1;
+                }
+                SDL_Log("selftest: two documents draw their own tiles on %s, no "
+                        "texture bleed either way", app.useGpu ? "the GPU" : "the CPU");
+            } else {
+                SDL_Log("selftest: this renderer cannot read pixels back; the "
+                        "texture-bleed check did not run");
+            }
+            app.useGpu = false;
+            applyGpuMode(app);
+
+            // Closing a dirty tab prompts, and leaves the other one alone.
+            app.docs[tabB]->doc.dirty = true;
+            const std::size_t openBefore = app.docs.size();
+            requestClose(app, tabB);
+            if (!app.openDiscard || app.pending != Pending::CloseTab ||
+                app.docs.size() != openBefore) {
+                SDL_Log("selftest FAILED: closing a dirty tab did not prompt");
+                return 1;
+            }
+            app.openDiscard = false;
+            app.pending     = Pending::None;
+            closeDocument(app, tabB);          // what "Discard" does
+            if (app.docs.size() != openBefore - 1) {
+                SDL_Log("selftest FAILED: discarding left %zu tabs open",
+                        app.docs.size());
+                return 1;
+            }
+            // The other document is still there, still holding its own pixels.
+            if (!(sbl::pickColour(app.docs[tabA]->doc, 200, 200) == inkA)) {
+                SDL_Log("selftest FAILED: closing one tab disturbed another");
+                return 1;
+            }
+            // A CLEAN tab closes with no prompt at all.
+            newDocument(app, 128, 128, false);
+            const std::size_t clean = app.activeDoc;
+            requestClose(app, clean);
+            if (app.openDiscard || app.docs.size() != openBefore - 1) {
+                SDL_Log("selftest FAILED: closing a clean tab prompted");
+                return 1;
+            }
+            // And the last one standing is never actually the last: closing it
+            // leaves a blank canvas rather than an application with none.
+            while (app.docs.size() > 1) closeDocument(app, app.docs.size() - 1);
+            closeDocument(app, 0);
+            if (app.docs.size() != 1 || app.cur().doc.layers.empty()) {
+                SDL_Log("selftest FAILED: closing the last tab left %zu documents",
+                        app.docs.size());
+                return 1;
+            }
+            SDL_Log("selftest: a dirty tab prompts and a clean one does not; the "
+                    "last tab closed leaves a fresh canvas");
+        }
+
         SDL_Log("selftest OK");
 
         // Exit before the settings write below. The self-test drives the app
@@ -4096,7 +4763,7 @@ int main(int argc, char** argv) {
         // someone's stabilizer setting.
         sbl::setPaintBackend(nullptr);
         app.gpu.reset();
-        canvas.releaseAll();
+        app.docs.clear();   // every tab's textures, before the renderer goes
         ImGui_ImplSDLRenderer3_Shutdown();
         ImGui_ImplSDL3_Shutdown();
         ImGui::DestroyContext();
@@ -4128,9 +4795,11 @@ int main(int argc, char** argv) {
     // leave it running while `app` goes out of scope underneath it.
     if (app.autosaveWorker.joinable()) app.autosaveWorker.join();
 
-    // A clean exit means the recovery copy has done its job. Leaving it would
+    // A clean exit means the recovery copies have done their job — every open
+    // tab's, not just the one that happened to be on screen. Leaving one would
     // offer the artist a stale "unsaved work" prompt on the next launch.
-    if (!app.lastRecoveryFile.empty()) sbl::clearRecovery(app.lastRecoveryFile);
+    for (const std::unique_ptr<OpenDocument>& open : app.docs)
+        if (!open->lastRecoveryFile.empty()) sbl::clearRecovery(open->lastRecoveryFile);
 
     Settings settings = loadSettings();
     collectSettings(app, settings);
@@ -4141,7 +4810,7 @@ int main(int argc, char** argv) {
     sbl::setPaintBackend(nullptr);
     app.gpu.reset();
 
-    canvas.releaseAll();
+    app.docs.clear();       // every tab's textures, before the renderer goes
     ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();

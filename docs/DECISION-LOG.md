@@ -1456,6 +1456,111 @@ path to keep in step the day one was wanted.
 
 ---
 
+## D-035 — Several open documents: an `OpenDocument` per tab, a texture cache each
+
+**Status:** Decided
+**Affects:** `app/src/main.cpp`, `app/src/shortcuts.cpp`, `app/src/shortcuts.hpp`
+**Answers:** #50
+
+`App` held one `sbl::Document`, and opening a file replaced it. Everything
+hanging off `App` had quietly assumed that.
+
+**The split came first, the tabs afterwards.** `struct OpenDocument` gathers
+the document, the view, the texture cache, the text session, the linework
+session, the paint-on-mask flag and the recovery bookkeeping; `App` keeps a
+`vector<unique_ptr<OpenDocument>>` and an index. Every one of the ~430 call
+sites that said `app.doc` now says `app.cur().doc`, which is a rename the
+compiler checked rather than a reading somebody did. Doing it the other way
+round — tabs first, state moved as the bugs turned up — is how a feature like
+this gets shipped with three fields still shared.
+
+**Held by pointer, never by value.** `CanvasView` owns SDL textures and is
+deliberately neither copyable nor movable, and the recovery worker holds a raw
+`OpenDocument*` across a thread hand-off. Both want addresses that adding a tab
+cannot move.
+
+**One texture cache per document.** This is #46 one level up. `CanvasView`
+keys its textures by TILE, so a cache shared between two documents has tile
+(0,0) of each landing on one texture and the last upload winning — the second
+document would be drawn with the first one's pixels, on screen only, with every
+document-level check still green. Keying by (document, tile) would work too; a
+cache per document cannot be got wrong, and it also means closing a tab frees
+its textures with it. The self-test reads three frames back off the renderer
+and compares them against the two documents, because reasoning about this is
+what let it ship the first time.
+
+**New and Open make a tab; only Close and Quit can lose work.** The
+"discard unsaved changes?" prompt used to guard New, Open, Import, drop and
+Quit, because each replaced the one document. None of them can now, so `Pending`
+lost three of its five members and the prompt moved to where the work actually
+goes: closing a tab, named, and quitting, counted. A drop opens a tab
+immediately, which is what a drop should always have done.
+
+**Opening reuses a pristine tab; New never does.** Sable starts on a blank
+canvas, so double-clicking a `.sable` would otherwise always leave an empty
+document beside the file. "Pristine" is strict — never saved, never edited,
+nothing in its history, nothing being typed. New canvas opts out: "New tab"
+twice producing one tab is a control that did nothing.
+
+**The clipboard is Sable's own, and the window's.** Copy lifts the active
+layer's pixels under the selection at 16 bits premultiplied — the same units
+and the same coverage rule `transformRegion` uses, so copying out of a 16-bit
+document does not quantise it. Paste lands on a NEW layer in the current
+document, which makes it one undo step through machinery that already exists:
+`swapRecord` moves a whole layer, tiles included, so undoing a paste takes its
+pixels with it. The origin is clamped on-canvas, or pasting into a smaller
+document would land the block off the edge and read as a failure.
+
+**The recovery thread covers every tab, one per pass.** Each `OpenDocument`
+carries its own recovery file and its own clock; the worker takes the first
+document that is dirty and due. One worker, not one per document — the interval
+is two minutes. A dirty reference tab left in the background is exactly the work
+an artist would not think to save.
+
+**Closing a tab joins the worker first.** That is the only thing making the
+worker's raw `OpenDocument*` sound, and it is one line that must not move.
+
+**A gesture is still the window's, not the document's.** The stroke, the lasso
+path and the gradient drag stayed on `App`: a pointer draws in one place at a
+time, so the only way they could span two documents is a switch halfway
+through — and switching ends them (`settleGestures`). A text or linework
+session is not a gesture and travels with its document, which is the difference
+the issue was pointing at.
+
+**Backends are read back at the boundary.** The paint backend holds tiles for
+whichever document it painted, so a switch reads the outgoing one back before
+it stops being what anything asks about, and turning the GPU off reads back
+every open document rather than the visible one.
+
+**What this does not do:**
+
+- **The symmetry ruler is still one per window.** Its centre is in canvas
+  coordinates, so switching to a differently sized document leaves the axis
+  off-centre until Recentre. D-024 already calls the ruler "a way of working,
+  not part of the picture"; splitting `SymmetryRuler` into the preference half
+  and the per-document half is a change of its own.
+- **No system clipboard.** Copy and paste reach between Sable's tabs and no
+  further. A system clipboard means a platform image format on three platforms.
+- **No session restore.** Which tabs were open is not remembered across a
+  restart; recovery files are, and they are per document, so a crash with three
+  documents open offers three.
+- **No per-tab window.** One window, several tabs. Tearing a tab off into its
+  own window would need a second renderer and a second ImGui context.
+- **Tabs are not reorderable across the strip in any saved way.** ImGui lets
+  them be dragged; the order is not persisted.
+
+**Alternative rejected — `std::vector<Document>` with the rest left on `App`.**
+The shape the issue warned about. Every field listed above would have stayed
+shared, and each would have been found by an artist rather than by the compiler.
+
+**Alternative rejected — swap the active document's state in and out of `App`
+on every switch.** It needs no call-site changes at all, which is its whole
+appeal. It also invalidates every pointer into `App` at a switch, forces the
+texture cache to be dropped wholesale each time, and moves the correctness
+argument from "the compiler checked it" to "somebody remembered every field".
+
+---
+
 ## Open decisions
 
 These blocked the milestone named. They have all been answered — the entries

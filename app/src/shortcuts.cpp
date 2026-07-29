@@ -32,8 +32,18 @@ constexpr std::array<Entry, static_cast<std::size_t>(Action::Count)> kDefaults{{
     {Action::SaveAs,        "Save as",        SDLK_S, static_cast<SDL_Keymod>(SDL_KMOD_CTRL | SDL_KMOD_SHIFT)},
     {Action::ExportPng,     "Export PNG",     SDLK_E, SDL_KMOD_CTRL},
     {Action::Quit,          "Quit",           SDLK_Q, SDL_KMOD_CTRL},
+    // #50. The bindings every tabbed application uses, so the gesture an artist
+    // already has in their hands works here too.
+    {Action::CloseDocument, "Close document",  SDLK_W,   SDL_KMOD_CTRL},
+    {Action::NextDocument,  "Next document",   SDLK_TAB, SDL_KMOD_CTRL},
+    {Action::PreviousDocument, "Previous document", SDLK_TAB,
+     static_cast<SDL_Keymod>(SDL_KMOD_CTRL | SDL_KMOD_SHIFT)},
     {Action::Undo,          "Undo",           SDLK_Z, SDL_KMOD_CTRL},
     {Action::Redo,          "Redo",           SDLK_Y, SDL_KMOD_CTRL},
+    // The one pair of bindings nobody expects to have to look up, and the
+    // reason to have two documents open at once.
+    {Action::Copy,          "Copy",           SDLK_C, SDL_KMOD_CTRL},
+    {Action::Paste,         "Paste",          SDLK_V, SDL_KMOD_CTRL},
     {Action::Clear,         "Clear layer",    SDLK_DELETE, SDL_KMOD_NONE},
     {Action::FillSelection, "Fill selection", SDLK_BACKSPACE, SDL_KMOD_NONE},
     {Action::Deselect,      "Deselect",       SDLK_D, SDL_KMOD_CTRL},
