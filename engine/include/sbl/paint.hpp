@@ -221,7 +221,7 @@ struct Gradient {
     StraightRgba8 from{};
     StraightRgba8 to{};
 
-    /// Ordered dither, applied only on an 8-bit document — see D-029. Off is
+    /// Ordered dither, applied only on an 8-bit document — see D-030. Off is
     /// the exact ramp, which is what a test can pin and what a 16-bit document
     /// gets anyway.
     bool dither = true;

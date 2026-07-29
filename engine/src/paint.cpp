@@ -660,7 +660,7 @@ UndoRecord CpuBackend::fillSelection(Document& doc, LayerId target,
 
 namespace {
 
-/// The 8 x 8 ordered dither threshold matrix, as 0..63 (D-029).
+/// The 8 x 8 ordered dither threshold matrix, as 0..63 (D-030).
 ///
 /// Ordered rather than error diffusion: a diffusion pass makes each pixel
 /// depend on the one before it, which is both serial and impossible to compute

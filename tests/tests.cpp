@@ -19,6 +19,7 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <numbers>
 #ifdef _WIN32
 #include <malloc.h>   // _aligned_malloc / _aligned_free
 #endif
@@ -1855,7 +1856,7 @@ namespace {
 
 /// A horizontal linear gradient with the exact ramp — dithering off, so the
 /// values a test reads are the ones the interpolation produced and not the
-/// ones a threshold matrix nudged. D-029.
+/// ones a threshold matrix nudged. D-030.
 Gradient horizontalRamp(double x0, double x1, StraightRgba8 from, StraightRgba8 to) {
     Gradient g;
     g.x0 = x0;
@@ -2052,7 +2053,7 @@ TEST_CASE("dithering breaks the bands of a shallow 8-bit ramp") {
 }
 
 TEST_CASE("dither leaves a colour that needs no dithering alone") {
-    // The other half of D-029: a dither that reaches a whole 8-bit step rather
+    // The other half of D-030: a dither that reaches a whole 8-bit step rather
     // than half of one also wobbles values that were exactly representable,
     // speckling the flat ends of every ramp and every solid colour under one.
     Document doc = makeDocument(64, 64, StraightRgba8{0, 0, 0, 0});
@@ -5723,6 +5724,179 @@ TEST_CASE("a control point is added on the curve and deleted off it") {
     CHECK(!erasePoint(content, PointRef{0, 0}));      // and asking again is safe
 }
 
+TEST_CASE("the stabiliser leaves a shaky freehand line fewer, straighter points") {
+    // #51.1. The stabiliser is a pure sample-to-sample function, so a linework
+    // curve gets it in the same place the brush does — and the two halves that
+    // decide what a freehand curve looks like, the smoothing and the point
+    // spacing, are only meaningful together. A hand that shakes 5 px either
+    // side of a straight line must not leave a control point on every wobble.
+    const auto drawShaky = [](std::uint8_t level) {
+        Stabilizer stabilizer;
+        stabilizer.setLevel(level);
+        LineStroke stroke;
+        stroke.points.push_back(LinePoint{0.0, 0.0, 1.0f});
+        for (int i = 1; i < 400; ++i) {
+            const InputSample s = stabilizer.apply(at(i * 1.0, (i % 2 == 0) ? 5.0 : -5.0));
+            (void)appendFreehand(stroke, LinePoint{s.x, s.y, 1.0f}, 14.0);
+        }
+        return stroke;
+    };
+    /// How far the control points wander off the line the artist meant, past
+    /// the transient at the start where the string is still being pulled taut.
+    const auto worstOffset = [](const LineStroke& stroke) {
+        double worst = 0.0;
+        for (const LinePoint& p : stroke.points)
+            if (p.x > 100.0) worst = std::max(worst, std::abs(p.y));
+        return worst;
+    };
+
+    const LineStroke raw      = drawShaky(0);
+    const LineStroke smoothed = drawShaky(3);
+
+    CHECK(worstOffset(raw) == doctest::Approx(5.0));
+    CHECK(worstOffset(smoothed) < 1.0);
+    // Fewer, as well as straighter: a wobble that is not smoothed out is extra
+    // travel, and extra travel is extra handles to drag afterwards.
+    CHECK(smoothed.points.size() < raw.points.size());
+    // And it still gets to the end of the line — a stabilised curve that stops
+    // short is the pulled-string bug the brush already had to fix (US-11.4).
+    CHECK(smoothed.points.back().x > 300.0);
+}
+
+TEST_CASE("a closed curve joins with no seam and no double-darkened join") {
+    // #51.3. The join is exactly the artefact `drawLineworkLayer` accumulates
+    // coverage to avoid: the last segment ends where the first begins, so a
+    // rasteriser that composited per stamp would put two layers of a
+    // semi-transparent line on the one pixel and leave a dark dot there.
+    LineStroke ring;
+    ring.width         = 6.0f;
+    ring.minWidthRatio = 1.0f;                      // even width, so alpha is comparable
+    ring.colour        = StraightRgba8{0, 0, 0, 128};
+    ring.points.push_back(LinePoint{32.0, 32.0, 1.0f});
+    ring.points.push_back(LinePoint{96.0, 32.0, 1.0f});
+    ring.points.push_back(LinePoint{96.0, 96.0, 1.0f});
+    ring.points.push_back(LinePoint{32.0, 96.0, 1.0f});
+
+    LineworkContent open;
+    open.strokes.push_back(ring);
+    Document unclosed = lineworkDocument(open);
+    (void)drawLineworkLayer(unclosed.layers[0], open, unclosed.width, unclosed.height);
+
+    LineworkContent shut;
+    shut.strokes.push_back(ring);
+    shut.strokes[0].closed = true;
+    Document closed = lineworkDocument(shut);
+    (void)drawLineworkLayer(closed.layers[0], shut, closed.width, closed.height);
+
+    // No seam: a point well inside the closing segment — asked of the same
+    // `samplePoints` the rasteriser walks, rather than guessed from the control
+    // points, because the spline bulges past a corner it turns — is inked when
+    // the stroke is closed and bare when it is not.
+    const std::vector<LinePoint> walk = samplePoints(shut.strokes[0], 1.0);
+    const LinePoint& onClosing = walk[walk.size() * 7 / 8];
+    const auto cx = static_cast<std::int32_t>(std::lround(onClosing.x));
+    const auto cy = static_cast<std::int32_t>(std::lround(onClosing.y));
+    CHECK(pickColour(closed, cx, cy).a > 0);
+    CHECK(pickColour(unclosed, cx, cy).a == 0);
+
+    // No double-darkening. The ring ends on the pixel it started on, so if
+    // coverage were composited per stamp rather than accumulated first, the
+    // join would carry two passes of a half-transparent line and show as a dark
+    // dot. Asked of every pixel, because the join is not the only place the
+    // closed walk visits twice.
+    std::uint8_t worst = 0;
+    for (std::int32_t y = 0; y < closed.height; ++y)
+        for (std::int32_t x = 0; x < closed.width; ++x)
+            worst = std::max(worst, pickColour(closed, x, y).a);
+    CHECK(worst == ring.colour.a);
+    CHECK(pickColour(closed, 32, 32).a == ring.colour.a);
+}
+
+TEST_CASE("a whole stroke is grabbed by its line and moved as a unit") {
+    // #51.2. `nearestPoint` answers "which handle", which is no use to an
+    // artist who wants the line itself; this is the whole-stroke answer.
+    LineworkContent content;
+    content.strokes.push_back(horizontalStroke());
+
+    // The line, not a handle: the middle of the curve is 48 px from either end.
+    const std::optional<std::size_t> grabbed = nearestStroke(content, 64.0, 66.0, 8.0);
+    REQUIRE(grabbed.has_value());
+    CHECK(*grabbed == 0);
+    CHECK(!nearestStroke(content, 64.0, 20.0, 8.0).has_value());
+
+    const LineStroke before = content.strokes[0];
+    transformStrokes(content, {0}, Transform{10.0, 20.0, 1.0, 1.0, 0.0});
+    for (std::size_t i = 0; i < before.points.size(); ++i) {
+        CHECK(content.strokes[0].points[i].x == doctest::Approx(before.points[i].x + 10.0));
+        CHECK(content.strokes[0].points[i].y == doctest::Approx(before.points[i].y + 20.0));
+    }
+    // A move is not a scale, so the line does not change thickness on the way.
+    CHECK(content.strokes[0].width == doctest::Approx(before.width));
+
+    // Indices that name nothing are ignored rather than fatal: a selection can
+    // outlive an undo that removed the stroke it pointed at.
+    transformStrokes(content, {7}, Transform{100.0, 0.0, 1.0, 1.0, 0.0});
+    CHECK(content.strokes[0].points[0].x == doctest::Approx(before.points[0].x + 10.0));
+}
+
+TEST_CASE("a stroke turns and scales about its own centre") {
+    // A diagonal, so a sign slip in the rotation shows: a horizontal line
+    // turned a quarter turn either way lands on the same two points.
+    LineworkContent content;
+    LineStroke diagonal;
+    diagonal.width = 12.0f;
+    diagonal.points.push_back(LinePoint{32.0, 32.0, 1.0f});
+    diagonal.points.push_back(LinePoint{96.0, 96.0, 1.0f});
+    content.strokes.push_back(diagonal);
+
+    // Clockwise about the centre of its own bounding box, which is the mapping
+    // `transformRegion` applies to a region of pixels — one meaning of an angle
+    // in the program, whether what is turning is a curve or a rectangle.
+    transformStrokes(content, {0}, Transform{0.0, 0.0, 1.0, 1.0, std::numbers::pi / 2.0});
+    CHECK(content.strokes[0].points[0].x == doctest::Approx(96.0));
+    CHECK(content.strokes[0].points[0].y == doctest::Approx(32.0));
+    CHECK(content.strokes[0].points[1].x == doctest::Approx(32.0));
+    CHECK(content.strokes[0].points[1].y == doctest::Approx(96.0));
+
+    // The width scales with the geometry: a curve blown up to twice the size
+    // that kept a 12 px line is not the same drawing enlarged.
+    transformStrokes(content, {0}, Transform{0.0, 0.0, 2.0, 2.0, 0.0});
+    CHECK(content.strokes[0].width == doctest::Approx(24.0f));
+    CHECK(content.strokes[0].points[0].x == doctest::Approx(128.0));
+    CHECK(content.strokes[0].points[0].y == doctest::Approx(0.0));
+}
+
+TEST_CASE("recolouring a finished stroke is one undo step, curves and pixels") {
+    // #51.4, and the reason `LayerProps::linework` exists: the colour is stored
+    // per stroke and editable, so changing it is a property change that carries
+    // the re-rasterised pixels with it. Undo has to put back both, or the next
+    // edit starts from a colour that is not what is on the canvas.
+    LineworkContent content;
+    content.strokes.push_back(horizontalStroke());
+    Document doc = lineworkDocument(content);
+    (void)drawLineworkLayer(doc.layers[0], content, doc.width, doc.height);
+    const std::uint64_t asBlack = hashCanvas(doc);
+    CHECK(pickColour(doc, 64, 64) == StraightRgba8{0, 0, 0, 255});
+
+    // Exactly what the tool does: snapshot the properties, edit the curves,
+    // re-rasterise, and push the two as one record.
+    const LayerProps before = propsOf(doc.layers[0]);
+    doc.layers[0].linework->strokes[0].colour = StraightRgba8{200, 30, 40, 255};
+    UndoRecord rec = drawLineworkLayer(doc.layers[0], *doc.layers[0].linework,
+                                       doc.width, doc.height);
+    rec.structure = LayerStructureDelta{LayerChange::Properties, doc.layers[0].id, 0,
+                                        std::nullopt, before};
+    const std::size_t steps = doc.undo.size();
+    doc.undo.push(std::move(rec));
+    CHECK(doc.undo.size() == steps + 1);
+    CHECK(pickColour(doc, 64, 64) == StraightRgba8{200, 30, 40, 255});
+
+    doc.undo.undo(doc);
+    REQUIRE(doc.layers[0].linework.has_value());
+    CHECK(doc.layers[0].linework->strokes[0].colour == StraightRgba8{0, 0, 0, 255});
+    CHECK(hashCanvas(doc) == asBlack);
+}
+
 TEST_CASE("linework composites for the screen exactly as it does for the export") {
     // #1 again. The proof is that turning the layer into a plain raster one
     // changes nothing: the compositor never knew the difference.
@@ -5799,6 +5973,7 @@ TEST_CASE("a linework layer round-trips through .sable") {
     curve.width         = 9.25f;
     curve.minWidthRatio = 0.35f;
     curve.colour        = StraightRgba8{12, 34, 56, 210};
+    curve.closed        = true;
     curve.points.push_back(LinePoint{10.5, 20.25, 0.25f});
     curve.points.push_back(LinePoint{60.0, 90.0, 1.0f});
     curve.points.push_back(LinePoint{100.75, 30.5, 0.5f});
@@ -5824,6 +5999,9 @@ TEST_CASE("a linework layer round-trips through .sable") {
     CHECK(out.colour == curve.colour);
     CHECK(out.width == doctest::Approx(curve.width));
     CHECK(out.minWidthRatio == doctest::Approx(curve.minWidthRatio));
+    // A shape that comes back open is a shape the artist has to close again by
+    // hand, and the pixels would no longer be what the curves rasterise to.
+    CHECK(out.closed == curve.closed);
     REQUIRE(out.points.size() == curve.points.size());
     for (std::size_t i = 0; i < out.points.size(); ++i) {
         CHECK(out.points[i].x == doctest::Approx(curve.points[i].x));

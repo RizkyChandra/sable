@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "sbl/canvas.hpp"
+#include "sbl/paint.hpp"
 
 namespace sbl {
 
@@ -49,14 +50,48 @@ struct PointRef {
 /// What the rasteriser walks, and what the app draws the on-canvas preview
 /// from — one definition of where the curve goes, so the line the artist sees
 /// while dragging is the line that gets rasterised.
+///
+/// A closed stroke walks the segment from the last point back to the first as
+/// well, and does NOT repeat the start point at the end: the rasteriser takes
+/// coverage with max, so a repeat would cost a stamp rather than show, but a
+/// caller drawing the samples as a polyline would close the ring twice.
 [[nodiscard]] std::vector<LinePoint> samplePoints(const LineStroke& stroke,
                                                   double stepPx = 1.0);
+
+/// Adds `at` to a stroke being drawn freehand, once the pointer has travelled
+/// `spacingPx` from the last control point. True when a point was added.
+///
+/// Here rather than in the tool because it is half of what makes a smoothed
+/// freehand curve smooth — the stabiliser removes the wobble, and the spacing
+/// decides how many handles the artist is left holding. The two are only
+/// meaningful together, and together they are testable without a window.
+bool appendFreehand(LineStroke& stroke, const LinePoint& at, double spacingPx);
 
 /// The control point nearest (x, y), if one is within `within` canvas pixels.
 /// Later strokes win a tie: they are the ones drawn on top, so they are the
 /// ones the artist is pointing at.
 [[nodiscard]] std::optional<PointRef> nearestPoint(const LineworkContent& content,
                                                    double x, double y, double within);
+
+/// The stroke whose CURVE passes nearest (x, y), if one is within `within`
+/// canvas pixels of it. The whole-stroke answer to `nearestPoint`: an artist
+/// grabbing a line to move it aims at the line, not at a handle.
+///
+/// Later strokes win a tie, for the same reason as `nearestPoint`.
+[[nodiscard]] std::optional<std::size_t> nearestStroke(const LineworkContent& content,
+                                                       double x, double y, double within);
+
+/// Moves, scales and rotates whole strokes about the centre of their own
+/// bounding box, in place. Indices that name no stroke are ignored.
+///
+/// `Transform` is the one from sbl/paint.hpp: a second transform type would be
+/// a second definition of what a rotation angle means, and the day they drift
+/// the artist finds out by turning a selection the wrong way.
+///
+/// The width scales with the geometry. A curve scaled to twice the size that
+/// kept a 4 px line is not the same drawing enlarged, it is a different one.
+void transformStrokes(LineworkContent& content, const std::vector<std::size_t>& which,
+                      const Transform& transform);
 
 /// Splits the segment nearest (x, y) and returns the new point, or nothing when
 /// no curve passes within `within` canvas pixels.
