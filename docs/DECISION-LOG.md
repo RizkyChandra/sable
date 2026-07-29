@@ -1456,6 +1456,97 @@ path to keep in step the day one was wanted.
 
 ---
 
+## D-034 — ICC colour management via lcms2; the display conversion sits above both backends
+
+**Status:** Decided
+**Affects:** `engine/include/sbl/colour.hpp`, `engine/src/colour.cpp`,
+`engine/src/backend.cpp`, `engine/src/project.cpp`, `engine/src/psd.cpp`,
+`engine/src/kra.cpp`, `engine/src/openraster.cpp`, `engine/src/io.cpp`,
+`CMakeLists.txt`
+**Answers:** #53
+**Supersedes:** D-105 (assume sRGB)
+
+D-105 answered "assume sRGB", and answered it deliberately: it made every
+`.sable` manifest record `"colour": {"space": "sRGB"}` so that a future
+ICC-aware Sable could tell v1 files apart. This is that version, and it uses
+the slot D-105 left.
+
+**Little CMS (lcms2) is taken as a dependency, MIT, pinned to the commit
+`lcms2.19.1` names.** D-019 released the resist-dependencies rule and D-020
+explicitly priced "a colour-management library" into what a licence change
+would be worth; MIT costs nothing here and `LICENSE` is unchanged.
+
+Hand-rolled matrix conversions were the alternative and they are genuinely
+cheap: a 3 × 3 and a gamma covers Adobe RGB, Display P3 and ProPhoto, which is
+most of what artists actually carry. They do not cover a profile whose transfer
+curve or gamut mapping is a lookup table — every printer profile, most camera
+profiles, and a good share of what Photoshop embeds. A conversion that is
+silently wrong for those is worse than the sRGB assumption it replaces, because
+the assumption was visible in the manifest and a wrong conversion is not: it
+will be trusted. The pin is a SHA rather than the tag for lodepng's reason —
+two builds of one Sable commit must not convert colour differently.
+
+**The display conversion lives in the free `compositeRect`, above both
+backends, and not inside either of them.** That is the whole answer to "CPU and
+GPU must agree after conversion": there is one conversion, applied to whichever
+backend produced the buffer, so the two cannot drift. A transform written into
+one compositor and forgotten in the other is exactly what `tests/differential.cpp`
+exists to catch, and the cheapest way to pass that test is to make the bug
+unrepresentable rather than to write it twice carefully. It also keeps the
+conversion off `flatten` and `exportPng`, which call the backend member
+directly: an export carries the document's own colour, never the monitor's.
+
+**Untagged means sRGB, and an unset display profile means convert nothing.**
+The engine links no display server (D-003) and no portable API hands over the
+monitor's profile, so guessing sRGB for the display and converting to it would
+change how every existing painting looks on the strength of a guess — the one
+outcome #53 forbids outright. Conversion therefore starts when somebody says
+what the display is: `setDisplayProfile()`, or the `SABLE_DISPLAY_PROFILE`
+environment variable naming an `.icc` file, read once. On a default build the
+display path returns the compositor's bytes untouched, which is not a promise
+about rounding but the absence of any code that could round.
+
+**The manifest gains `colour.profile`, and only a tagged document claims format
+8.** The profile bytes go in the container as `colour.icc`, stored not
+deflated, so `unzip -p x.sable colour.icc` hands a working profile to any
+colour tool; `colour.space` becomes the profile's own description instead of
+the constant "sRGB". An untagged document writes exactly the manifest it wrote
+before, down to the version number — the same conditional bump 16-bit colour
+and layer masks already take, and it earns it more than either: an older Sable
+would open a Display P3 document, read its numbers as sRGB, and write the
+profile away on the next save, so the artist's file quietly becomes a
+differently-coloured one.
+
+**Importers record the profile; they never apply it.** PSD image resource
+1039, Krita's `<document>/annotations/icc`, and the `iCCP` chunk of an ORA or
+KRA `mergedimage.png`. The pixels arrive exactly as the file had them and the
+conversion happens on the way to the screen, because repainting an artist's
+file on open is the one thing an importer must not do. A profile that will not
+parse, or that is not RGB, is dropped with a warning on `doc.warnings` (#40)
+rather than carried to the compositor to fail there once per tile.
+
+**Relative colorimetric with black point compensation**, not perceptual:
+perceptual means something only when the profile carries a perceptual table,
+and lcms2 falls back to colorimetric when it does not — so asking for it buys
+inconsistency between one artist's profile and the next.
+
+**The ceiling, stated.** Sable cannot find the monitor's profile by itself, so
+colour-managed display is opt-in through the environment variable until the
+application grows a setting and a per-monitor lookup (Wayland's
+colour-management protocol, X11's `_ICC_PROFILE`, ColorSync). The conversion is
+also CPU work on the composited tile even when the GPU backend produced it,
+which is a few tenths of a millisecond per dirty tile and is only paid by a
+document that is actually being converted. A 3D LUT baked into the compositing
+shader is the upgrade if that ever shows up in a frame time.
+
+**Alternative rejected — convert on import.** One transform per file and
+nothing in the compositor at all. It is destructive: the artist's numbers are
+replaced by our approximation of them, the original gamut is gone, and saving
+back to PSD hands Photoshop a file that no longer matches. Colour management
+means knowing what the numbers mean, not changing them.
+
+---
+
 ## Open decisions
 
 These blocked the milestone named. They have all been answered — the entries
@@ -1473,7 +1564,7 @@ resolutions, because the questions are the useful part of the record.
 | ~~D-102~~ | Undo memory cap and eviction | **Answered by D-017** — 256 MB, oldest dropped first, stated in the UI |
 | ~~D-103~~ | Stabilizer algorithm | **Pulled-string**, as the leaning said. It holds corners, which a moving average rounds off — and that is what line art cannot afford. See `input.cpp` |
 | ~~D-104~~ | ImGui docking branch: track it, or fixed layout? | **Answered by D-016** — track the branch, pinned to a commit |
-| ~~D-105~~ | Colour management (assume sRGB vs ICC) | **Assume sRGB**, recorded in every `.sable` manifest as `"colour": {"space": "sRGB"}` so a future ICC-aware version can tell v1 files apart |
+| ~~D-105~~ | Colour management (assume sRGB vs ICC) | **Assume sRGB**, recorded in every `.sable` manifest as `"colour": {"space": "sRGB"}` so a future ICC-aware version can tell v1 files apart. **Superseded by D-034**, which is that version and uses that slot |
 | ~~D-106~~ | Packaging: Flatpak, AppImage, distro packages | **Answered by D-018** — AppImage, built from the normal install tree |
 
 ### Note on D-101 — the shortcut references disagree

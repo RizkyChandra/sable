@@ -10,6 +10,8 @@
 #include <system_error>
 #include <vector>
 
+#include "sbl/io.hpp"   // iccProfileFromPng
+
 #include "blit.hpp"
 #include "miniz.h"
 #include "miniz_zip.h"
@@ -243,6 +245,34 @@ struct Importer {
         return out;
     }
 
+    /// Krita's embedded ICC profile (D-034), which it writes to
+    /// `<document>/annotations/icc` — raw profile bytes, no wrapper. Found by
+    /// suffix for the same reason `layerFile` falls back to one: the directory
+    /// is named after whatever the document was called when it was saved.
+    ///
+    /// Falls back to the `iCCP` chunk of `mergedimage.png`, which is where a
+    /// KRA written by something other than Krita is likeliest to have put it.
+    [[nodiscard]] IccProfile icc() const {
+        const mz_uint count = mz_zip_reader_get_num_files(&zip);
+        for (mz_uint i = 0; i < count; ++i) {
+            mz_zip_archive_file_stat stat{};
+            if (!mz_zip_reader_file_stat(&zip, i, &stat)) continue;
+            if (!std::string_view(stat.m_filename).ends_with("/annotations/icc"))
+                continue;
+            std::size_t size = 0;
+            void* data = mz_zip_reader_extract_to_heap(&zip, i, &size, 0);
+            if (data == nullptr) break;
+            IccProfile profile;
+            const auto* bytes = static_cast<const std::uint8_t*>(data);
+            profile.data.assign(bytes, bytes + size);
+            mz_free(data);
+            if (!profile.empty()) return profile;
+            break;
+        }
+        const std::string merged = entry("mergedimage.png");
+        return iccProfileFromPng(merged.data(), merged.size());
+    }
+
     /// The document name in maindoc.xml is normally the directory the layers
     /// live in, but it is written by whoever saved the file. Fall back to a
     /// search so a renamed or oddly-named document still opens.
@@ -438,6 +468,11 @@ std::expected<Document, Error> readKrita(const std::filesystem::path& path) {
                     path.string() + " gives an implausible canvas size");
     doc.dpi = static_cast<std::uint32_t>(
         std::max<std::int32_t>(1, parseInt(image->attributeOr("x-res", "72"))));
+
+    // `colorspacename` above says RGBA — which channels there are, not what
+    // they mean. The profile beside it is what says that (D-034), and Krita
+    // writes one into every document it saves, including its sRGB default.
+    adoptColourProfile(doc, importer.icc());
 
     // Krita's canvas background is a projection colour rather than a layer, and
     // Sable has no equivalent that survives export, so an imported document

@@ -718,6 +718,7 @@ thumbnail.png                          256 px preview for file browsers
 selection.png                          8-bit greyscale coverage mask, when there is one
 layers/<layerId>/tiles/<tx>_<ty>.png   one PNG per non-empty tile, straight alpha
 layers/<layerId>/mask/<tx>_<ty>.png    one PNG per allocated mask tile (D-031)
+colour.icc                             the embedded ICC profile, if any (D-034)
 ```
 
 ```jsonc
@@ -727,6 +728,8 @@ layers/<layerId>/mask/<tx>_<ty>.png    one PNG per allocated mask tile (D-031)
   "width": 1024, "height": 1024, "dpi": 72,
   "background": "#ffffff",
   "tile_size": 256,
+  // "profile" is present only on a tagged document; without it "space" is
+  // exactly "sRGB" and the document is untagged, as every v1 file is.
   "colour": { "depth": 8, "space": "sRGB", "premultiplied": true },
   "layers": [
     { "id": 1, "kind": "raster", "name": "Sketch",
@@ -765,10 +768,12 @@ Rules:
   message rather than reading it wrong. Version 2 added `vanishing_points`,
   version 3 `selection`, version 4 `"kind": "text"` and the `text` object
   beside it, version 5 `"kind": "linework"` and the `linework` object beside
-  it, version 6 16-bit colour, version 7 layer masks. Everything each adds is
-  optional, so v1 to v6 files still load unchanged.
-- **Version 6 is written only by a 16-bit document, and version 7 only by a
-  document with a layer mask.** Every earlier bump was unconditional because
+  it, version 6 16-bit colour, version 7 layer masks, version 8 an embedded ICC
+  profile. Everything each adds is optional, so v1 to v7 files still load
+  unchanged.
+- **Version 6 is written only by a 16-bit document, version 7 only by a
+  document with a layer mask, and version 8 only by one carrying an ICC
+  profile.** Every earlier bump was unconditional because
   each added something an ordinary document might contain; depth and masks are
   per-document choices most documents never make. An 8-bit document with no
   mask keeps declaring 5, so saving from a build that has both does not lock an
@@ -785,6 +790,15 @@ Rules:
 - `colour.depth` is 8 or 16 (D-023). At 16 the tile PNGs are 16 bits per
   channel, which PNG carries natively, so they stay openable in any image
   viewer. Absent, or anything that is not 16, means 8.
+- `colour.profile` names the container entry holding the document's ICC profile,
+  and is always `"colour.icc"` when present (D-034). Absent means untagged,
+  which means sRGB — what every file written before version 8 says, and what a
+  new document still is. `colour.space` is then the profile's own description
+  rather than the constant `"sRGB"` D-105 wrote. The profile is stored, not
+  deflated, so `unzip -p x.sable colour.icc` hands a working profile to any
+  colour tool. A profile that will not parse, or that is not RGB, is dropped
+  with a warning and the document opens as sRGB — never as a canvas holding
+  bytes nothing can build a transform from.
 - `"mask": true` means `selection.png` holds the coverage, one byte per pixel of
   the selection's own w x h. A selection whose mask will not decode, or decodes
   at the wrong size, is DROPPED rather than downgraded to its rectangle: a

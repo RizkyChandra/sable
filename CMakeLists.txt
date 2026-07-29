@@ -118,6 +118,37 @@ add_library(nlohmann_json INTERFACE)
 target_include_directories(nlohmann_json SYSTEM INTERFACE
   ${nlohmann_json_SOURCE_DIR}/single_include)
 
+# Little CMS — ICC colour management (D-034). MIT, so D-020 has nothing to say
+# about it, and D-019 already released the "resist dependencies" rule.
+#
+# Taken rather than hand-rolled: matrix maths covers Adobe RGB and Display P3
+# and nothing else. A profile whose transfer curve is a lookup table — every
+# printer profile, most camera profiles, half of what Photoshop embeds — would
+# come out wrong, and wrong colour that is *presented as managed* is worse than
+# the honest sRGB assumption it replaced, because the artist will trust it.
+#
+# Pinned to the commit the lcms2.19.1 tag points at, not to the tag name: a tag
+# is a movable ref, and two builds of one Sable commit must not convert colour
+# differently. lodepng's `master` pin was treated as a bug for the same reason.
+# SOURCE_SUBDIR skips lcms2's own CMakeLists, which builds a shared library and
+# the command line utilities; Sable wants the sources and the public header.
+FetchContent_Declare(lcms2
+  GIT_REPOSITORY https://github.com/mm2/Little-CMS.git
+  GIT_TAG        21c582a594fe5279f90c0b93437c398f93bf62b0   # lcms2.19.1
+  SOURCE_SUBDIR  do-not-configure)
+FetchContent_MakeAvailable(lcms2)
+
+# GLOB rather than 26 filenames, and safe here for the reason it usually is not:
+# the source tree is pinned to a commit, so the set cannot change under a build
+# without the re-pin that reconfigures anyway. No CONFIGURE_DEPENDS for the same
+# reason — it would re-stat the directory on every single build to catch a
+# change that cannot happen.
+file(GLOB SABLE_LCMS2_SOURCES ${lcms2_SOURCE_DIR}/src/*.c)
+add_library(lcms2 STATIC ${SABLE_LCMS2_SOURCES})
+target_include_directories(lcms2 SYSTEM PUBLIC ${lcms2_SOURCE_DIR}/include)
+target_include_directories(lcms2 PRIVATE ${lcms2_SOURCE_DIR}/src)
+set_target_properties(lcms2 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # --------------------------------------------------------------------- engine
 # D-022: the engine may link SDL3, but never ImGui, and nothing under engine/
 # may open a window, an event queue or an input device. The headless
@@ -137,6 +168,7 @@ cmake_dependent_option(SABLE_GPU "Build the GPU paint backend" ON "SDL3_FOUND" O
 add_library(engine STATIC
   engine/src/backend.cpp
   engine/src/canvas.cpp
+  engine/src/colour.cpp
   engine/src/gpu.cpp
   engine/src/input.cpp
   engine/src/paint.cpp
@@ -151,7 +183,7 @@ add_library(engine STATIC
   engine/src/text.cpp
   engine/src/linework.cpp)
 target_include_directories(engine PUBLIC engine/include)
-target_link_libraries(engine PRIVATE lodepng miniz nlohmann_json stb_truetype)
+target_link_libraries(engine PRIVATE lodepng miniz nlohmann_json stb_truetype lcms2)
 target_compile_options(engine PRIVATE ${SABLE_WARNINGS})
 if(SABLE_GPU)
   target_link_libraries(engine PUBLIC SDL3::SDL3)
@@ -267,8 +299,11 @@ if(SABLE_BUILD_TESTS)
   # differential.cpp is the CPU/GPU harness (#14); it is a suite of its own and
   # tests.cpp is quite long enough.
   add_executable(engine_tests tests/tests.cpp tests/differential.cpp)
+  # lcms2 so the colour tests can BUILD the profiles they convert between —
+  # Adobe RGB and Display P3 are nine numbers each, and nine numbers in the test
+  # say what is being asserted in a way three committed .icc blobs never would.
   target_link_libraries(engine_tests PRIVATE sable::engine doctest lodepng miniz
-                                             nlohmann_json)
+                                             nlohmann_json lcms2)
   # app/src for view_transform.hpp only — the screen<->canvas maths is app-side
   # but SDL-free, and a rotation dropped on one path is not something to check
   # by eye. Nothing else from app/ may be included here (D-003).

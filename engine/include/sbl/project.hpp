@@ -35,7 +35,10 @@ namespace sbl {
 /// the tile PNGs are 16 bits per channel. 6 is the first bump that is NOT
 /// written unconditionally — see below. 7 added layer masks (#48): a `mask`
 /// object on a layer and `layers/<id>/mask/<tx>_<ty>.png` beside its tiles.
-inline constexpr int SABLE_FORMAT_VERSION = 7;
+/// 8 added an embedded ICC profile (D-034): `colour.profile` names a `colour.icc`
+/// entry in the container, and `colour.space` becomes the profile's own
+/// description instead of the constant "sRGB" D-105 wrote.
+inline constexpr int SABLE_FORMAT_VERSION = 8;
 
 /// The newest version a document that uses neither 16-bit colour nor a mask can
 /// declare, which is the newest an older Sable can still read in full.
@@ -62,6 +65,14 @@ inline constexpr int SABLE_FORMAT_VERSION_16BIT = 6;
 /// What a document with a layer mask declares whatever its depth (#48). Above
 /// 6 because a masked 16-bit document needs both, and a version is one number.
 inline constexpr int SABLE_FORMAT_VERSION_MASK = 7;
+
+/// What a document carrying an ICC profile declares (D-034). Conditional for
+/// the same reason as the two above, and it earns it more than either: an older
+/// Sable would open a Display P3 document, treat its numbers as sRGB, and write
+/// the profile away on the next save — the artist's file quietly becomes a
+/// differently-coloured one. A document with no profile is untagged sRGB, which
+/// is what every Sable has always assumed, so it declares nothing new.
+inline constexpr int SABLE_FORMAT_VERSION_ICC = 8;
 
 /// Undo history is deliberately not saved.
 [[nodiscard]] std::expected<void, Error> saveProject(

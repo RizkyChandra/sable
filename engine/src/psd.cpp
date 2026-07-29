@@ -97,6 +97,40 @@ private:
     bool ok_ = true;
 };
 
+// --------------------------------------------------------- image resources
+
+/// The ICC profile out of the image resource section, or nothing (D-034).
+///
+/// Resources are a flat list of `8BIM`, a 16-bit id, a Pascal-string name and a
+/// length, each of the last two padded to an even byte. 1039 is the profile.
+/// The cursor is left at `end` whatever happens: a resource section Sable
+/// cannot walk must not desynchronise the layer section behind it, which is the
+/// whole file. That is why this takes a copy of the cursor rather than the
+/// cursor itself.
+[[nodiscard]] IccProfile readIccResource(Cursor scan, std::size_t end) {
+    while (scan.ok() && scan.pos() + 12 <= end) {
+        if (scan.text(4) != "8BIM") break;
+        const std::uint16_t id = scan.u16();
+
+        const std::uint8_t nameLen = scan.u8();
+        scan.skip(nameLen);
+        if ((nameLen + 1u) % 2u != 0u) scan.skip(1);   // Pascal string, even-padded
+
+        const std::uint32_t size = scan.u32();
+        if (!scan.ok() || size > scan.remaining()) break;
+        if (id == 1039) {
+            const std::uint8_t* data = scan.take(size);
+            if (data == nullptr) break;
+            IccProfile profile;
+            profile.data.assign(data, data + size);
+            return profile;
+        }
+        scan.skip(size);
+        if (size % 2u != 0u) scan.skip(1);             // and so is the payload
+    }
+    return {};
+}
+
 // -------------------------------------------------------------- blend modes
 
 struct BlendKey {
@@ -576,12 +610,24 @@ std::expected<Document, Error> readPsd(const std::filesystem::path& path) {
         return fail(ErrorKind::Malformed, path.string() + " has an implausible canvas size");
 
     in.skip(in.u32());                             // colour mode data
-    in.skip(in.u32());                             // image resources
+
+    // Image resources. Walked for the ICC profile (D-034) and then skipped
+    // wholesale exactly as before, so a resource section this reader cannot
+    // make sense of costs a profile and nothing else.
+    const std::uint32_t resourceLength = in.u32();
+    const std::size_t resourceEnd = in.pos() + std::min<std::size_t>(
+        resourceLength, in.ok() ? in.remaining() : 0);
+    IccProfile embedded = in.ok() ? readIccResource(in, resourceEnd) : IccProfile{};
+    in.skip(resourceLength);
     if (!in.ok()) return fail(ErrorKind::Malformed, path.string() + " is truncated");
 
     Document doc;
     doc.width  = width;
     doc.height = height;
+    // What the file says its numbers mean. Not applied to the pixels: the
+    // document keeps Photoshop's values and the conversion happens on the way
+    // to the screen, so opening a file never repaints it.
+    adoptColourProfile(doc, std::move(embedded));
     // PSD has no document background: whatever backs the artwork is a layer in
     // the file and stays one here, so nothing must be composited underneath or
     // the flattened result stops matching what Photoshop shows.
@@ -1264,6 +1310,24 @@ std::expected<void, Error> writePsd(const Document& doc,
             out.u32(fixed);
             out.u16(1);                               // display unit: inches
             out.u16(1);
+        }
+
+        // And the ICC profile, when the document has one (D-034). Written only
+        // then: an untagged document is sRGB, Photoshop already reads an
+        // untagged PSD as its working space, and adding a resource block to
+        // every export would change files nobody asked to have changed.
+        if (!doc.colourProfile.empty()) {
+            out.text("8BIM");
+            out.u16(1039);                            // ICC profile
+            out.pad(2);                               // empty Pascal name, padded
+            const auto size = static_cast<std::uint32_t>(doc.colourProfile.data.size());
+            out.u32(size);
+            out.out.insert(out.out.end(), doc.colourProfile.data.begin(),
+                           doc.colourProfile.data.end());
+            // Every resource payload is padded to an even length, and a reader
+            // that trusts the spec will be one byte out for the whole rest of
+            // the section without this.
+            if (size % 2u != 0u) out.pad(1);
         }
         out.fillLength(resourcesAt);
     }

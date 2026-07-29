@@ -608,6 +608,10 @@ Document cloneDocument(const Document& doc) {
     // from the one that was lost. Tile::clone() keeps each tile's own depth, so
     // this line is what keeps the document's answer agreeing with theirs.
     copy.depth       = doc.depth;
+    // And for the same reason as the depth above: the autosave worker writes
+    // the manifest from this copy, and a recovery file that lost the profile
+    // would come back as a differently-coloured painting (D-034).
+    copy.colourProfile = doc.colourProfile;
     copy.activeLayer = doc.activeLayer;
     copy.nextLayerId = doc.nextLayerId;
     copy.selection   = doc.selection;
