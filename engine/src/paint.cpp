@@ -32,12 +32,80 @@ constexpr float lerpf(float a, float b, float t) noexcept { return a + (b - a) *
 
 /// Coverage of the pixel at distance `d` from the dab centre. Hard core out to
 /// `inner`, linear falloff to `radius`.
-[[nodiscard]] float coverage(double d, float radius, float hardness) noexcept {
+///
+/// `d` is a float, and is measured in float by the caller. It used to be a
+/// double, which cost the two backends their agreement: `dab.comp` has no
+/// doubles to measure it with, so nearly every partially covered pixel came
+/// out a fraction apart and whichever ones landed near a rounding boundary
+/// tipped. D-025 accepted that as one fringe pixel per stroke; a textured dab
+/// (D-032) multiplies coverage by a mask and so has far more values sitting
+/// near a boundary, which turned it into a whole edge of them. Nothing is lost
+/// by measuring in float: the result is quantised to eight bits either way.
+[[nodiscard]] float coverage(float d, float radius, float hardness) noexcept {
     const float feather = std::max(radius * (1.0f - hardness), kAaWidth);
     const float inner   = std::max(radius - feather, 0.0f);
     if (d <= inner)             return 1.0f;
     if (d >= inner + feather)   return 0.0f;
-    return 1.0f - static_cast<float>(d - inner) / feather;
+    return 1.0f - (d - inner) / feather;
+}
+
+static_assert((MASK_SIZE & (MASK_SIZE - 1)) == 0,
+              "grain tiles the canvas with a bitmask, so the side has to be a power of two");
+
+/// One texel, and zero outside the mask: a stamp has to fade to nothing at its
+/// own border. Clamping the edge row outwards instead would smear whatever
+/// happens to be on the mask's rim along the whole bounding box.
+[[nodiscard]] float maskTexel(const BrushMask& m, std::int32_t x,
+                              std::int32_t y) noexcept {
+    if (x < 0 || y < 0 || x >= MASK_SIZE || y >= MASK_SIZE) return 0.0f;
+    return static_cast<float>(
+        m.coverage[static_cast<std::size_t>(y) * MASK_SIZE + static_cast<std::size_t>(x)]);
+}
+
+/// The stamp's coverage at one pixel, bilinear, in the dab's turned frame.
+///
+/// `float` and not `double`, and every operation in the order `dab.comp`
+/// writes it: this is the one new piece of per-pixel arithmetic both backends
+/// run, and `tests/differential.cpp` allows their alphas to differ by exactly
+/// nothing. Written with `a + (b - a) * t` rather than a `mix`, because GLSL's
+/// `mix` is `x * (1 - a) + y * a` and that is a different rounding.
+[[nodiscard]] float stampCoverage(const BrushMask& m, float dx, float dy, float radius,
+                                  float ca, float sa) noexcept {
+    const float u = (dx * ca + dy * sa) / radius;
+    const float v = (dy * ca - dx * sa) / radius;
+    const float tx = (u * 0.5f + 0.5f) * static_cast<float>(MASK_SIZE) - 0.5f;
+    const float ty = (v * 0.5f + 0.5f) * static_cast<float>(MASK_SIZE) - 0.5f;
+
+    const float fx0 = std::floor(tx);
+    const float fy0 = std::floor(ty);
+    const auto  x0  = static_cast<std::int32_t>(fx0);
+    const auto  y0  = static_cast<std::int32_t>(fy0);
+    const float fx  = tx - fx0;
+    const float fy  = ty - fy0;
+
+    const float top = lerpf(maskTexel(m, x0, y0), maskTexel(m, x0 + 1, y0), fx);
+    const float bot = lerpf(maskTexel(m, x0, y0 + 1), maskTexel(m, x0 + 1, y0 + 1), fx);
+    return lerpf(top, bot, fy) * (1.0f / 255.0f);
+}
+
+/// What grain leaves of a pixel's coverage.
+///
+/// Sampled in CANVAS space, so two dabs that overlap reveal the same tooth in
+/// the same place. Riding with the dab instead would make the texture read as
+/// noise the brush emits rather than as paper it is being dragged across —
+/// and a slow stroke would then average its own noise back to flat.
+///
+/// Nearest, not bilinear: the index is integer on both backends, so there is
+/// no interpolation for a driver to round differently, and grain wants a tooth
+/// rather than a blur anyway.
+[[nodiscard]] float grainFactor(const BrushMask& m, std::int32_t x, std::int32_t y,
+                                float strength) noexcept {
+    const float g =
+        static_cast<float>(m.coverage[static_cast<std::size_t>(y & (MASK_SIZE - 1)) *
+                                          MASK_SIZE +
+                                      static_cast<std::size_t>(x & (MASK_SIZE - 1))]) *
+        (1.0f / 255.0f);
+    return 1.0f - strength * (1.0f - g);
 }
 
 [[nodiscard]] std::uint8_t scale8(std::uint8_t c, float f) noexcept {
@@ -49,16 +117,36 @@ constexpr float lerpf(float a, float b, float t) noexcept { return a + (b - a) *
         std::clamp<long>(std::lround(static_cast<float>(c) * f), 0L, 65535L));
 }
 
+/// Not `noexcept`, unlike everything around it: the registry builds its
+/// built-in masks on first use, and that allocates. It happens once, before
+/// the first dab of the process, and never again — the allocation test
+/// (US-02.9) paints before it starts counting for exactly this kind of reason.
 [[nodiscard]] Dab makeDab(const BrushPreset& p, StraightRgba8 colour,
-                          const InputSample& s) noexcept {
+                          const InputSample& s) {
     Dab d;
     d.x        = s.x;
     d.y        = s.y;
     d.radius   = radiusFor(p, s.pressure);
     d.density  = densityFor(p, s.pressure);
     d.hardness = std::clamp(p.hardness, 0.0f, 1.0f);
-    d.angle    = 0.0f;                     // round brushes only in v1
     d.erase    = p.isEraser;
+
+    // Looked up once per dab rather than once per stroke, because the artist
+    // may edit the preset mid-stroke and `Stroke::preset` is a copy for that
+    // very reason. A miss leaves the pointer null, which is the round,
+    // untextured dab — a preset naming a mask this build does not have has to
+    // paint, not fail.
+    const TextureRegistry& masks = textureRegistry();
+    if (p.shape == ShapeId::Stamp) d.stamp = masks.find(p.stampMask);
+    if (p.texture.has_value() && p.textureStrength > 0.0f) {
+        d.grain         = masks.find(*p.texture);
+        d.grainStrength = std::clamp(p.textureStrength, 0.0f, 1.0f);
+    }
+
+    // A nib points where the pen leans and turns with the barrel; a round dab
+    // has no orientation to get wrong, and leaving it at zero there keeps the
+    // symmetry ruler — which mirrors this angle — doing exactly what it did.
+    d.angle = d.stamp != nullptr ? std::atan2(s.tiltY, s.tiltX) + s.rotation : 0.0f;
 
     // Density is folded into the colour here, not at blend time, so the
     // per-pixel loop stays a multiply and an add.
@@ -87,7 +175,120 @@ constexpr float lerpf(float a, float b, float t) noexcept { return a + (b - a) *
     return s;
 }
 
+// ------------------------------------------------------------------- masks
+
+/// A hash, not a generator: the same texel has to produce the same byte in
+/// every process on every machine, because the GPU backend ships these bytes
+/// to the device and the differential harness then compares the two pixel for
+/// pixel. `<random>`'s distributions are not specified to be portable and its
+/// engines are only portable if you never touch a distribution; this is one
+/// line and has neither problem.
+[[nodiscard]] float hashUnit(std::int32_t x, std::int32_t y) noexcept {
+    std::uint32_t h = static_cast<std::uint32_t>(x) * 0x9E3779B9u ^
+                      static_cast<std::uint32_t>(y) * 0x85EBCA6Bu;
+    h ^= h >> 16;
+    h *= 0x7FEB352Du;
+    h ^= h >> 15;
+    h *= 0x846CA68Bu;
+    h ^= h >> 16;
+    return static_cast<float>(h >> 8) * (1.0f / 16777215.0f);
+}
+
+/// Value noise on a lattice of `cell`-texel squares, WRAPPED at the mask edge.
+///
+/// Wrapped is the whole point: grain is tiled across the canvas, and a mask
+/// whose opposite edges do not meet draws a visible 64-pixel grid over any
+/// wide fill — which is the one artefact a paper texture must not have.
+///
+/// `low` is how dark the deepest pit gets; the peaks always reach 1, so the
+/// texture takes coverage away and never adds it.
+[[nodiscard]] BrushMask noiseMask(std::string name, std::int32_t cell, float low) {
+    BrushMask m;
+    m.name = std::move(name);
+    m.coverage.resize(static_cast<std::size_t>(MASK_SIZE) * MASK_SIZE);
+
+    const std::int32_t lattice = MASK_SIZE / cell;
+    for (std::int32_t y = 0; y < MASK_SIZE; ++y) {
+        for (std::int32_t x = 0; x < MASK_SIZE; ++x) {
+            const std::int32_t gx = x / cell, gy = y / cell;
+            const float tx = static_cast<float>(x % cell) / static_cast<float>(cell);
+            const float ty = static_cast<float>(y % cell) / static_cast<float>(cell);
+            // Smoothstep rather than linear: a linear lattice leaves creases
+            // along its own grid lines, and a grain made of creases is a weave.
+            const float sx = tx * tx * (3.0f - 2.0f * tx);
+            const float sy = ty * ty * (3.0f - 2.0f * ty);
+            const auto at = [&](std::int32_t ix, std::int32_t iy) {
+                return hashUnit(ix % lattice, iy % lattice);
+            };
+            const float top = lerpf(at(gx, gy), at(gx + 1, gy), sx);
+            const float bot = lerpf(at(gx, gy + 1), at(gx + 1, gy + 1), sx);
+            const float v   = lerpf(top, bot, sy);
+            m.coverage[static_cast<std::size_t>(y) * MASK_SIZE +
+                       static_cast<std::size_t>(x)] =
+                static_cast<std::uint8_t>(std::lround(lerpf(low, 1.0f, v) * 255.0f));
+        }
+    }
+    return m;
+}
+
+/// A flat nib: long axis along the mask's x, short across it, so `Dab::angle`
+/// of zero is a horizontal chisel.
+///
+/// Analytic and soft-edged in the mask itself, for two reasons. There is no
+/// mip chain, so a hard edge here crawls when the mask is minified onto a
+/// small brush; and the long axis stops at 0.92 rather than 1.0 so that the
+/// round falloff — which is still what applyDab multiplies this by — does not
+/// clip the tips off the nib at hardness 1.
+[[nodiscard]] BrushMask chiselMask() {
+    constexpr float kLong  = 0.92f;
+    constexpr float kShort = 0.30f;
+    constexpr float kEdge  = 0.10f;   // in the ellipse's own units
+
+    BrushMask m;
+    m.name = "Chisel";
+    m.coverage.resize(static_cast<std::size_t>(MASK_SIZE) * MASK_SIZE);
+    for (std::int32_t y = 0; y < MASK_SIZE; ++y) {
+        for (std::int32_t x = 0; x < MASK_SIZE; ++x) {
+            const float u = (static_cast<float>(x) + 0.5f) * (2.0f / MASK_SIZE) - 1.0f;
+            const float v = (static_cast<float>(y) + 0.5f) * (2.0f / MASK_SIZE) - 1.0f;
+            const float du = u / kLong, dv = v / kShort;
+            const float d  = std::sqrt(du * du + dv * dv);
+            const float cov = std::clamp((1.0f - d) / kEdge, 0.0f, 1.0f);
+            m.coverage[static_cast<std::size_t>(y) * MASK_SIZE +
+                       static_cast<std::size_t>(x)] =
+                static_cast<std::uint8_t>(std::lround(cov * 255.0f));
+        }
+    }
+    return m;
+}
+
 }  // namespace
+
+TextureId TextureRegistry::add(BrushMask mask) {
+    // Sized to fit rather than refused. The dab loop indexes a mask without
+    // checking, and refusing would have to hand back an id that finds nothing
+    // — which the next successful `add` would then quietly give to a different
+    // mask, so a preset holding the old id would paint with the new one.
+    mask.coverage.resize(static_cast<std::size_t>(MASK_SIZE) * MASK_SIZE, 0);
+    masks_.push_back(std::move(mask));
+    return static_cast<TextureId>(masks_.size() - 1);
+}
+
+const BrushMask* TextureRegistry::find(TextureId id) const noexcept {
+    return id < masks_.size() ? &masks_[id] : nullptr;
+}
+
+TextureRegistry& textureRegistry() {
+    static TextureRegistry registry = [] {
+        TextureRegistry r;
+        // The order IS the TEXTURE_/SHAPE_ constants in paint.hpp.
+        r.add(noiseMask("Paper", 2, 0.30f));    // TEXTURE_PAPER
+        r.add(noiseMask("Canvas", 8, 0.20f));   // TEXTURE_CANVAS
+        r.add(chiselMask());                    // SHAPE_CHISEL
+        return r;
+    }();
+    return registry;
+}
 
 // ------------------------------------------------------------------- presets
 
@@ -101,6 +302,11 @@ BrushPreset defaultPencil() {
     p.minDensityRatio = 0.25f;
     p.spacingFactor   = 0.08f;
     p.hardness        = 0.9f;
+    // The tooth is what makes a pencil a pencil: graphite catches the paper's
+    // peaks and skips its pits, so a light pass is broken and a heavy one
+    // fills in. Without it this preset is the opaque brush at another size.
+    p.texture         = TEXTURE_PAPER;
+    p.textureStrength = 0.45f;
     p.pressure        = PressureMapping{.toSize = true, .toDensity = true};
     return p;
 }
@@ -112,6 +318,11 @@ BrushPreset defaultEraser() {
     p.size     = 24.0f;
     p.hardness = 0.8f;
     p.isEraser = true;
+    // Deliberately not the pencil's tooth, which came with the copy above: an
+    // eraser that leaves speckles of the old colour behind reads as a bug, and
+    // "rub harder" is not a fix an artist should have to find.
+    p.texture.reset();
+    p.textureStrength = 0.0f;
     return p;
 }
 
@@ -148,6 +359,11 @@ BrushPreset defaultAirbrush() {
 BrushPreset defaultMarker() {
     // Fixed width, pressure only on density — a marker does not get thinner
     // when you press lightly, it gets fainter.
+    //
+    // A chisel nib, which is what makes it a marker rather than a translucent
+    // pencil: the mark is wide across the stroke and thin along it, and it
+    // turns with the pen. Hardness is 1 because for a stamp the round falloff
+    // is what the mask is cut out of, and a soft one would round the nib off.
     BrushPreset p;
     p.id   = "marker";
     p.name = "Marker";
@@ -155,7 +371,9 @@ BrushPreset defaultMarker() {
     p.density         = 0.55f;
     p.minDensityRatio = 0.4f;
     p.spacingFactor   = 0.05f;
-    p.hardness        = 0.75f;
+    p.hardness        = 1.0f;
+    p.shape           = ShapeId::Stamp;
+    p.stampMask       = SHAPE_CHISEL;
     p.pressure        = PressureMapping{.toSize = false, .toDensity = true};
     return p;
 }
@@ -175,6 +393,10 @@ BrushPreset defaultWatercolour() {
     p.blending        = 0.6f;
     p.dilution        = 0.35f;
     p.persistence     = 0.75f;
+    // Coarse weave, not the pencil's fine tooth: wet media pool in the hollows
+    // of the paper, at a scale you can see from across the room.
+    p.texture         = TEXTURE_CANVAS;
+    p.textureStrength = 0.4f;
     p.pressure        = PressureMapping{.toSize = true, .toDensity = true};
     return p;
 }
@@ -279,6 +501,14 @@ void CpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
     if (dab.colour.a == 0 || dab.radius <= 0.0f) return;
 
     const double r = dab.radius;
+    // Turned once per dab, not once per pixel. The centre goes to float here
+    // for the same reason `coverage` takes one: the shader only ever sees
+    // these two values, so measuring from anything wider measures a different
+    // dab and the two backends stop agreeing.
+    const float ca   = std::cos(dab.angle);
+    const float sa   = std::sin(dab.angle);
+    const float dabX = static_cast<float>(dab.x);
+    const float dabY = static_cast<float>(dab.y);
     const auto lo = [](double v) { return static_cast<std::int32_t>(std::floor(v)); };
     const auto hi = [](double v) { return static_cast<std::int32_t>(std::ceil(v)); };
 
@@ -338,7 +568,7 @@ void CpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
             const PremulRgba8 dab8 = narrow(dab.colour);
 
             for (std::int32_t y = y0; y <= y1; ++y) {
-                const double ddy = (static_cast<double>(y) + 0.5) - dab.y;
+                const float ddy = (static_cast<float>(y) + 0.5f) - dabY;
                 const std::size_t rowAt = static_cast<std::size_t>(y - oy) * TILE_SIZE;
                 for (std::int32_t x = x0; x <= x1; ++x) {
                     // Scaled by the selection, not gated on it: a lasso edge is
@@ -351,10 +581,22 @@ void CpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
                         if (inside == 0) continue;
                         clip = static_cast<float>(inside) * (1.0f / 255.0f);
                     }
-                    const double ddx = (static_cast<double>(x) + 0.5) - dab.x;
+                    const float ddx = (static_cast<float>(x) + 0.5f) - dabX;
                     float cov = coverage(std::sqrt(ddx * ddx + ddy * ddy),
                                          dab.radius, dab.hardness) * clip;
                     if (cov <= 0.0f) continue;
+
+                    // Shape first, then grain — the order dab.comp uses. The
+                    // stamp is a hole cut in the round falloff rather than a
+                    // replacement for it, so hardness keeps meaning what it
+                    // means and the bounding box above stays honest: nothing
+                    // outside `radius` can be reached either way.
+                    if (dab.stamp != nullptr) {
+                        cov *= stampCoverage(*dab.stamp, ddx, ddy, dab.radius, ca, sa);
+                        if (cov <= 0.0f) continue;
+                    }
+                    if (dab.grain != nullptr)
+                        cov *= grainFactor(*dab.grain, x, y, dab.grainStrength);
 
                     if (wide) {
                         PremulRgba16& dst = px16[rowAt + static_cast<std::size_t>(x - ox)];

@@ -33,9 +33,11 @@ against `SHA256SUMS` if you like.
 ### What it does
 
 Paint with a **pencil, opaque brush, airbrush, marker, watercolour or smudge**,
-in 8-bit or 16-bit colour. Pressure from a graphics tablet drives brush size and
-density through a curve you shape yourself, with a stabilizer for steady line
-art.
+in 8-bit or 16-bit colour. They make different marks, not the same mark at
+different settings: the pencil catches paper tooth, the marker lays down a
+chisel nib that turns as you tilt the pen. Pressure from a graphics tablet
+drives brush size and density through a curve you shape yourself, with a
+stabilizer for steady line art.
 
 Work in **layers** — 13 blend modes, clipping, folders, plus text layers you can
 re-edit and linework layers whose curves stay adjustable after you draw them.
@@ -194,8 +196,8 @@ with this codebase instead of guessing at it.
 Browse the [open issues](https://github.com/RizkyChandra/sable/issues). Two in
 particular:
 
-- **[#47 — brush shapes and textures](https://github.com/RizkyChandra/sable/issues/47)** are declared in `BrushPreset` and read by nothing, so every dab is round. Self-contained, a large effect on how the brushes feel, and a good way to learn the dab path.
-- **[#16 — run the stylus spike](https://github.com/RizkyChandra/sable/issues/16).** If you own a graphics tablet you can close the single largest unknown in this project in an afternoon. `docs/USER-STORIES.md` US-00 spells out what to check, and the tablet test pad already displays most of it.
+- **[#16 — run the stylus spike](https://github.com/RizkyChandra/sable/issues/16).** If you own a graphics tablet you can close the single largest unknown in this project in an afternoon. `docs/USER-STORIES.md` US-00 spells out what to check, and the tablet test pad already displays most of it. Brush shape now follows the pen's tilt (D-029) and has been tuned against nothing but synthetic input, so this is more valuable than it was.
+- **A brush editor.** #47 gave the engine stamp shapes and paper grain, and the interface can still only move a strength slider. Choosing a mask, or loading one from an image, is a self-contained piece of work with a visible result.
 
 Reports are as valuable as code. If a `.psd` opens wrong or your tablet behaves
 strangely, that is worth an issue.

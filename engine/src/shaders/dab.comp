@@ -12,18 +12,31 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
+// SPIR-V binding order is SDL_GPU's, as in composite.comp: set 0 read-only
+// storage, set 1 read-write storage, set 2 uniforms.
+//
+// The two brush masks, packed four texels to a uint: the stamp first, then the
+// grain. A storage buffer and not the uniform block, because SDL_gpu.h says in
+// as many words not to put more than "a matrix or so" in a uniform — 8 KiB of
+// mask there paints the wrong picture on radv rather than failing (D-032).
+layout(std430, set = 0, binding = 0) readonly buffer Masks { uint mask[]; };
 layout(std430, set = 1, binding = 0) buffer Arena { uint arena[]; };
 
 const int kMaxDabs = 64;
 
+// paint.hpp MASK_SIZE, and the offset of the grain mask in `mask`.
+const int  kMaskSize  = 64;
+const uint kGrainBase = uint(kMaskSize * kMaskSize) / 4u;
+
 layout(std140, set = 2, binding = 0) uniform Params {
-    // x: dab count, y: arena slot, z: preserveOpacity
+    // x: dab count, y: arena slot, z: preserveOpacity, w: 1 stamp | 2 grain
     uvec4 head;
     // Tile origin in canvas pixels, then the half-open box paint may land in:
     // the canvas clipped by the selection.
     ivec4 origin;
     ivec4 clipBox;
     vec4  geom[kMaxDabs];    // x, y, radius, hardness
+    vec4  turn[kMaxDabs];    // cos(angle), sin(angle), grain strength, -
     uvec4 paint[kMaxDabs];   // x: packed premultiplied colour, y: erase
 } P;
 
@@ -34,6 +47,52 @@ float coverage(float d, float radius, float hardness) {
     if (d <= inner)           return 1.0;
     if (d >= inner + feather) return 0.0;
     return 1.0 - (d - inner) / feather;
+}
+
+// paint.cpp `maskTexel`: zero outside, so a stamp fades at its own border.
+float stampTexel(int x, int y) {
+    if (x < 0 || y < 0 || x >= kMaskSize || y >= kMaskSize) return 0.0;
+    uint i = uint(y) * uint(kMaskSize) + uint(x);
+    return float((mask[i >> 2u] >> (8u * (i & 3u))) & 255u);
+}
+
+float grainTexel(int x, int y) {
+    uint i = uint(y & (kMaskSize - 1)) * uint(kMaskSize) + uint(x & (kMaskSize - 1));
+    return float((mask[kGrainBase + (i >> 2u)] >> (8u * (i & 3u))) & 255u);
+}
+
+// paint.cpp `stampCoverage`, operation for operation. `mix` is deliberately
+// not used: GLSL defines it as x * (1 - a) + y * a and the CPU lerps with
+// a + (b - a) * t, which rounds differently. `precise` for the same reason the
+// compositor uses it — a contracted multiply-add here is a one-step alpha
+// disagreement, and tests/differential.cpp allows none.
+float stampCoverage(float dx, float dy, float radius, float ca, float sa) {
+    precise float u = (dx * ca + dy * sa) / radius;
+    precise float v = (dy * ca - dx * sa) / radius;
+    precise float tx = (u * 0.5 + 0.5) * float(kMaskSize) - 0.5;
+    precise float ty = (v * 0.5 + 0.5) * float(kMaskSize) - 0.5;
+
+    float fx0 = floor(tx);
+    float fy0 = floor(ty);
+    int   x0  = int(fx0);
+    int   y0  = int(fy0);
+    precise float fx = tx - fx0;
+    precise float fy = ty - fy0;
+
+    precise float top = stampTexel(x0, y0) +
+                        (stampTexel(x0 + 1, y0) - stampTexel(x0, y0)) * fx;
+    precise float bot = stampTexel(x0, y0 + 1) +
+                        (stampTexel(x0 + 1, y0 + 1) - stampTexel(x0, y0 + 1)) * fx;
+    precise float cov = (top + (bot - top) * fy) * (1.0 / 255.0);
+    return cov;
+}
+
+// paint.cpp `grainFactor`. Canvas space and nearest, so the index is integer
+// on both sides and there is no interpolation to round differently.
+float grainFactor(int x, int y, float strength) {
+    precise float g = grainTexel(x, y) * (1.0 / 255.0);
+    precise float f = 1.0 - strength * (1.0 - g);
+    return f;
 }
 
 void main() {
@@ -47,6 +106,10 @@ void main() {
     uvec4 start = dst;
 
     bool preserve = P.head.z != 0u;
+    // Per batch, not per dab: a preset's masks cannot change inside a stroke,
+    // and gpu.cpp starts a new batch if they ever do.
+    bool hasStamp = (P.head.w & 1u) != 0u;
+    bool hasGrain = (P.head.w & 2u) != 0u;
     uint count = min(P.head.x, uint(kMaxDabs));
     for (uint i = 0u; i < count; ++i) {
         vec4 g = P.geom[i];
@@ -62,6 +125,14 @@ void main() {
         float ddy = (float(c.y) + 0.5) - g.y;
         float cov = coverage(sqrt(ddx * ddx + ddy * ddy), g.z, g.w);
         if (cov <= 0.0) continue;
+
+        // paint.cpp's order: shape, then grain, then preserveOpacity.
+        vec4 t = P.turn[i];
+        if (hasStamp) {
+            cov *= stampCoverage(ddx, ddy, g.z, t.x, t.y);
+            if (cov <= 0.0) continue;
+        }
+        if (hasGrain) cov *= grainFactor(c.x, c.y, t.z);
         if (preserve) cov *= float(dst.w) / 255.0;
 
         uvec4 col = unpackRgba(P.paint[i].x);

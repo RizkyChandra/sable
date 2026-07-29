@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <deque>
 #include <optional>
 #include <string>
 #include <vector>
@@ -19,13 +20,76 @@ class PaintBackend;
 
 // ------------------------------------------------------------------- brushes
 
-/// Round is the only shape in v1; the enum exists so the stamp path has
-/// somewhere to land.
+/// Round is the analytic falloff in `applyDab`. Stamp cuts that falloff to the
+/// shape of a mask from the registry, turned by `Dab::angle` — so hardness
+/// still owns the dab's edge and the mask owns its outline. A stamp brush
+/// therefore wants a high hardness: at 0.5 the round feather eats the mask's
+/// extremities and a chisel comes out a lens (D-032).
 enum class ShapeId : std::uint8_t { Round, Stamp };
 
-/// Index into the texture registry the app owns. Not a pointer — presets are
-/// serialised, and the registry outlives none of them.
+/// Index into the texture registry. Not a pointer — presets are serialised,
+/// and the registry outlives none of them.
 using TextureId = std::uint32_t;
+
+/// Side of a brush mask, in texels.
+///
+/// 64 because both jobs a mask does have a floor and a ceiling here: grain is
+/// tiled across the CANVAS, so a smaller square reads as a repeating pattern
+/// on a wide flat fill, and the pair in use travels to the GPU on every change
+/// of brush, which a larger one makes a heavier upload (D-032). A power of
+/// two, because tiling grain over the canvas is a bitmask.
+inline constexpr std::int32_t MASK_SIZE = 64;
+
+/// Coverage, 0..255, on a fixed square grid — a dab's own footprint when a
+/// preset names it as a shape, and paper grain when it names it as a texture.
+///
+/// One type for both, because they differ only in the space they are sampled
+/// in: a shape rides with the dab, grain is nailed to the canvas. A second
+/// type would be the same bytes under a different name, and every registry
+/// call site would then have to pick between two of them.
+struct BrushMask {
+    std::string name;
+    /// MASK_SIZE * MASK_SIZE, row-major. Exactly that once the registry has
+    /// taken it — `add` sizes it — so the dab loop indexes it without asking.
+    std::vector<std::uint8_t> coverage;
+};
+
+/// The masks a preset's `TextureId`s name.
+///
+/// Append-only, and entries never move: `Dab` borrows a pointer to a mask for
+/// the length of a stroke, and the paint path may not pay a lookup — or a
+/// lifetime question — per pixel. Adding is a load-time act, not a paint-time
+/// one, so nothing here is synchronised.
+class TextureRegistry {
+public:
+    /// The id the mask can be found under afterwards. A mask of the wrong size
+    /// is padded to fit rather than refused — see the implementation for why
+    /// refusing cannot be done safely with an index for an id.
+    TextureId add(BrushMask mask);
+
+    /// Null for an id nothing was registered under — which is what a preset
+    /// naming a texture this build does not have must degrade to, rather than
+    /// failing to load (DATA-MODEL: "loads with `texture` empty").
+    [[nodiscard]] const BrushMask* find(TextureId id) const noexcept;
+
+    [[nodiscard]] std::size_t size() const noexcept { return masks_.size(); }
+
+private:
+    /// Deque, not vector: `find` hands out pointers that outlive later `add`s.
+    std::deque<BrushMask> masks_;
+};
+
+/// Process-wide, like `paintBackend()`, and carrying the built-ins below from
+/// first use. The app may add its own; the engine needs the same registry to
+/// be reachable from a headless test with no app in the process at all.
+[[nodiscard]] TextureRegistry& textureRegistry();
+
+/// The built-ins, in the order `textureRegistry()` holds them. Generated from
+/// code rather than shipped as images: D-010 forbids anyone else's brush
+/// textures, and a procedural mask is original by construction.
+inline constexpr TextureId TEXTURE_PAPER  = 0;   ///< fine tooth, for dry media
+inline constexpr TextureId TEXTURE_CANVAS = 1;   ///< coarse weave, for wet media
+inline constexpr TextureId SHAPE_CHISEL   = 2;   ///< flat nib, long axis at angle 0
 
 /// Which properties pressure drives. Independently switchable: a marker keeps
 /// a fixed size and varies only density; a lineart pen does the opposite.
@@ -48,8 +112,9 @@ struct BrushPreset {
     float hardness        = 1.0f;    // 0..1; 1 crisp pencil, 0 airbrush falloff
 
     ShapeId shape = ShapeId::Round;
-    std::optional<TextureId> texture;
-    float textureStrength = 0.0f;
+    TextureId stampMask = SHAPE_CHISEL;   // the footprint, when shape is Stamp
+    std::optional<TextureId> texture;     // grain, multiplied into coverage
+    float textureStrength = 0.0f;         // 0..1; 0 leaves coverage untouched
 
     // Watercolour / smudge family only. Unused at Milestone 1.
     float blending    = 0.0f;
@@ -90,6 +155,17 @@ struct Dab {
     /// needs before any of the storage width is worth having.
     PremulRgba16 colour{};
     bool  erase = false;
+
+    /// Resolved once per dab and BORROWED, never owned: the registry only ever
+    /// grows and never moves an entry, so a mask outlives every stroke that
+    /// names it, and the pixel loop pays no lookup. Null is the ordinary case
+    /// — a round dab with no grain — and is also where a preset naming a mask
+    /// this build does not have ends up.
+    const BrushMask* stamp = nullptr;   ///< footprint, in the dab's turned frame
+    const BrushMask* grain = nullptr;   ///< tiled over the CANVAS, not the dab
+    /// 0..1. How much of the grain's shadow is taken out of coverage; 0 is
+    /// exactly the untextured dab, to the bit.
+    float grainStrength = 0.0f;
 };
 
 /// Spacing rule — the single most important line in the engine.

@@ -52,6 +52,9 @@ const std::uint32_t kDabSpv[] =
 constexpr std::size_t kMaxOps   = 192;
 constexpr int         kMaxDepth = 4;
 constexpr std::size_t kMaxDabs  = 64;
+/// One brush mask, one byte a texel. Two of them live in `masks_`, the stamp
+/// first and the grain after it (D-032).
+constexpr std::size_t kMaskBytes = static_cast<std::size_t>(MASK_SIZE) * MASK_SIZE;
 
 /// Tiles the arena holds before it starts evicting. 128 MiB of VRAM, which
 /// covers what a 4000 x 4000 document with a handful of layers actually
@@ -107,10 +110,11 @@ struct CompositeParams {
     std::uint32_t ops[kMaxOps][4];
 };
 struct DabParams {
-    std::uint32_t head[4];             // dabCount, slot, preserveOpacity, -
+    std::uint32_t head[4];             // dabCount, slot, preserveOpacity, maskFlags
     std::int32_t  origin[4];
     std::int32_t  clipBox[4];
     float         geom[kMaxDabs][4];
+    float         turn[kMaxDabs][4];   // cos, sin, grain strength, -
     std::uint32_t paint[kMaxDabs][4];
 };
 
@@ -230,6 +234,7 @@ private:
     bool syncLayer(Layer& layer);
     void reconcile(const Document& doc);
     [[nodiscard]] bool uploadTiles();
+    [[nodiscard]] bool uploadMasks();
     [[nodiscard]] bool downloadSlots(const std::vector<std::uint32_t>& slots,
                                      std::vector<PremulRgba8>& out);
     void submitPending();
@@ -242,6 +247,12 @@ private:
     SDL_GPUComputePipeline* compPipe_   = nullptr;
     SDL_GPUBuffer*          arena_      = nullptr;
     SDL_GPUBuffer*          dest_       = nullptr;
+    SDL_GPUBuffer*          masks_      = nullptr;
+    /// What `masks_` currently holds, compared by pointer only — registry
+    /// entries never move, so identity is enough and no mask is ever uploaded
+    /// twice in a stroke.
+    const BrushMask*        deviceStamp_ = nullptr;
+    const BrushMask*        deviceGrain_ = nullptr;
     SDL_GPUTransferBuffer*  up_         = nullptr;
     SDL_GPUTransferBuffer*  down_       = nullptr;
     std::uint32_t           arenaSlots_ = 0;
@@ -256,6 +267,11 @@ private:
         LayerId      layer = NO_LAYER;
         bool         preserveOpacity = false;
         std::int32_t clip[4]{};
+        /// Borrowed from the registry, and the same for every dab in a batch:
+        /// one pair of masks is on the device at a time, so a dab naming a
+        /// different pair starts a new batch.
+        const BrushMask* stamp = nullptr;
+        const BrushMask* grain = nullptr;
         std::vector<Dab> dabs;
         std::vector<std::pair<TileKey, std::uint32_t>> tiles;
     } batch_;
@@ -276,6 +292,7 @@ GpuBackend::~GpuBackend() {
     if (compPipe_ != nullptr) SDL_ReleaseGPUComputePipeline(dev_, compPipe_);
     if (arena_ != nullptr)    SDL_ReleaseGPUBuffer(dev_, arena_);
     if (dest_ != nullptr)     SDL_ReleaseGPUBuffer(dev_, dest_);
+    if (masks_ != nullptr)    SDL_ReleaseGPUBuffer(dev_, masks_);
     if (up_ != nullptr)       SDL_ReleaseGPUTransferBuffer(dev_, up_);
     if (down_ != nullptr)     SDL_ReleaseGPUTransferBuffer(dev_, down_);
     SDL_DestroyGPUDevice(dev_);
@@ -306,7 +323,8 @@ bool GpuBackend::start(std::string* why) {
 
     compPipe_ = pipeline(kCompositeSpv, sizeof(kCompositeSpv), 1, 1);
     if (compPipe_ == nullptr) return fail("compositing shader");
-    dabPipe_ = pipeline(kDabSpv, sizeof(kDabSpv), 0, 1);
+    // One read-only storage buffer now: the brush masks (D-032).
+    dabPipe_ = pipeline(kDabSpv, sizeof(kDabSpv), 1, 1);
     if (dabPipe_ == nullptr) return fail("dab shader");
 
     SDL_GPUBufferCreateInfo buf{};
@@ -320,6 +338,11 @@ bool GpuBackend::start(std::string* why) {
     buf.size = kChunkSlots * static_cast<Uint32>(kTileBytes8);
     dest_ = SDL_CreateGPUBuffer(dev_, &buf);
     if (dest_ == nullptr) return fail("composite target");
+
+    buf.usage = SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_READ;
+    buf.size  = 2 * static_cast<Uint32>(kMaskBytes);
+    masks_ = SDL_CreateGPUBuffer(dev_, &buf);
+    if (masks_ == nullptr) return fail("brush masks");
 
     SDL_GPUTransferBufferCreateInfo tb{};
     tb.size  = kChunkSlots * static_cast<Uint32>(kTileBytes8);
@@ -507,6 +530,43 @@ bool GpuBackend::uploadTiles() {
     return ok;
 }
 
+bool GpuBackend::uploadMasks() {
+    // Only when they change. A preset's masks are fixed for the length of a
+    // stroke, so this is one small upload per stroke and nothing per dispatch
+    // — which is the whole reason the masks are not simply pushed with the
+    // rest of the parameters.
+    if (batch_.stamp == deviceStamp_ && batch_.grain == deviceGrain_) return true;
+
+    auto* staging = static_cast<std::uint8_t*>(SDL_MapGPUTransferBuffer(dev_, up_, true));
+    if (staging == nullptr) return false;
+    // Every mask is exactly kMaskBytes long — the registry sizes them on the
+    // way in — so nothing here has to check. Absent ones are zeroed rather
+    // than left alone: the shader is told not to read one, but a buffer still
+    // holding the previous stroke's paper is one flag bug away from using it.
+    const auto put = [&](const BrushMask* m, std::size_t at) {
+        if (m != nullptr) std::memcpy(staging + at, m->coverage.data(), kMaskBytes);
+        else              std::memset(staging + at, 0, kMaskBytes);
+    };
+    put(batch_.stamp, 0);
+    put(batch_.grain, kMaskBytes);
+    SDL_UnmapGPUTransferBuffer(dev_, up_);
+
+    SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(dev_);
+    if (cmd == nullptr) return false;
+    SDL_GPUCopyPass* pass = SDL_BeginGPUCopyPass(cmd);
+    const SDL_GPUTransferBufferLocation src{up_, 0};
+    const SDL_GPUBufferRegion dst{masks_, 0, 2 * static_cast<Uint32>(kMaskBytes)};
+    // Cycled: every byte is replaced, and a dispatch from the batch before
+    // this one may still be reading the old contents.
+    SDL_UploadToGPUBuffer(pass, &src, &dst, true);
+    SDL_EndGPUCopyPass(pass);
+    if (!SDL_SubmitGPUCommandBuffer(cmd)) return false;
+
+    deviceStamp_ = batch_.stamp;
+    deviceGrain_ = batch_.grain;
+    return true;
+}
+
 bool GpuBackend::downloadSlots(const std::vector<std::uint32_t>& slots,
                                std::vector<PremulRgba8>& out) {
     out.resize(slots.size() * TILE_PIXELS);
@@ -562,13 +622,27 @@ void GpuBackend::submitPending() {
     DabParams p{};
     p.head[0] = static_cast<std::uint32_t>(batch_.dabs.size());
     p.head[2] = batch_.preserveOpacity ? 1u : 0u;
+    p.head[3] = (batch_.stamp != nullptr ? 1u : 0u) |
+                (batch_.grain != nullptr ? 2u : 0u);
     std::copy(batch_.clip, batch_.clip + 4, p.clipBox);
+    if (!uploadMasks()) {
+        recordFailure(Error{ErrorKind::Io, "could not upload the brush masks: " +
+                                               std::string(SDL_GetError())});
+        batch_.dabs.clear();
+        batch_.tiles.clear();
+        return;
+    }
     for (std::size_t i = 0; i < batch_.dabs.size(); ++i) {
         const Dab& d  = batch_.dabs[i];
         p.geom[i][0]  = static_cast<float>(d.x);
         p.geom[i][1]  = static_cast<float>(d.y);
         p.geom[i][2]  = d.radius;
         p.geom[i][3]  = d.hardness;
+        // Turned on the host, so the shader runs no trigonometry of its own —
+        // one fewer function whose last bit has to match the CPU's.
+        p.turn[i][0]  = std::cos(d.angle);
+        p.turn[i][1]  = std::sin(d.angle);
+        p.turn[i][2]  = d.grainStrength;
         // The shader paints 8-bit tiles, and this narrows to exactly what
         // `CpuBackend::applyDab` narrows the same dab to — which is what keeps
         // tests/differential.cpp inside its ±1 tolerance without touching it.
@@ -581,6 +655,10 @@ void GpuBackend::submitPending() {
         const SDL_GPUStorageBufferReadWriteBinding rw{arena_, false, 0, 0, 0};
         SDL_GPUComputePass* pass = SDL_BeginGPUComputePass(cmd, nullptr, 0, &rw, 1);
         SDL_BindGPUComputePipeline(pass, dabPipe_);
+        // Bound even when neither mask is in use: the pipeline declares the
+        // binding, and an unbound storage buffer is a validation error rather
+        // than an unread one.
+        SDL_BindGPUComputeStorageBuffers(pass, 0, &masks_, 1);
         for (const auto& [key, slot] : batch_.tiles) {
             p.head[1]   = slot;
             p.origin[0] = key.first  * TILE_SIZE;
@@ -652,12 +730,15 @@ void GpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
 
     if (batch_.layer != t.layer.id ||
         batch_.preserveOpacity != t.layer.preserveOpacity ||
+        batch_.stamp != dab.stamp || batch_.grain != dab.grain ||
         !std::equal(clip, clip + 4, batch_.clip) ||
         batch_.dabs.size() >= kMaxDabs) {
         submitPending();
     }
     batch_.layer           = t.layer.id;
     batch_.preserveOpacity = t.layer.preserveOpacity;
+    batch_.stamp           = dab.stamp;
+    batch_.grain           = dab.grain;
     std::copy(clip, clip + 4, batch_.clip);
 
     for (std::int32_t ty = tileIndex(minY); ty <= tileIndex(maxY); ++ty) {

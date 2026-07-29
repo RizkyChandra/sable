@@ -229,14 +229,14 @@ struct Layer {
     /// Set on a Linework layer and on nothing else (D-028), on the same
     /// terms: the tiles are rasterised from these curves.
     std::optional<LineworkContent> linework;
-    /// D-029. Absent means no mask, which is NOT the same as a mask that
+    /// D-031. Absent means no mask, which is NOT the same as a mask that
     /// hides nothing — the second is a channel the artist can paint into.
     /// Legal on any kind, folders included.
     std::optional<LayerMask> mask;
     // Draw order is the Document's vector order, not a field here.
 };
 
-// D-029. Sparse like the pixels, and made of the same tiles: coverage is the
+// D-031. Sparse like the pixels, and made of the same tiles: coverage is the
 // RED channel of an ordinary opaque 8-bit tile, so the brush, the undo
 // snapshot, the tile PNG and the GPU arena slot all serve a mask unchanged.
 // Painting black hides, painting white reveals, and erasing — which takes
@@ -459,6 +459,13 @@ struct Dab {
     /// it away — this is where the banding is made, before storage is reached.
     PremulRgba16 colour{};
     bool  erase = false;       // from BrushPreset::isEraser
+
+    /// Resolved once per dab and borrowed from the registry, which only ever
+    /// grows: the pixel loop pays no lookup and no lifetime question. Null is
+    /// the ordinary round, untextured dab (D-032).
+    const BrushMask* stamp = nullptr;   // footprint, in the dab's turned frame
+    const BrushMask* grain = nullptr;   // tiled over the CANVAS, not the dab
+    float grainStrength = 0.0f;         // 0..1; 0 is the untextured dab exactly
 };
 ```
 
@@ -502,16 +509,35 @@ allocates nothing (D-012).
 
 ## Brushes
 
-`Round` is the only shape in v1; the enum exists so the stamp path has somewhere
-to land. Textures are looked up in a registry the app owns, so a preset that
-names a missing texture loads with `texture` empty rather than failing.
+`Round` is the analytic falloff `applyDab` computes from the distance to the dab
+centre. `Stamp` cuts that falloff to the shape of a mask, turned by `Dab::angle`
+— so hardness still owns the dab's edge and the mask owns its outline (D-032).
+
+Shapes and textures are the same thing sampled in different spaces, and come out
+of the same registry: a shape rides with the dab, a texture is tiled over the
+canvas so overlapping dabs reveal the same tooth. A preset naming a mask this
+build does not have paints a plain round dab rather than failing.
 
 ```cpp
 enum class ShapeId : uint8_t { Round, Stamp };
 
-/// Index into the loaded texture registry. Not a pointer — presets are
-/// serialised, and the registry outlives none of them.
+/// Index into the texture registry. Not a pointer — presets are serialised,
+/// and the registry outlives none of them.
 using TextureId = uint32_t;
+
+/// Coverage, 0..255, on a fixed square grid. 64 on a side: smaller repeats
+/// visibly when grain is tiled across a wide fill, larger strains the transfer
+/// to the GPU.
+inline constexpr int32_t MASK_SIZE = 64;
+
+struct BrushMask {
+    std::string name;
+    std::vector<uint8_t> coverage;   // MASK_SIZE * MASK_SIZE, row-major
+};
+
+/// Process-wide, reached like `paintBackend()`, and append-only: a `Dab`
+/// borrows a pointer to a mask for the length of a stroke.
+TextureRegistry& textureRegistry();
 
 struct BrushPreset {
     std::string id;             // stable slug, used by preset files on disk
@@ -524,9 +550,10 @@ struct BrushPreset {
     float spacingFactor   = 0.1f;   // fraction of diameter
     float hardness        = 1.0f;   // 0..1; 1 crisp pencil, 0 airbrush falloff
 
-    ShapeId shape = ShapeId::Round;         // round, or a stamp image
-    std::optional<TextureId> texture;
-    float textureStrength = 0.0f;
+    ShapeId shape = ShapeId::Round;         // round, or a stamp mask
+    TextureId stampMask = SHAPE_CHISEL;      // which mask, when shape is Stamp
+    std::optional<TextureId> texture;        // grain, multiplied into coverage
+    float textureStrength = 0.0f;            // 0..1; 0 leaves coverage untouched
 
     // Watercolour / smudge family only.
     float blending    = 0.0f;   // 0..1, canvas colour picked up
@@ -690,7 +717,7 @@ document.json                          manifest
 thumbnail.png                          256 px preview for file browsers
 selection.png                          8-bit greyscale coverage mask, when there is one
 layers/<layerId>/tiles/<tx>_<ty>.png   one PNG per non-empty tile, straight alpha
-layers/<layerId>/mask/<tx>_<ty>.png    one PNG per allocated mask tile (D-029)
+layers/<layerId>/mask/<tx>_<ty>.png    one PNG per allocated mask tile (D-031)
 ```
 
 ```jsonc
@@ -814,7 +841,7 @@ Nothing that was listed here is still missing. Layer masks were the last of
 them, and they arrived at format version 7 through exactly the hook this
 section named — the same one perspective rulers (version 2), selection masks
 (version 3), text (version 4), linework (version 5) and 16-bit colour
-(version 6) used. See D-029, and #52 for the other half of the coverage story:
+(version 6) used. See D-031, and #52 for the other half of the coverage story:
 a selection and a mask are the same per-pixel question asked about different
 things, and `maskCoverage()` and `Selection::coverage()` answer it in the same
 units on purpose.
