@@ -113,6 +113,16 @@ void drawIcon(ImDrawList* draw, Icon icon, ImVec2 topLeft, float size, ImU32 col
             break;
         }
 
+        case Icon::Hand:
+            // A palm with three fingers and a thumb: enough of a hand at
+            // sixteen pixels, and nothing at all below that.
+            p.rect(0.34f, 0.46f, 0.72f, 0.86f, 0.08f);
+            p.line(0.40f, 0.48f, 0.40f, 0.22f, 0.08f);
+            p.line(0.53f, 0.48f, 0.53f, 0.14f, 0.08f);
+            p.line(0.66f, 0.48f, 0.66f, 0.24f, 0.08f);
+            p.line(0.34f, 0.62f, 0.18f, 0.50f, 0.08f);
+            break;
+
         case Icon::Wand:
             // A wand on the diagonal with a spark at the tip.
             p.line(0.16f, 0.86f, 0.62f, 0.40f, 0.11f);

@@ -64,7 +64,7 @@ constexpr float kDegToRad      = 3.14159265358979323846f / 180.0f;
 enum class Pending { None, Quit, CloseTab };
 
 enum class Tool { Brush, Eraser, Fill, Select, Lasso, Wand, Transform, Text, Linework,
-                  Gradient };
+                  Gradient, Hand };
 
 /// True for the three tools that build a selection, which share the modifier
 /// keys, the mode setting, and the rule that a click with no drag deselects.
@@ -315,6 +315,16 @@ struct App {
     bool lightTheme      = false;
     bool appliedLight    = false;
     sbl::Transform pendingTransform;   // edited live, applied as one step
+    /// The transform gesture on the canvas. A gesture is the window's, not the
+    /// document's (D-035), which is why these sit here beside the stroke.
+    enum class Grab { None, Move, Scale };
+    Grab   transformGrab   = Grab::None;
+    int    transformCorner = -1;
+    double transformGrabX = 0.0, transformGrabY = 0.0;
+    sbl::Transform transformAtGrab;
+    /// Whether the record on top of the undo stack is this transform's preview,
+    /// and therefore ours to take back before laying down the next one.
+    bool   transformPreviewed = false;
     int undoBudgetMb = 256;            // D-102, mirrored into the document
     char presetName[48] = "My brush";
 
@@ -401,6 +411,7 @@ struct App {
         case Tool::Text:   return "text";
         case Tool::Linework: return "linework";
         case Tool::Gradient: return "gradient";
+        case Tool::Hand:   return "hand";
     }
     return "brush";
 }
@@ -1130,6 +1141,191 @@ void endGradient(App& app, double sx, double sy) {
     app.gradientPreviewed = false;
 }
 
+// ------------------------------------------------------------------ transform
+//
+// The transform used to be three number widgets and an Apply button, which is
+// a description of a transform rather than a way to perform one: an artist who
+// has selected something reaches for it and drags. It now has a box on the
+// canvas with corner handles, and the panel keeps the numbers for the cases a
+// drag is bad at — an exact 90 degrees, a scale of precisely one half.
+//
+// Like the gradient (D-030), the live result goes THROUGH the undo stack: each
+// drag takes the last preview back and lays a new one down, so what the artist
+// is looking at is always a real edit and there is nothing to commit on
+// release. Apply just stops previewing; Escape takes the last one back.
+
+/// The rectangle a transform lifts: the selection, clamped exactly as
+/// `transformRegion` clamps it, so the box drawn here is the box the engine
+/// will actually move.
+[[nodiscard]] bool transformSource(const App& app, double& x0, double& y0,
+                                   double& x1, double& y1) {
+    const sbl::Document& doc = app.cur().doc;
+    if (!doc.selection.has_value() || doc.selection->empty()) return false;
+    const sbl::Selection& s = *doc.selection;
+    x0 = std::max(0, s.x);
+    y0 = std::max(0, s.y);
+    x1 = std::min(doc.width,  s.x + s.w);
+    y1 = std::min(doc.height, s.y + s.h);
+    return x0 < x1 && y0 < y1;
+}
+
+/// Where a source point lands. The same arithmetic `transformRegion` runs, in
+/// the same order: a box drawn from a second version of it would drift from the
+/// pixels the moment either changed.
+[[nodiscard]] std::pair<double, double> transformForward(const sbl::Transform& t,
+                                                         double cx, double cy,
+                                                         double centreX, double centreY) {
+    const double ox = (cx - centreX) * t.scaleX;
+    const double oy = (cy - centreY) * t.scaleY;
+    return {ox * std::cos(t.angle) - oy * std::sin(t.angle) + centreX + t.dx,
+            ox * std::sin(t.angle) + oy * std::cos(t.angle) + centreY + t.dy};
+}
+
+/// The four corners of the transformed box, in canvas pixels, in the order
+/// top-left, top-right, bottom-left, bottom-right.
+[[nodiscard]] std::array<std::pair<double, double>, 4> transformCorners(const App& app) {
+    std::array<std::pair<double, double>, 4> out{};
+    double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
+    if (!transformSource(app, x0, y0, x1, y1)) return out;
+    const double centreX = (x0 + x1) * 0.5;
+    const double centreY = (y0 + y1) * 0.5;
+    for (int corner = 0; corner < 4; ++corner) {
+        out[static_cast<std::size_t>(corner)] =
+            transformForward(app.pendingTransform, (corner & 1) ? x1 : x0,
+                             (corner & 2) ? y1 : y0, centreX, centreY);
+    }
+    return out;
+}
+
+/// Which corner handle the screen point is on, or -1. Measured on SCREEN, so a
+/// handle is the same size to hit at any zoom.
+[[nodiscard]] int transformHandleAt(const App& app, double sx, double sy) {
+    constexpr double kGrabPx = 11.0;
+    const auto corners = transformCorners(app);
+    for (int i = 0; i < 4; ++i) {
+        const auto& [cx, cy] = corners[static_cast<std::size_t>(i)];
+        const double hx = toScreenX(app.cur().view, cx, cy) - sx;
+        const double hy = toScreenY(app.cur().view, cx, cy) - sy;
+        if (hx * hx + hy * hy <= kGrabPx * kGrabPx * app.uiScale * app.uiScale) return i;
+    }
+    return -1;
+}
+
+/// Whether the screen point is inside the transformed box: the point is mapped
+/// BACK through the transform and tested against the source rectangle, which
+/// costs one inverse and works at any rotation.
+[[nodiscard]] bool insideTransformBox(const App& app, double sx, double sy) {
+    double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
+    if (!transformSource(app, x0, y0, x1, y1)) return false;
+    const sbl::Transform& t = app.pendingTransform;
+    const double centreX = (x0 + x1) * 0.5;
+    const double centreY = (y0 + y1) * 0.5;
+    const double px = toCanvasX(app.cur().view, sx, sy) - centreX - t.dx;
+    const double py = toCanvasY(app.cur().view, sx, sy) - centreY - t.dy;
+    const double ux =  px * std::cos(-t.angle) - py * std::sin(-t.angle);
+    const double uy =  px * std::sin(-t.angle) + py * std::cos(-t.angle);
+    const double sxScale = std::abs(t.scaleX) < 1e-6 ? 1e-6 : t.scaleX;
+    const double syScale = std::abs(t.scaleY) < 1e-6 ? 1e-6 : t.scaleY;
+    const double bx = ux / sxScale + centreX;
+    const double by = uy / syScale + centreY;
+    return bx >= x0 && bx <= x1 && by >= y0 && by <= y1;
+}
+
+/// Lays the pending transform down, taking the previous preview back first.
+void previewTransform(App& app) {
+    if (app.transformPreviewed) {
+        syncTextures(app, app.cur().doc.undo.undo(app.cur().doc));
+        app.transformPreviewed = false;
+    }
+    if (!app.cur().doc.selection.has_value() || app.cur().doc.selection->empty()) return;
+
+    sbl::UndoRecord rec = sbl::transformRegion(app.cur().doc, app.cur().doc.activeLayer,
+                                               *app.cur().doc.selection,
+                                               app.pendingTransform);
+    if (rec.empty()) return;
+    for (const auto& snap : rec.tiles) app.cur().canvas->markDirty(snap.key);
+    app.cur().doc.undo.push(std::move(rec));
+    app.transformPreviewed = true;
+    app.cur().doc.dirty = true;
+}
+
+/// Keeps the last preview and stops transforming. Nothing is written here: the
+/// preview on the stack IS the edit.
+void applyTransform(App& app) {
+    app.pendingTransform   = sbl::Transform{};
+    app.transformPreviewed = false;
+    app.transformGrab      = App::Grab::None;
+}
+
+/// Takes the preview back and forgets the transform.
+void cancelTransform(App& app) {
+    if (app.transformPreviewed) {
+        syncTextures(app, app.cur().doc.undo.undo(app.cur().doc));
+        app.transformPreviewed = false;
+    }
+    app.pendingTransform = sbl::Transform{};
+    app.transformGrab    = App::Grab::None;
+}
+
+/// A press inside the box moves it, a press on a corner scales it. A press
+/// anywhere else is not a transform at all and leaves the tool alone.
+bool beginTransformDrag(App& app, double sx, double sy) {
+    double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
+    if (!transformSource(app, x0, y0, x1, y1)) return false;
+
+    const int handle = transformHandleAt(app, sx, sy);
+    if (handle < 0 && !insideTransformBox(app, sx, sy)) return false;
+
+    app.transformGrab    = handle >= 0 ? App::Grab::Scale : App::Grab::Move;
+    app.transformCorner  = handle;
+    app.transformGrabX   = toCanvasX(app.cur().view, sx, sy);
+    app.transformGrabY   = toCanvasY(app.cur().view, sx, sy);
+    app.transformAtGrab  = app.pendingTransform;
+    return true;
+}
+
+void dragTransform(App& app, double sx, double sy) {
+    if (app.transformGrab == App::Grab::None) return;
+    double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
+    if (!transformSource(app, x0, y0, x1, y1)) return;
+
+    const double cx = toCanvasX(app.cur().view, sx, sy);
+    const double cy = toCanvasY(app.cur().view, sx, sy);
+
+    if (app.transformGrab == App::Grab::Move) {
+        app.pendingTransform.dx = app.transformAtGrab.dx + (cx - app.transformGrabX);
+        app.pendingTransform.dy = app.transformAtGrab.dy + (cy - app.transformGrabY);
+    } else {
+        // Scaled about the region's centre, which is what the engine turns
+        // about too, so a corner follows the pointer instead of sliding away
+        // from it. The reach at the moment of the grab is the unit: a pointer
+        // twice as far out is twice the size.
+        const double centreX = (x0 + x1) * 0.5 + app.transformAtGrab.dx;
+        const double centreY = (y0 + y1) * 0.5 + app.transformAtGrab.dy;
+        const double wasX = app.transformGrabX - centreX;
+        const double wasY = app.transformGrabY - centreY;
+        // A corner grabbed almost exactly on the centre line has no reach to
+        // measure a ratio against; leave that axis alone rather than divide by
+        // very nearly nothing and send the region to the horizon.
+        if (std::abs(wasX) > 1.0)
+            app.pendingTransform.scaleX = app.transformAtGrab.scaleX * ((cx - centreX) / wasX);
+        if (std::abs(wasY) > 1.0)
+            app.pendingTransform.scaleY = app.transformAtGrab.scaleY * ((cy - centreY) / wasY);
+        // Shift keeps it square, the way it does everywhere else.
+        if ((SDL_GetModState() & SDL_KMOD_SHIFT) != 0) {
+            const double uniform = std::abs(app.pendingTransform.scaleX) >
+                                           std::abs(app.pendingTransform.scaleY)
+                                       ? app.pendingTransform.scaleX
+                                       : app.pendingTransform.scaleY;
+            app.pendingTransform.scaleX = uniform;
+            app.pendingTransform.scaleY = uniform;
+        }
+    }
+    previewTransform(app);
+}
+
+void endTransformDrag(App& app) { app.transformGrab = App::Grab::None; }
+
 /// Shift adds, Alt subtracts, both intersect — the modifiers every other
 /// painting application uses, over whatever the panel is set to. Read once, at
 /// pen-down, so a drag means one thing from start to finish.
@@ -1401,6 +1597,10 @@ void settleGestures(App& app) {
     endSelectDrag(app, mx, my);
     lineworkRelease(app);
     endGradient(app, mx, my);
+    // The preview stays where it is, on the stack of the document it belongs
+    // to; only the gesture ends. Taking it back here would undo an edit the
+    // artist can see, in a tab they are leaving.
+    applyTransform(app);
     endPaint(app);
 }
 
@@ -1775,6 +1975,21 @@ void handleKey(App& app, const SDL_KeyboardEvent& key) {
         return;
     }
 
+    // Enter settles a transform and Escape takes it back — the two keys every
+    // other application uses for it, and the answer to "how do I finish this".
+    // Ahead of the bindings below so they mean this while a transform is live,
+    // and nothing at all when one is not.
+    if (app.tool == Tool::Transform) {
+        if (key.key == SDLK_RETURN || key.key == SDLK_KP_ENTER) {
+            applyTransform(app);
+            return;
+        }
+        if (key.key == SDLK_ESCAPE && app.rebinding == Action::Count) {
+            cancelTransform(app);
+            return;
+        }
+    }
+
     // Capturing a new binding takes priority over triggering the old one.
     if (app.rebinding != Action::Count) {
         if (key.key == SDLK_ESCAPE) { app.rebinding = Action::Count; return; }
@@ -1882,6 +2097,11 @@ void handleKey(App& app, const SDL_KeyboardEvent& key) {
             app.perspective.enabled = !app.perspective.enabled;
             break;
 
+        case Action::ToolHand:
+            app.cur().text.finish(app.window, app.cur().doc);
+            app.tool = Tool::Hand;
+            break;
+
         case Action::GettingStarted:
             app.showTutorial = !app.showTutorial;
             if (app.showTutorial) app.tutorialStep = 0;
@@ -1968,6 +2188,15 @@ void handleEvent(App& app, const SDL_Event& e) {
         case SDL_EVENT_PEN_DOWN:
             app.penSeen = true;
             app.activePen = e.ptouch.which;
+            // The hand pans with a stylus as well as a mouse: on a tablet it
+            // is the ONLY way to pan, since there is no middle button to hold
+            // and no second hand free for the space bar.
+            if (app.tool == Tool::Hand && overCanvas(app, e.ptouch.x, e.ptouch.y) &&
+                !ImGui::GetIO().WantCaptureMouse) {
+                app.panning    = true;
+                app.panAnchorX = e.ptouch.x - app.cur().view.panX;
+                app.panAnchorY = e.ptouch.y - app.cur().view.panY;
+            }
             // Before the guard below, which is what this makes truthful: the
             // tip IS ImGui's left button, or a menu can only be opened with a
             // mouse. Fed rather than left to SDL's synthetic mouse events,
@@ -2006,6 +2235,10 @@ void handleEvent(App& app, const SDL_Event& e) {
                 beginSelectDrag(app, e.ptouch.x, e.ptouch.y);
                 break;
             }
+            if (app.tool == Tool::Transform) {
+                beginTransformDrag(app, e.ptouch.x, e.ptouch.y);
+                break;
+            }
             beginPaint(app);
             holdPen(app, e.ptouch.which, e.ptouch.x, e.ptouch.y, true);
             break;
@@ -2013,6 +2246,12 @@ void handleEvent(App& app, const SDL_Event& e) {
         case SDL_EVENT_PEN_MOTION:
             app.activePen = e.pmotion.which;
             ++app.motionThisFrame;
+            if (app.panning) {
+                app.cur().view.panX = e.pmotion.x - app.panAnchorX;
+                app.cur().view.panY = e.pmotion.y - app.panAnchorY;
+                ImGui::GetIO().AddMousePosEvent(e.pmotion.x, e.pmotion.y);
+                break;
+            }
             // ImGui's SDL3 backend has no pen handling, and the synthetic mouse
             // events it would otherwise have learned from are off at startup so
             // that a stroke is not painted twice. Left alone, `WantCaptureMouse`
@@ -2029,11 +2268,14 @@ void handleEvent(App& app, const SDL_Event& e) {
                 dragSelection(app, e.pmotion.x, e.pmotion.y);
             else if (app.gradientDragging)
                 previewGradient(app, e.pmotion.x, e.pmotion.y);
+            else if (app.transformGrab != App::Grab::None)
+                dragTransform(app, e.pmotion.x, e.pmotion.y);
             else if (app.cur().linework.busy() || app.painting)
                 holdPen(app, e.pmotion.which, e.pmotion.x, e.pmotion.y, false);
             break;
 
         case SDL_EVENT_PEN_UP:
+            app.panning = false;
             // Released whatever it landed on, always: a button whose press
             // ImGui saw and whose release it did not stays held for the rest
             // of the session.
@@ -2042,6 +2284,7 @@ void handleEvent(App& app, const SDL_Event& e) {
             endSelectDrag(app, e.ptouch.x, e.ptouch.y);
             lineworkRelease(app);
             endGradient(app, e.ptouch.x, e.ptouch.y);
+            endTransformDrag(app);
             endPaint(app);
             break;
 
@@ -2054,7 +2297,8 @@ void handleEvent(App& app, const SDL_Event& e) {
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
             if (io.WantCaptureMouse || !overCanvas(app, e.button.x, e.button.y)) break;
             if (e.button.button == SDL_BUTTON_MIDDLE ||
-                (e.button.button == SDL_BUTTON_LEFT && app.spaceHeld)) {
+                (e.button.button == SDL_BUTTON_LEFT &&
+                 (app.spaceHeld || app.tool == Tool::Hand))) {
                 app.panning    = true;
                 // Screen space on both sides, so this stays right at any
                 // rotation: pan translates the whole mapping, it does not
@@ -2081,6 +2325,10 @@ void handleEvent(App& app, const SDL_Event& e) {
                     beginGradient(app, e.button.x, e.button.y);
                 } else if (selectsRegion(app.tool)) {
                     beginSelectDrag(app, e.button.x, e.button.y);
+                } else if (app.tool == Tool::Transform) {
+                    beginTransformDrag(app, e.button.x, e.button.y);
+                } else if (app.tool == Tool::Hand) {
+                    // The press already started the pan above.
                 } else {
                     beginPaint(app);
                     paintWith(app, mouseSample(app, e.button.x, e.button.y));
@@ -2103,6 +2351,8 @@ void handleEvent(App& app, const SDL_Event& e) {
                 lineworkDrag(app, e.motion.x, e.motion.y, 1.0f);
             } else if (app.gradientDragging) {
                 previewGradient(app, e.motion.x, e.motion.y);
+            } else if (app.transformGrab != App::Grab::None) {
+                dragTransform(app, e.motion.x, e.motion.y);
             } else if (app.painting) {
                 paintWith(app, mouseSample(app, e.motion.x, e.motion.y));
             }
@@ -2117,6 +2367,7 @@ void handleEvent(App& app, const SDL_Event& e) {
                 endSelectDrag(app, e.button.x, e.button.y);
                 lineworkRelease(app);
                 endGradient(app, e.button.x, e.button.y);
+                endTransformDrag(app);
                 endPaint(app);
             }
             break;
@@ -2155,6 +2406,11 @@ void buildDefaultLayout(ImGuiID dockspace) {
     ImGui::DockBuilderSetNodeSize(dockspace, ImGui::GetMainViewport()->WorkSize);
 
     ImGuiID centre = dockspace;
+    // The options bar first, so it spans the whole width the way Photoshop's
+    // and Clip Studio's do — split off the panels and it would only ever be as
+    // wide as the canvas.
+    const ImGuiID top   = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Up, 0.055f,
+                                                      nullptr, &centre);
     const ImGuiID left  = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Left, 0.18f,
                                                       nullptr, &centre);
     ImGuiID right = ImGui::DockBuilderSplitNode(centre, ImGuiDir_Right, 0.24f,
@@ -2162,6 +2418,7 @@ void buildDefaultLayout(ImGuiID dockspace) {
     const ImGuiID rightLower = ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.45f,
                                                            nullptr, &right);
 
+    ImGui::DockBuilderDockWindow("Tool options", top);
     ImGui::DockBuilderDockWindow("Tools",  left);
     ImGui::DockBuilderDockWindow("Colour", right);
     ImGui::DockBuilderDockWindow("Layers", rightLower);
@@ -2212,9 +2469,17 @@ void drawTabStrip(App& app) {
         if (!stayOpen) closeRequest = i;
     }
     ImGui::EndTabBar();
+    const bool pushed = app.tabStripFollow;
     app.tabStripFollow = false;
 
-    switchToDocument(app, selected);
+    // Not on the frame a switch was pushed INTO the bar. ImGui decides which
+    // tab is visible in BeginTabBar, from the state it had last frame, so a
+    // tab that has just been added reads as not-selected however loudly
+    // SetSelected is asked for — and taking that answer switches straight back
+    // to the document the new tab replaced, for exactly one frame. That frame
+    // is the flicker of the previous drawing an artist sees when they open a
+    // file or press New.
+    if (!pushed) switchToDocument(app, selected);
     if (closeRequest < app.docs.size()) requestClose(app, closeRequest);
 }
 
@@ -2469,6 +2734,164 @@ void drawMenuBar(App& app, float& menuHeight) {
     ImGui::EndMainMenuBar();
 }
 
+/// The options bar: what the ACTIVE tool can be set to, and a line saying how
+/// to work it, across the top where Photoshop and Clip Studio both put it.
+///
+/// They put it there because it answers the question a tool raises at the
+/// moment it is chosen, in the place the eye already is — the artist has just
+/// clicked the tool, and the tool's own settings appear next to where they
+/// clicked rather than three panels down a column shared with the brush. The
+/// hint line is the other half: "Select and Transform are confusing, they do
+/// not know how to work on it" is a report about discoverability, and no
+/// arrangement of sliders fixes it on its own.
+void drawToolOptions(App& app) {
+    if (!ImGui::Begin("Tool options")) { ImGui::End(); return; }
+
+    // One line, in the reading order of a sentence: what the tool is, what it
+    // is set to, then how to use it.
+    const auto hint = [](const char* text) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("|");
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", text);
+    };
+    const auto slider = [&](const char* id, int* value, const char* format) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(180.0f * app.uiScale);
+        ImGui::SliderInt(id, value, 0, 128, format);
+    };
+
+    switch (app.tool) {
+        case Tool::Brush:
+        case Tool::Eraser:
+            ImGui::TextUnformatted(app.tool == Tool::Brush ? "Brush" : "Eraser");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(200.0f * app.uiScale);
+            ImGui::SliderFloat("##optsize", &activeBrush(app).size, 1.0f, 256.0f,
+                               "size %.0f px", ImGuiSliderFlags_Logarithmic);
+            hint("[ and ] step the size. Draw on the canvas; pressure varies the mark.");
+            break;
+
+        case Tool::Fill:
+            ImGui::TextUnformatted("Fill");
+            slider("##opttol", &app.fillTolerance, "tolerance %d");
+            hint("Click a region. Tolerance is how different a neighbouring "
+                 "colour may be and still count as the same region.");
+            break;
+
+        case Tool::Gradient:
+            ImGui::TextUnformatted("Gradient");
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Linear", app.gradientShape == sbl::GradientShape::Linear))
+                app.gradientShape = sbl::GradientShape::Linear;
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Radial", app.gradientShape == sbl::GradientShape::Radial))
+                app.gradientShape = sbl::GradientShape::Radial;
+            ImGui::SameLine();
+            ImGui::Checkbox("To transparent", &app.gradientToTransparent);
+            if (app.cur().doc.depth == sbl::ColourDepth::Bits8) {
+                ImGui::SameLine();
+                ImGui::Checkbox("Dither", &app.gradientDither);
+            }
+            hint("Drag across the canvas to set the axis. It ramps from the "
+                 "foreground colour to the background one.");
+            break;
+
+        case Tool::Select:
+        case Tool::Lasso:
+        case Tool::Wand: {
+            ImGui::TextUnformatted(app.tool == Tool::Select ? "Rectangle select"
+                                   : app.tool == Tool::Lasso ? "Lasso"
+                                                             : "Magic wand");
+            // Buttons as well as modifier keys. The keyboard is the only
+            // accessibility affordance Sable has (PRD §6), so a mode reachable
+            // only by holding Shift while dragging is a mode some users do not
+            // have.
+            const auto modeButton = [&](const char* label, sbl::SelectMode mode) {
+                ImGui::SameLine();
+                if (ImGui::RadioButton(label, app.selectMode == mode))
+                    app.selectMode = mode;
+            };
+            modeButton("Replace",   sbl::SelectMode::Replace);
+            modeButton("Add",       sbl::SelectMode::Add);
+            modeButton("Subtract",  sbl::SelectMode::Subtract);
+            modeButton("Intersect", sbl::SelectMode::Intersect);
+            if (app.tool == Tool::Wand) slider("##optwand", &app.wandTolerance, "tolerance %d");
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!app.cur().doc.selection.has_value());
+            if (ImGui::Button("Deselect")) app.cur().doc.selection.reset();
+            ImGui::EndDisabled();
+            hint(app.tool == Tool::Wand
+                     ? "Click a region to select it. Shift adds to the selection, "
+                       "Alt takes away."
+                     : "Drag on the canvas to select. Shift adds to the selection, "
+                       "Alt takes away. Then paint, fill or transform inside it.");
+            break;
+        }
+
+        case Tool::Transform: {
+            ImGui::TextUnformatted("Transform");
+            if (!app.cur().doc.selection.has_value() || app.cur().doc.selection->empty()) {
+                hint("Select something first: this moves what is inside a "
+                     "selection, on the active layer.");
+                break;
+            }
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(150.0f * app.uiScale);
+            if (ImGui::DragScalarN("##move", ImGuiDataType_Double,
+                                   &app.pendingTransform.dx, 2, 0.5f, nullptr, nullptr,
+                                   "%.0f"))
+                previewTransform(app);
+            ImGui::SameLine();
+            ImGui::TextDisabled("move");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(150.0f * app.uiScale);
+            if (ImGui::DragScalarN("##scale", ImGuiDataType_Double,
+                                   &app.pendingTransform.scaleX, 2, 0.01f, nullptr,
+                                   nullptr, "%.2f"))
+                previewTransform(app);
+            ImGui::SameLine();
+            ImGui::TextDisabled("scale");
+
+            auto degrees = static_cast<float>(app.pendingTransform.angle * 180.0 /
+                                              3.14159265358979323846);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(150.0f * app.uiScale);
+            if (ImGui::SliderFloat("##rot", &degrees, -180.0f, 180.0f, "%.0f deg")) {
+                app.pendingTransform.angle =
+                    static_cast<double>(degrees) * 3.14159265358979323846 / 180.0;
+                previewTransform(app);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Apply")) applyTransform(app);
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) cancelTransform(app);
+            hint("Drag inside the box to move it, a corner to scale. "
+                 "Enter applies, Escape cancels.");
+            break;
+        }
+
+        case Tool::Hand:
+            ImGui::TextUnformatted("Hand");
+            hint("Drag to move the canvas around. Holding space does the same "
+                 "with any tool, and the wheel zooms.");
+            break;
+
+        case Tool::Text:
+            ImGui::TextUnformatted("Text");
+            hint("Click where the words should start, then type. The panel on "
+                 "the left picks the font.");
+            break;
+
+        case Tool::Linework:
+            ImGui::TextUnformatted("Linework");
+            hint("Draw a stroke and it becomes a curve you can re-shape "
+                 "afterwards. The panel on the left has the rest.");
+            break;
+    }
+    ImGui::End();
+}
+
 void drawToolPanel(App& app) {
     if (ImGui::Begin("Tools")) {
         ImGui::TextDisabled("TOOL");
@@ -2494,6 +2917,7 @@ void drawToolPanel(App& app) {
         toolRow(Icon::Transform, "Transform", Tool::Transform, Action::ToolTransform);
         toolRow(Icon::Text,      "Text",      Tool::Text,      Action::ToolText);
         toolRow(Icon::Linework,  "Linework",  Tool::Linework,  Action::ToolLinework);
+        toolRow(Icon::Hand,      "Hand",      Tool::Hand,      Action::ToolHand);
 
         if (app.tool == Tool::Text) {
             app.cur().text.drawPanel(app.cur().doc);
@@ -2507,84 +2931,6 @@ void drawToolPanel(App& app) {
             app.cur().linework.colour = app.foreground;
             app.cur().linework.drawPanel(app.cur().doc);
             syncTextures(app, app.cur().linework.takeChanged());
-        }
-
-        if (app.tool == Tool::Transform) {
-            if (!app.cur().doc.selection.has_value() || app.cur().doc.selection->empty()) {
-                ImGui::TextDisabled("Select a region first.");
-            } else {
-                ImGui::SetNextItemWidth(-1.0f);
-                ImGui::DragScalarN("##move", ImGuiDataType_Double,
-                                   &app.pendingTransform.dx, 2, 0.5f);
-                ImGui::TextDisabled("offset x, y");
-                ImGui::SetNextItemWidth(-1.0f);
-                ImGui::DragScalarN("##scale", ImGuiDataType_Double,
-                                   &app.pendingTransform.scaleX, 2, 0.01f);
-                ImGui::TextDisabled("scale x, y");
-
-                auto degrees = static_cast<float>(app.pendingTransform.angle * 180.0 / 3.14159265358979323846);
-                ImGui::SetNextItemWidth(-1.0f);
-                if (ImGui::SliderFloat("##rot", &degrees, -180.0f, 180.0f, "%.1f deg"))
-                    app.pendingTransform.angle =
-                        static_cast<double>(degrees) * 3.14159265358979323846 / 180.0;
-
-                if (ImGui::Button("Apply", ImVec2(-1.0f, 0.0f))) {
-                    sbl::UndoRecord rec = sbl::transformRegion(
-                        app.cur().doc, app.cur().doc.activeLayer, *app.cur().doc.selection,
-                        app.pendingTransform);
-                    if (!rec.empty()) {
-                        app.cur().canvas->releaseAll();
-                        app.cur().doc.undo.push(std::move(rec));
-                        app.cur().doc.dirty = true;
-                    }
-                    app.pendingTransform = sbl::Transform{};
-                }
-                if (ImGui::Button("Reset", ImVec2(-1.0f, 0.0f)))
-                    app.pendingTransform = sbl::Transform{};
-            }
-        }
-
-        if (app.tool == Tool::Fill) {
-            ImGui::SetNextItemWidth(-1.0f);
-            ImGui::SliderInt("##tol", &app.fillTolerance, 0, 128, "tolerance %d");
-        }
-        if (app.tool == Tool::Gradient) {
-            if (ImGui::RadioButton("Linear", app.gradientShape == sbl::GradientShape::Linear))
-                app.gradientShape = sbl::GradientShape::Linear;
-            if (ImGui::RadioButton("Radial", app.gradientShape == sbl::GradientShape::Radial))
-                app.gradientShape = sbl::GradientShape::Radial;
-            ImGui::Checkbox("To transparent", &app.gradientToTransparent);
-            if (app.cur().doc.depth == sbl::ColourDepth::Bits8) {
-                ImGui::Checkbox("Dither", &app.gradientDither);
-                ImGui::TextDisabled("breaks up 8-bit banding");
-            } else {
-                // Said rather than hidden: the checkbox vanishing without a
-                // word reads as a missing feature, not as one that has nothing
-                // left to do.
-                ImGui::TextDisabled("16-bit: no dither needed");
-            }
-            ImGui::TextDisabled("drag to set the axis");
-        }
-        if (selectsRegion(app.tool)) {
-            if (app.tool == Tool::Wand) {
-                ImGui::SetNextItemWidth(-1.0f);
-                ImGui::SliderInt("##wandtol", &app.wandTolerance, 0, 128, "tolerance %d");
-            }
-            // Buttons as well as modifier keys. The keyboard is the only
-            // accessibility affordance Sable has (PRD §6), so a mode that can
-            // only be reached by holding Shift while dragging is a mode some
-            // users do not have.
-            ImGui::TextDisabled("MODE");
-            const auto modeRow = [&](const char* label, sbl::SelectMode mode) {
-                if (ImGui::RadioButton(label, app.selectMode == mode))
-                    app.selectMode = mode;
-            };
-            modeRow("Replace",        sbl::SelectMode::Replace);
-            modeRow("Add (Shift)",    sbl::SelectMode::Add);
-            modeRow("Subtract (Alt)", sbl::SelectMode::Subtract);
-            modeRow("Intersect",      sbl::SelectMode::Intersect);
-            if (app.cur().doc.selection.has_value() &&
-                ImGui::SmallButton("Deselect")) app.cur().doc.selection.reset();
         }
 
         ImGui::Spacing();
@@ -2728,6 +3074,68 @@ void pushLayerAction(App& app, sbl::UndoRecord&& rec) {
     app.cur().doc.dirty = true;
 }
 
+/// A layer's own pixels, small, beside its name.
+///
+/// Sampled straight out of the tiles into a grid of squares rather than built
+/// as a texture: at this size the picture IS a grid of squares, and a texture
+/// per layer would need a cache, an invalidation rule and a lifetime tied to
+/// the renderer — three things to get wrong for an image 22 pixels across.
+/// Nearest sampling, no compositing: a thumbnail answers "which layer is this",
+/// and the layer's own contents answer it better than the stack does.
+///
+/// ponytail: kSide^2 samples per visible layer per frame. Ten layers is 2,500
+/// tile lookups, which is nothing next to a frame; if a document ever carries
+/// hundreds, cache by `Tile::stamp()` before reaching for anything cleverer.
+void drawLayerThumbnail(App& app, const sbl::Layer& layer) {
+    constexpr int kSide = 11;
+    const float box  = ImGui::GetFrameHeight() * 1.6f;
+    const float cell = box / static_cast<float>(kSide);
+    const ImVec2 at  = ImGui::GetCursorScreenPos();
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+
+    // The checkerboard first, so transparency reads as transparency rather
+    // than as black paint.
+    for (int y = 0; y < kSide; ++y) {
+        for (int x = 0; x < kSide; ++x) {
+            const ImU32 tone = ((x + y) & 1) ? IM_COL32(70, 70, 74, 255)
+                                             : IM_COL32(52, 52, 56, 255);
+            draw->AddRectFilled(
+                ImVec2(at.x + static_cast<float>(x) * cell,
+                       at.y + static_cast<float>(y) * cell),
+                ImVec2(at.x + static_cast<float>(x + 1) * cell,
+                       at.y + static_cast<float>(y + 1) * cell), tone);
+        }
+    }
+
+    const sbl::Document& doc = app.cur().doc;
+    for (int y = 0; y < kSide; ++y) {
+        for (int x = 0; x < kSide; ++x) {
+            // Pixel centres of the cell, so a thin line down the middle of the
+            // canvas is not missed by sampling its edges.
+            const auto px = static_cast<std::int32_t>(
+                (static_cast<double>(x) + 0.5) / kSide * doc.width);
+            const auto py = static_cast<std::int32_t>(
+                (static_cast<double>(y) + 0.5) / kSide * doc.height);
+            const sbl::TileKey key{sbl::tileIndex(px), sbl::tileIndex(py)};
+            const sbl::Tile* tile = layer.find(key);
+            if (tile == nullptr) continue;
+
+            const sbl::PremulRgba16 c = tile->pixel(px - key.first * sbl::TILE_SIZE,
+                                                    py - key.second * sbl::TILE_SIZE);
+            if (c.a == 0) continue;
+            const sbl::StraightRgba8 straight = sbl::narrow(c).unpremultiply();
+            draw->AddRectFilled(
+                ImVec2(at.x + static_cast<float>(x) * cell,
+                       at.y + static_cast<float>(y) * cell),
+                ImVec2(at.x + static_cast<float>(x + 1) * cell,
+                       at.y + static_cast<float>(y + 1) * cell),
+                IM_COL32(straight.r, straight.g, straight.b, straight.a));
+        }
+    }
+    draw->AddRect(at, ImVec2(at.x + box, at.y + box), IM_COL32(120, 120, 128, 200));
+    ImGui::Dummy(ImVec2(box, box));
+}
+
 void drawLayerPanel(App& app) {
     if (ImGui::Begin("Layers")) {
         ImGui::TextDisabled("LAYERS");
@@ -2804,6 +3212,8 @@ void drawLayerPanel(App& app) {
 
             const bool active = layer.id == app.cur().doc.activeLayer;
             if (layer.parent.has_value()) ImGui::Indent(16.0f);
+            drawLayerThumbnail(app, layer);
+            ImGui::SameLine();
             char label[160];
             std::snprintf(label, sizeof label, "%s%s%s%s",
                           layer.kind == sbl::LayerKind::Folder   ? "[group] "
@@ -3157,7 +3567,9 @@ void drawTutorial(App& app) {
                     "on the right sets what you paint with, and %s swaps the two "
                     "colours it holds.\n\n"
                     "The Tools panel picks a preset: pencil, opaque, airbrush, "
-                    "marker and the rest make genuinely different marks.",
+                    "marker and the rest make genuinely different marks. Whatever "
+                    "the tool in hand can be set to is in the bar along the top, "
+                    "with a line saying how to work it.",
                     key(Action::SizeDown).c_str(), key(Action::SizeUp).c_str(),
                     key(Action::SwapColours).c_str());
                 break;
@@ -3187,9 +3599,11 @@ void drawTutorial(App& app) {
             case 4:
                 heading("Move around");
                 ImGui::TextWrapped(
-                    "The wheel zooms about the pointer, and holding space turns "
-                    "any drag into a pan. %s fits the drawing to the window, %s "
-                    "returns to actual size.",
+                    "The wheel zooms about the pointer, and the hand tool (%s) "
+                    "drags the canvas around; holding space does the same with "
+                    "whatever tool you are using. %s fits the drawing to the "
+                    "window, %s returns to actual size.",
+                    key(Action::ToolHand).c_str(),
                     key(Action::FitToWindow).c_str(), key(Action::ActualSize).c_str());
                 ImGui::Spacing();
                 if (ImGui::SmallButton("Fit to window"))
@@ -3576,6 +3990,41 @@ void rebuildAnts(App& app) {
     }
 }
 
+/// The transform's box and its four corner handles, over the canvas.
+///
+/// Drawn whenever the tool is chosen and something is selected, not only while
+/// a drag is running: the handles ARE the instruction, and a box that appears
+/// only once you have guessed the gesture teaches nobody anything.
+void drawTransformBox(const App& app) {
+    if (app.tool != Tool::Transform) return;
+    double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
+    if (!transformSource(app, x0, y0, x1, y1)) return;
+
+    const auto corners = transformCorners(app);
+    const auto at = [&](const std::pair<double, double>& c) {
+        return ImVec2(static_cast<float>(toScreenX(app.cur().view, c.first, c.second)),
+                      static_cast<float>(toScreenY(app.cur().view, c.first, c.second)));
+    };
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    const ImVec2 tl = at(corners[0]), tr = at(corners[1]);
+    const ImVec2 bl = at(corners[2]), br = at(corners[3]);
+    const ImU32 line = IM_COL32(80, 170, 255, 220);
+
+    draw->AddLine(tl, tr, line, 1.5f);
+    draw->AddLine(tr, br, line, 1.5f);
+    draw->AddLine(br, bl, line, 1.5f);
+    draw->AddLine(bl, tl, line, 1.5f);
+
+    const float r = 4.5f * app.uiScale;
+    for (const ImVec2& corner : {tl, tr, bl, br}) {
+        draw->AddRectFilled(ImVec2(corner.x - r, corner.y - r),
+                            ImVec2(corner.x + r, corner.y + r),
+                            IM_COL32(20, 20, 24, 230), 1.0f);
+        draw->AddRect(ImVec2(corner.x - r, corner.y - r),
+                      ImVec2(corner.x + r, corner.y + r), line, 1.0f, 0, 1.5f);
+    }
+}
+
 void drawSelectionOutline(App& app) {
     rebuildAnts(app);
     if (!app.cur().doc.selection.has_value() || app.cur().doc.selection->empty()) return;
@@ -3829,7 +4278,12 @@ void renderFrame(App& app, bool present = true) {
 
     drawTabStrip(app);
 
-    const ImGuiID dockspace = ImGui::GetID("sable.dockspace");
+    // The id carries a generation, and moving it forward is what gives an
+    // upgrading artist the new layout ONCE. The panel arrangement lives in
+    // layout.ini, so a version that adds a panel would otherwise leave it
+    // floating loose in the middle of somebody's window forever, and "Reset
+    // panel layout" is not a thing anyone knows to go looking for.
+    const ImGuiID dockspace = ImGui::GetID("sable.dockspace.2");
     if (app.resetLayout || ImGui::DockBuilderGetNode(dockspace) == nullptr) {
         buildDefaultLayout(dockspace);
         app.resetLayout = false;
@@ -3838,6 +4292,7 @@ void renderFrame(App& app, bool present = true) {
                      ImGuiDockNodeFlags_PassthruCentralNode);
     ImGui::End();
 
+    drawToolOptions(app);
     drawToolPanel(app);
     drawColourPanel(app);
     drawLayerPanel(app);
@@ -3883,6 +4338,7 @@ void renderFrame(App& app, bool present = true) {
     drawEmptyCanvasHint(app, overlay);
     drawRulerGuides(app);
     drawSelectionOutline(app);
+    drawTransformBox(app);
     drawLassoInProgress(app);
     drawLineworkHandles(app);
     drawBrushCursor(app);
@@ -5318,6 +5774,85 @@ int main(int argc, char** argv) {
             }
             SDL_Log("selftest: the pen presses the interface and paints nothing "
                     "through it");
+        }
+
+        // Opening a tab must not show the previous drawing, even for one frame.
+        // The tab strip decides which tab is visible from the state it had last
+        // frame, so a new tab reads as not-selected and the answer it gives has
+        // to be ignored on that frame or the document switches straight back.
+        {
+            const std::size_t before = app.activeDoc;
+            newDocument(app, 128, 128, false);
+            const std::size_t opened = app.activeDoc;
+            if (opened == before) {
+                SDL_Log("selftest FAILED: New did not open a tab of its own");
+                return 1;
+            }
+            renderFrame(app, false);       // the frame the strip first sees it
+            if (app.activeDoc != opened) {
+                SDL_Log("selftest FAILED: the frame after opening a tab showed "
+                        "document %zu, not the %zu just opened",
+                        app.activeDoc, opened);
+                return 1;
+            }
+            closeDocument(app, opened);
+            SDL_Log("selftest: a new tab is on screen the frame it opens");
+        }
+
+        // The transform: grabbed on the canvas, previewed live, one undo step,
+        // and Escape puts it back. What the artist could not find before was
+        // any of this — the tool was three number widgets and an Apply button.
+        {
+            app.tool = Tool::Transform;
+            app.foreground = sbl::StraightRgba8{200, 30, 30, 255};
+            app.cur().doc.selection = sbl::Selection{10, 10, 40, 40};
+            app.cur().doc.undo.push(sbl::fillSelection(app.cur().doc,
+                                                       app.cur().doc.activeLayer,
+                                                       app.foreground));
+            app.cur().canvas->markAllDirty();
+            const auto screenX = [&](double cx, double cy) {
+                return toScreenX(app.cur().view, cx, cy);
+            };
+            const auto screenY = [&](double cx, double cy) {
+                return toScreenY(app.cur().view, cx, cy);
+            };
+            const auto isRed = [&](std::int32_t x, std::int32_t y) {
+                const sbl::StraightRgba8 c = sbl::pickColour(app.cur().doc, x, y);
+                return c.r > 150 && c.g < 100;
+            };
+            if (!isRed(30, 30)) {
+                SDL_Log("selftest FAILED: the transform check painted nothing to move");
+                return 1;
+            }
+
+            const std::size_t steps = app.cur().doc.undo.size();
+            if (!beginTransformDrag(app, screenX(30.0, 30.0), screenY(30.0, 30.0))) {
+                SDL_Log("selftest FAILED: a press inside the transform box did not "
+                        "grab it, so the region cannot be dragged at all");
+                return 1;
+            }
+            dragTransform(app, screenX(60.0, 30.0), screenY(60.0, 30.0));
+            endTransformDrag(app);
+            if (!isRed(60, 30) || isRed(15, 30)) {
+                SDL_Log("selftest FAILED: dragging the transform box did not move "
+                        "the pixels with it");
+                return 1;
+            }
+            if (app.cur().doc.undo.size() != steps + 1) {
+                SDL_Log("selftest FAILED: a transform drag left %zu undo steps, not 1",
+                        app.cur().doc.undo.size() - steps);
+                return 1;
+            }
+            cancelTransform(app);
+            if (!isRed(30, 30) || isRed(60, 30)) {
+                SDL_Log("selftest FAILED: cancelling the transform did not put the "
+                        "pixels back");
+                return 1;
+            }
+            app.cur().doc.selection.reset();
+            app.tool = Tool::Brush;
+            SDL_Log("selftest: the transform box drags, previews as one undo step "
+                    "and cancels");
         }
 
         SDL_Log("selftest OK");

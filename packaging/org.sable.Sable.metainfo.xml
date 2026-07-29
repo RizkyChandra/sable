@@ -57,6 +57,27 @@
 
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.4.0" date="2026-07-30">
+      <description>
+        <p>
+          A tool options bar along the top, where Photoshop and Clip Studio
+          both put one: whatever the tool in hand can be set to, and a line
+          saying how to work it. Select and Transform in particular are no
+          longer a guess.
+        </p>
+        <p>
+          Transform is a box on the canvas now. Drag inside it to move the
+          selection, a corner to scale, Enter to apply and Escape to cancel,
+          with the result live on the canvas rather than described by three
+          number widgets.
+        </p>
+        <p>
+          A hand tool for panning, layer thumbnails so a layer can be
+          recognised rather than read, and a fix for the previous drawing
+          flickering up for a frame when a tab is opened.
+        </p>
+      </description>
+    </release>
     <release version="3.3.0" date="2026-07-30">
       <description>
         <p>
