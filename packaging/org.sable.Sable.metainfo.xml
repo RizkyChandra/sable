@@ -57,6 +57,21 @@
 
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.0.0" date="2026-07-29">
+      <description>
+        <p>
+          Layer masks, painted with the ordinary brushes. Linear and radial
+          gradients. Brush shapes and paper texture, so the presets make
+          different marks rather than the same mark at different settings.
+          Several drawings open at once as tabs, each with its own zoom and
+          undo history. Selections that can be kept by name, taken from a
+          layer or a mask, and combined without losing a soft edge. Linework
+          curves that close, move as a whole and recolour after the fact.
+          ICC colour management, so a tagged file keeps the colours it was
+          made with.
+        </p>
+      </description>
+    </release>
     <release version="2.0.1" date="2026-07-29">
       <description>
         <p>

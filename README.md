@@ -40,10 +40,25 @@ drives brush size and density through a curve you shape yourself, with a
 stabilizer for steady line art.
 
 Work in **layers** — 13 blend modes, clipping, folders, plus text layers you can
-re-edit and linework layers whose curves stay adjustable after you draw them.
+re-edit and linework layers whose curves stay adjustable after you draw them:
+close them, move a whole stroke, or recolour one long after it was drawn. Give
+any layer a **mask** and paint it with the ordinary brushes, so fading something
+out costs nothing you cannot undo. Lay down **linear and radial gradients**.
+
 Select with a **rectangle, lasso or magic wand**, then fill, transform or paint
-inside it. Draw along **perspective and symmetry rulers**. Rotate the canvas to
-whatever angle your hand prefers.
+inside it — and **keep the selection**, by name, in the file. A selection you
+spent five minutes on is worth more than five minutes. Take one from a layer's
+alpha or from a mask, and combine them with add, subtract and intersect without
+losing a soft edge. Draw along **perspective and symmetry rulers**. Rotate the
+canvas to whatever angle your hand prefers.
+
+Open **several drawings at once**, as tabs. Each keeps its own zoom, its own
+undo history and its own place on the canvas, and you can copy between them.
+
+**Your colours are the colours you chose.** Sable reads the ICC profile in a
+file it opens rather than assuming everything is sRGB, so an Adobe RGB or
+Display P3 document arrives looking the way it left. A new document is still
+plain sRGB, and an untagged file is treated exactly as it always was.
 
 **Your files stay yours.** Sable saves `.sable` projects, imports and exports
 **Photoshop PSD** (layers, groups, masks) and **OpenRaster**, and reads **Krita
@@ -69,11 +84,15 @@ drop old steps it says so in the status bar rather than doing it quietly.
 | Brush, eraser | `B`, `E` — or just turn the pen over |
 | Fill, select, lasso, wand | `G`, `M`, `L`, `W` |
 | Transform, text, linework | `T`, `F`, `V` |
+| Gradient | `R` |
 | Brush size | `[` and `]`, or the slider |
 | Swap / reset colours | `X` / `C` |
 | Fill selection / clear layer | `Backspace` / `Delete` |
 | Undo / redo / deselect | `Ctrl+Z` / `Ctrl+Y` / `Ctrl+D` |
 | Open / save / export | `Ctrl+O` / `Ctrl+S` / `Ctrl+E` |
+| New tab / close tab | `Ctrl+N` / `Ctrl+W` |
+| Next / previous tab | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
+| Copy / paste between tabs | `Ctrl+C` / `Ctrl+V` |
 
 **Every one of those can be changed.** *View → Keyboard and interface* rebinds
 any action and scales the whole interface for a large or small display.
@@ -90,7 +109,7 @@ your graphics card. On a large multi-layer canvas it is roughly a hundred times
 faster.
 
 It is **off by default, and the CPU stays the reference implementation.** A test
-suite compares the two across 32 scenarios and fails on any colour difference
+suite compares the two across 35 scenarios and fails on any colour difference
 above one level, or any alpha difference at all — so a picture is the same
 picture whichever one drew it. If your machine has no usable GPU, Sable says so
 in the status bar and carries on.
@@ -100,7 +119,7 @@ in the status bar and carries on.
 **Tablet support has never been tested on a tablet.** Not on any platform. No
 hardware was available while Sable was written, so every claim about pressure,
 tilt and sample rate is verified against simulated input only. The drawing
-engine has 215 automated tests behind it; the pen path has none. If your tablet
+engine has 272 automated tests behind it; the pen path has none. If your tablet
 works, that is good news rather than a guarantee — please
 [open an issue](https://github.com/RizkyChandra/sable/issues) either way.
 
@@ -143,7 +162,7 @@ fast loop, and the first thing CI gates on:
 
 ```sh
 cmake -S . -B build -G Ninja -DSABLE_BUILD_APP=OFF && cmake --build build
-ctest --test-dir build --output-on-failure     # 261 cases
+ctest --test-dir build --output-on-failure     # 272 cases
 ```
 
 Worth running before you open a pull request:
@@ -160,7 +179,7 @@ cmake --build build-asan && ./build-asan/engine_tests   # ASan + UBSan
 engine/     The painting engine. Pure C++23 — tiles, layers, brushes, undo,
             file formats. Testable with no window and no graphics driver.
 app/        SDL3 + Dear ImGui: event loop, canvas view, panels, input.
-tests/      215 doctest cases, all headless. differential.cpp compares the
+tests/      272 doctest cases, all headless. differential.cpp compares the
             CPU and GPU backends against one another.
 docs/       The specification. Start at docs/README.md.
 packaging/  Desktop entry, icon, AppStream metadata, AppImage script.
@@ -174,7 +193,7 @@ The main loop **blocks** when nobody is drawing, so an idle window costs nothing
 
 ### Read the decision log
 
-`docs/DECISION-LOG.md` holds 31 entries answering *"why is it like this?"* — why
+`docs/DECISION-LOG.md` holds 35 entries answering *"why is it like this?"* — why
 premultiplied and straight colour are different C++ types, why the undo budget
 counts bytes and not steps, why the GPU is opt-in. If something looks odd, the
 reason is usually written down.
@@ -197,7 +216,8 @@ with this codebase instead of guessing at it.
 Browse the [open issues](https://github.com/RizkyChandra/sable/issues). Two in
 particular:
 
-- **[#16 — run the stylus spike](https://github.com/RizkyChandra/sable/issues/16).** If you own a graphics tablet you can close the single largest unknown in this project in an afternoon. `docs/USER-STORIES.md` US-00 spells out what to check, and the tablet test pad already displays most of it. Brush shape now follows the pen's tilt (D-029) and has been tuned against nothing but synthetic input, so this is more valuable than it was.
+- **[#16 — run the stylus spike](https://github.com/RizkyChandra/sable/issues/16).** If you own a graphics tablet you can close the single largest unknown in this project in an afternoon. `docs/USER-STORIES.md` US-00 spells out what to check, and the tablet test pad already displays most of it. Brush shape now follows the pen's tilt (D-032) and has been tuned against nothing but synthetic input, so this is more valuable than it was.
+- **[#58 — teach the fill tools to write a mask](https://github.com/RizkyChandra/sable/issues/58).** Bucket, fill, gradient and clear all write layer pixels, so they refuse to run while you are painting a mask rather than quietly hitting the artwork. The route through is mapped out in the issue, and the hard part is already done: all four share one `PixelWriter`, and a mask tile is an ordinary tile.
 - **A brush editor.** #47 gave the engine stamp shapes and paper grain, and the interface can still only move a strength slider. Choosing a mask, or loading one from an image, is a self-contained piece of work with a visible result.
 
 Reports are as valuable as code. If a `.psd` opens wrong or your tablet behaves
