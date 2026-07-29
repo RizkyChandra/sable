@@ -2810,6 +2810,17 @@ void renderFrame(App& app) {
         app.viewport = SDL_FRect{central->Pos.x, central->Pos.y,
                                  central->Size.x, central->Size.y};
     }
+    // Every overlay below draws canvas-space geometry into the shared
+    // foreground list, and canvas space is unbounded: a ruler guide runs a
+    // canvas diagonal past its centre, a vanishing point sits off-picture, a
+    // selection survives a zoom that puts it off-screen. Unclipped, all of it
+    // paints straight over the docked panels and out of the window. Clip once
+    // here rather than guarding each drawer, so an overlay added later cannot
+    // reintroduce it.
+    ImDrawList* overlay = ImGui::GetForegroundDrawList();
+    overlay->PushClipRect(ImVec2(app.viewport.x, app.viewport.y),
+                          ImVec2(app.viewport.x + app.viewport.w,
+                                 app.viewport.y + app.viewport.h), true);
     drawRulerGuides(app);
     drawSelectionOutline(app);
     drawLassoInProgress(app);
@@ -2819,7 +2830,8 @@ void renderFrame(App& app) {
     // session is live the text simply IS the foreground colour.
     app.text.setColour(app.doc, app.foreground);
     syncTextures(app, app.text.takeChanged());
-    app.text.frame(app.window, app.view, app.uiScale);
+    app.text.frame(app.window, app.view, app.uiScale);   // draws the caret
+    overlay->PopClipRect();
 
     ImGui::Render();
 
@@ -3163,6 +3175,65 @@ int main(int argc, char** argv) {
                 SDL_Log("selftest: rotated blit lands on the pixel the transform names");
             }
             SDL_DestroySurface(shot);
+        }
+
+        // Overlays must stay inside the canvas viewport. Ruler guides are
+        // canvas-space lines a full diagonal long, so unclipped they run
+        // straight across the docked panels and out of the window — which is
+        // exactly what shipped in v2.0.0.
+        //
+        // Moving the symmetry centre rather than switching the ruler off keeps
+        // the panels pixel-identical between the two frames (the tool panel
+        // shows the ruler's state, not its position), so anything that differs
+        // outside the viewport is an overlay that escaped.
+        {
+            const auto shoot = [&](double cx, double cy) -> SDL_Surface* {
+                app.symmetry.centreX = cx;
+                app.symmetry.centreY = cy;
+                renderFrame(app);
+                return SDL_RenderReadPixels(app.renderer, nullptr);
+            };
+            app.symmetry.enabled = true;
+            app.symmetry.radial  = 12;   // a fan, so the guides cross everything
+            // Switching the ruler on adds its widgets to the tool panel, and
+            // ImGui settles a layout change on the following frame. Without
+            // this the first capture is a frame behind the second and the
+            // panel itself differs.
+            for (int warm = 0; warm < 3; ++warm) renderFrame(app);
+            SDL_Surface* shotA = shoot(80.0, 80.0);
+            SDL_Surface* shotB  = shoot(static_cast<double>(app.doc.width) - 80.0,
+                                      static_cast<double>(app.doc.height) - 80.0);
+            if (shotA != nullptr && shotB != nullptr &&
+                shotA->w == shotB->w && shotA->h == shotB->h) {
+                int escaped = 0;
+                for (int y = 0; y < shotA->h; ++y) {
+                    for (int x = 0; x < shotA->w; ++x) {
+                        const bool inside =
+                            static_cast<float>(x) >= app.viewport.x &&
+                            static_cast<float>(y) >= app.viewport.y &&
+                            static_cast<float>(x) <  app.viewport.x + app.viewport.w &&
+                            static_cast<float>(y) <  app.viewport.y + app.viewport.h;
+                        if (inside) continue;
+                        Uint8 ar = 0, ag = 0, ab = 0, aa = 0, br = 0, bg = 0, bb = 0, ba = 0;
+                        if (!SDL_ReadSurfacePixel(shotA, x, y, &ar, &ag, &ab, &aa)) continue;
+                        if (!SDL_ReadSurfacePixel(shotB,  x, y, &br, &bg, &bb, &ba)) continue;
+                        if (ar != br || ag != bg || ab != bb) ++escaped;
+                    }
+                }
+                if (escaped > 0) {
+                    SDL_Log("selftest FAILED: %d pixels outside the canvas viewport "
+                            "changed when the symmetry centre moved — an overlay is "
+                            "drawing over the panels", escaped);
+                    SDL_DestroySurface(shotA);
+                    SDL_DestroySurface(shotB);
+                    return 1;
+                }
+                SDL_Log("selftest: ruler guides stay inside the canvas viewport");
+            }
+            SDL_DestroySurface(shotA);
+            SDL_DestroySurface(shotB);
+            app.symmetry.radial = 1;
+            centreSymmetry(app);
         }
 
         const auto project = std::filesystem::temp_directory_path() / "sable_selftest.sable";
