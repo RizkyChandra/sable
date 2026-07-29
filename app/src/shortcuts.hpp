@@ -20,7 +20,11 @@
 
 enum class Action {
     NewCanvas, OpenProject, Save, SaveAs, ExportPng, Quit,
-    Undo, Redo, Clear, FillSelection, Deselect,
+    // #50. Reassignable like everything else here: Ctrl+Tab in particular is
+    // taken by the window manager on some desktops, and an artist who cannot
+    // reach their other document has lost the feature.
+    CloseDocument, NextDocument, PreviousDocument,
+    Undo, Redo, Copy, Paste, Clear, FillSelection, Deselect,
     FitToWindow, ActualSize, ZoomIn, ZoomOut,
     RotateLeft, RotateRight, ResetRotation,
     ToolBrush, ToolEraser, ToolFill, ToolSelect, ToolLasso, ToolWand,
