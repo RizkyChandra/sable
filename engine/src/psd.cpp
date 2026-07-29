@@ -230,9 +230,10 @@ bool readPlanes(Cursor& in, std::uint16_t compression, std::size_t planes,
 
 /// A PSD layer mask: a greyscale plane that multiplies the layer's alpha.
 ///
-/// Sable has no mask of its own — DATA-MODEL.md still lists them under "what is
-/// deliberately not modelled yet" — so the importer bakes one into the pixels.
-/// Skipping it was #35: the import then showed content the file itself hides.
+/// It maps onto `sbl::LayerMask` almost field for field (#48) — a rectangle of
+/// coverage plus a default colour for everything outside it — which is what
+/// makes both directions of the import short. It used to be baked into the
+/// pixels (D-027), because there was nowhere to put it.
 struct MaskPlane {
     std::int32_t top = 0, left = 0, bottom = 0, right = 0;
     /// PSD's "default colour": what the mask reads as beyond its own rectangle.
@@ -460,6 +461,44 @@ void writeRect(Layer& layer, std::int32_t left, std::int32_t top,
     }
 }
 
+/// Writes a PSD mask plane into a Sable layer mask (#48, superseding D-027).
+///
+/// The two models line up exactly, which is why this is short: PSD stores a
+/// rectangle of greyscale plus a default colour for everything outside it, and
+/// `LayerMask` stores sparse tiles plus `outside`. So the plane goes in at the
+/// coverage the file holds and nothing is expanded to canvas size to say
+/// "unchanged" — a mask on a 200-pixel highlight stays 200 pixels.
+void writeMask(Layer& layer, const MaskPlane& plane, std::int32_t canvasW,
+               std::int32_t canvasH) {
+    LayerMask mask;
+    mask.outside = plane.outside;
+    mask.enabled = plane.enabled;
+
+    const std::int32_t x0 = std::max(0, plane.left);
+    const std::int32_t y0 = std::max(0, plane.top);
+    const std::int32_t x1 = std::min(canvasW, plane.right);
+    const std::int32_t y1 = std::min(canvasH, plane.bottom);
+
+    TileKey cachedKey{0, 0};
+    Tile* cached = nullptr;
+    for (std::int32_t cy = y0; cy < y1; ++cy) {
+        for (std::int32_t cx = x0; cx < x1; ++cx) {
+            const std::uint8_t cov = plane.at(cx, cy);
+            const TileKey key{tileIndex(cx), tileIndex(cy)};
+            if (cached == nullptr || key != cachedKey) {
+                cachedKey = key;
+                cached    = &mask.tileFor(key);
+            }
+            // Opaque grey: coverage is the red channel, and an alpha of
+            // anything less would make the brush's own `over` behave as though
+            // part of the mask had been erased.
+            cached->setPixel(cx - key.first * TILE_SIZE, cy - key.second * TILE_SIZE,
+                             PremulRgba8{cov, cov, cov, 255});
+        }
+    }
+    layer.mask = std::move(mask);
+}
+
 // -------------------------------------------------------------------- input
 
 std::expected<std::vector<unsigned char>, Error> readFile(const std::filesystem::path& path) {
@@ -597,7 +636,6 @@ std::expected<Document, Error> readPsd(const std::filesystem::path& path) {
     };
 
     std::vector<std::uint8_t> plane;
-    std::size_t bakedMasks = 0;
     for (Record& rec : records) {
         if (rec.section == 3) {                    // the group ends here, going up
             openGroups.push_back(OpenGroup{doc.nextLayerId++, doc.layers.size()});
@@ -614,37 +652,15 @@ std::expected<Document, Error> readPsd(const std::filesystem::path& path) {
         layer.preserveOpacity = rec.preserveOpacity;
         layer.clipToBelow     = rec.clipping;
 
-        if (rec.section == 1 || rec.section == 2) {
-            layer.kind = LayerKind::Folder;
-            // The one mask that still cannot be honoured: a group's applies to
-            // the folder's composited result, so there is no single child's
-            // alpha to fold it into. Say so rather than open silently (#40).
-            if (rec.mask.present || rec.realMask.present)
-                doc.warnings.push_back(
-                    "the group \"" + layer.name + "\" arrives without its mask — a "
-                    "mask on a group applies to everything inside it, which Sable "
-                    "cannot yet hold, so what the mask hid is visible here");
-            if (openGroups.empty())
-                return fail(ErrorKind::Malformed,
-                            path.string() + " has an unbalanced layer group");
-            const OpenGroup group = openGroups.back();
-            openGroups.pop_back();
-            layer.id     = group.id;
-            layer.parent = parentNow();
-            for (const auto& [id, length] : rec.channels) in.skip(length);
-
-            doc.layers.insert(doc.layers.begin() +
-                                  static_cast<std::ptrdiff_t>(group.at),
-                              std::move(layer));
-            continue;
-        }
-        layer.id     = doc.nextLayerId++;
-        layer.parent = parentNow();
-
         const std::size_t w = rec.width();
         const std::size_t h = rec.height();
         std::array<std::vector<std::uint8_t>, 4> rgba;   // r, g, b, a
 
+        // Read for a GROUP as well as for an ordinary layer (#48). This used to
+        // skip a group's channels outright, because the only thing in them
+        // Sable could have used was a mask it had nowhere to put; a folder can
+        // carry one now, and a group record's own w and h are zero, so the
+        // colour planes below are still skipped exactly as they were.
         for (const auto& [id, length] : rec.channels) {
             const std::size_t blockStart = in.pos();
             if (length > in.remaining())
@@ -683,26 +699,31 @@ std::expected<Document, Error> readPsd(const std::filesystem::path& path) {
                             path.string() + " has a truncated layer channel");
         }
 
-        // #35: a mask multiplies the layer's alpha, and Sable has nowhere to
-        // keep one, so it is baked into the pixels here. That costs the artist
-        // the ability to edit the mask afterwards; dropping it cost them a
-        // drawing that showed what the file hides, which is the worse trade.
-        // The vector-derived mask wins when both are present — Photoshop writes
-        // channel -3 as the combination of the two.
+        // #48, superseding D-027: the mask keeps its own channel. It used to be
+        // multiplied into the alpha here because `Layer` had nowhere to put it,
+        // which made the drawing right and the mask gone; now the import is
+        // faithful in both. The vector-derived mask still wins when both are
+        // present — Photoshop writes channel -3 as the combination of the two.
         if (const MaskPlane& m = rec.realMask.usable() ? rec.realMask : rec.mask;
-            m.usable() && w > 0 && h > 0 && !rgba[0].empty()) {
-            ++bakedMasks;
-            if (rgba[3].empty()) rgba[3].assign(w * h, 255);
-            for (std::size_t y = 0; y < h; ++y)
-                for (std::size_t x = 0; x < w; ++x) {
-                    const std::size_t i = y * w + x;
-                    const std::uint32_t coverage =
-                        m.at(rec.left + static_cast<std::int32_t>(x),
-                             rec.top  + static_cast<std::int32_t>(y));
-                    rgba[3][i] = static_cast<std::uint8_t>(
-                        (rgba[3][i] * coverage + 127) / 255);
-                }
+            m.present && !m.plane.empty())
+            writeMask(layer, m, doc.width, doc.height);
+
+        if (rec.section == 1 || rec.section == 2) {
+            layer.kind = LayerKind::Folder;
+            if (openGroups.empty())
+                return fail(ErrorKind::Malformed,
+                            path.string() + " has an unbalanced layer group");
+            const OpenGroup group = openGroups.back();
+            openGroups.pop_back();
+            layer.id     = group.id;
+            layer.parent = parentNow();
+            doc.layers.insert(doc.layers.begin() +
+                                  static_cast<std::ptrdiff_t>(group.at),
+                              std::move(layer));
+            continue;
         }
+        layer.id     = doc.nextLayerId++;
+        layer.parent = parentNow();
 
         if (w > 0 && h > 0 && !rgba[0].empty() && !rgba[1].empty() && !rgba[2].empty())
             writeRect(layer, rec.left, rec.top, w, h, rgba[0].data(), rgba[1].data(),
@@ -712,15 +733,9 @@ std::expected<Document, Error> readPsd(const std::filesystem::path& path) {
         doc.layers.push_back(std::move(layer));
     }
 
-    // The drawing is right — that was the bug (#35). What the artist has lost
-    // is the ability to change the mask, so say it once for the file rather
-    // than once per layer: a PSD from real work can have forty of them.
-    if (bakedMasks > 0)
-        doc.warnings.push_back(
-            std::to_string(bakedMasks) +
-            (bakedMasks == 1 ? " layer mask was" : " layer masks were") +
-            " applied to the pixels on import. The artwork matches the file; the "
-            "masks themselves can no longer be edited or exported as masks.");
+    // No warning about masks any more, and that is the point of #48: what
+    // #35 had to apologise for — "the masks can no longer be edited" — is not
+    // true of this reader. Nothing is lost, so there is nothing to say.
 
     // An unbalanced file would otherwise leave children pointing at a folder
     // that was never created, and levelOf() would never composite them.
@@ -903,6 +918,16 @@ struct OutRecord {
     std::optional<std::uint32_t> section;      // 'lsct' type, for groups
     /// Alpha, red, green, blue, each already carrying its compression tag.
     std::array<std::vector<std::uint8_t>, 4> channels;
+
+    /// The layer mask (#48), which PSD stores as a fifth channel with an id of
+    /// -2 plus a rectangle and a default colour of its own — the same shape
+    /// `LayerMask` has, which is why nothing has to be expanded to canvas size
+    /// on the way out.
+    bool maskPresent = false;
+    bool maskEnabled = true;
+    std::uint8_t maskOutside = 255;
+    std::int32_t maskTop = 0, maskLeft = 0, maskBottom = 0, maskRight = 0;
+    std::vector<std::uint8_t> maskChannel;
 };
 
 /// Wraps one already-planar channel in the compression tag and row table PSD
@@ -999,6 +1024,55 @@ void encodeChannels(const Layer& layer, OutRecord& rec) {
         packChannel(rec.channels[channel], planes.data() + channel * w * h, w, h);
 }
 
+/// The mask as PSD's channel -2 (#48), or nothing at all when the layer has no
+/// mask.
+///
+/// The rectangle is the mask's own tiles UNION the layer's rectangle, so every
+/// pixel the layer actually has is covered by real mask data and `outside`
+/// speaks only for the emptiness beyond. Taking the mask's tiles alone would
+/// leave a masked layer's own pixels reading PSD's default colour, which is the
+/// one place this could get the picture wrong rather than merely large.
+void encodeMask(const Layer& layer, OutRecord& rec, std::int32_t canvasW,
+                std::int32_t canvasH) {
+    if (!layer.mask.has_value()) return;
+
+    std::int32_t left = rec.left, top = rec.top, right = rec.right, bottom = rec.bottom;
+    for (const auto& [key, tile] : layer.mask->tiles) {
+        const std::int32_t x0 = std::max(0, key.first  * TILE_SIZE);
+        const std::int32_t y0 = std::max(0, key.second * TILE_SIZE);
+        const std::int32_t x1 = std::min(canvasW, (key.first  + 1) * TILE_SIZE);
+        const std::int32_t y1 = std::min(canvasH, (key.second + 1) * TILE_SIZE);
+        if (x0 >= x1 || y0 >= y1) continue;
+        if (right <= left || bottom <= top) { left = x0; top = y0; right = x1; bottom = y1; }
+        left   = std::min(left,   x0);
+        top    = std::min(top,    y0);
+        right  = std::max(right,  x1);
+        bottom = std::max(bottom, y1);
+    }
+    // Nothing painted and nothing masked: `outside` alone would still be honest,
+    // but a zero-size plane is the sort of thing other readers disagree about,
+    // and a layer with no pixels has nothing for a mask to hide anyway.
+    if (right <= left || bottom <= top) return;
+
+    const auto w = static_cast<std::size_t>(right - left);
+    const auto h = static_cast<std::size_t>(bottom - top);
+    std::vector<std::uint8_t> plane(w * h);
+    for (std::size_t y = 0; y < h; ++y)
+        for (std::size_t x = 0; x < w; ++x)
+            plane[y * w + x] = maskCoverage(*layer.mask,
+                                            left + static_cast<std::int32_t>(x),
+                                            top  + static_cast<std::int32_t>(y));
+
+    rec.maskPresent = true;
+    rec.maskEnabled = layer.mask->enabled;
+    rec.maskOutside = layer.mask->outside;
+    rec.maskLeft = left;
+    rec.maskTop = top;
+    rec.maskRight = right;
+    rec.maskBottom = bottom;
+    packChannel(rec.maskChannel, plane.data(), w, h);
+}
+
 /// Walks one nesting level and appends its records bottom to top, which is the
 /// order PSD stores them in. A group becomes its closing marker, its children,
 /// then its header — the mirror of what readPsd() expects.
@@ -1024,12 +1098,16 @@ void emitLevel(const Document& doc, std::optional<LayerId> parent, int depth,
             header.section = 1;                      // an open folder
             for (std::vector<std::uint8_t>& channel : header.channels)
                 channel = emptyChannel();
+            // A group's mask rides on its header record, which is where
+            // Photoshop puts one and where `readPsd` looks for it.
+            encodeMask(layer, header, doc.width, doc.height);
             out.push_back(std::move(header));
         } else {
             OutRecord rec;
             fillCommon(rec, layer);
             boundsOf(layer, doc.width, doc.height, rec);
             encodeChannels(layer, rec);
+            encodeMask(layer, rec, doc.width, doc.height);
             out.push_back(std::move(rec));
         }
     }
@@ -1042,10 +1120,14 @@ void writeRecord(Writer& w, const OutRecord& rec) {
     w.i32(rec.right);
 
     static constexpr std::array<std::int16_t, 4> kIds{-1, 0, 1, 2};   // alpha, R, G, B
-    w.u16(4);
+    w.u16(static_cast<std::uint16_t>(rec.maskPresent ? 5 : 4));
     for (std::size_t i = 0; i < 4; ++i) {
         w.u16(static_cast<std::uint16_t>(kIds[i]));
         w.u32(static_cast<std::uint32_t>(rec.channels[i].size()));
+    }
+    if (rec.maskPresent) {                            // -2: the layer mask (#48)
+        w.u16(static_cast<std::uint16_t>(-2));
+        w.u32(static_cast<std::uint32_t>(rec.maskChannel.size()));
     }
 
     w.text("8BIM");
@@ -1058,7 +1140,22 @@ void writeRecord(Writer& w, const OutRecord& rec) {
     w.u8(0);                                          // filler
 
     const std::size_t extraAt = w.reserveLength();
-    w.u32(0);                                         // layer mask data: none
+    if (rec.maskPresent) {
+        // The 20-byte form: rectangle, default colour, flags, and two bytes of
+        // padding to keep the block on a multiple of four. Bit 1 of the flags
+        // is "mask disabled", which reads backwards and is what the format
+        // says — `readMaskBlock` above decodes exactly this.
+        w.u32(20);
+        w.i32(rec.maskTop);
+        w.i32(rec.maskLeft);
+        w.i32(rec.maskBottom);
+        w.i32(rec.maskRight);
+        w.u8(rec.maskOutside);
+        w.u8(rec.maskEnabled ? 0u : 0x02u);
+        w.pad(2);
+    } else {
+        w.u32(0);                                     // layer mask data: none
+    }
     w.u32(0);                                         // layer blending ranges: none
 
     // The legacy Pascal name, padded so the field is a multiple of four. ASCII
@@ -1179,8 +1276,12 @@ std::expected<void, Error> writePsd(const Document& doc,
         // Negative: the merged image at the end carries alpha.
         out.u16(static_cast<std::uint16_t>(-static_cast<std::int32_t>(records.size())));
         for (const OutRecord& rec : records) writeRecord(out, rec);
-        for (const OutRecord& rec : records)
+        for (const OutRecord& rec : records) {
             for (const std::vector<std::uint8_t>& channel : rec.channels) out.bytes(channel);
+            // Last, because -2 is last in the channel list the record declared,
+            // and the reader walks the two in the same order.
+            if (rec.maskPresent) out.bytes(rec.maskChannel);
+        }
         if (out.out.size() % 2 != 0) out.pad(1);      // the section is 2-aligned
         out.fillLength(layerInfoAt);
 

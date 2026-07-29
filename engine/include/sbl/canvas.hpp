@@ -370,6 +370,54 @@ inline constexpr std::array<BlendMode, 13> ALL_BLEND_MODES{
 using LayerId = std::uint32_t;                 // stable; never reused in a document
 inline constexpr LayerId NO_LAYER = 0;
 
+// --------------------------------------------------------------------- mask
+// #48. A paintable coverage channel that hides a layer's pixels without
+// destroying them, which is what `clipToBelow` — a boolean borrowing another
+// layer's alpha — has never been able to stand in for.
+
+/// Sparse for the same reason the pixels are (D-005): most masks cover a
+/// fraction of the canvas, and `TileMap` already says "absent means the
+/// default". The default is `outside`, not zero, because the mask an artist
+/// adds first is the one that hides nothing, and filling every tile with white
+/// to say "no change yet" would cost more memory than the painting.
+///
+/// The tiles are ORDINARY tiles holding opaque grey, so the brush, the undo
+/// snapshot, the tile PNG in a `.sable` and the GPU arena slot all serve a mask
+/// with no second implementation of any of them. Always 8-bit whatever the
+/// document is: coverage is what PSD stores in eight bits and what
+/// `Selection::mask` already carries in eight, and a 16-bit mask would double
+/// the undo cost of a mask stroke to record shades of grey nothing can show.
+///
+/// Coverage is the RED channel. Painting black hides and painting white
+/// reveals, which is what an artist expects; erasing takes every channel to
+/// zero and therefore also hides, which is the same answer twice rather than a
+/// surprise.
+struct LayerMask {
+    TileMap tiles;
+    /// Coverage where no tile has been allocated. 255 is "reveal all", the mask
+    /// added before a hole is painted in it; 0 is "hide all". This is also
+    /// PSD's mask default colour, so an imported mask needs no expansion to the
+    /// canvas just to say what it does outside its own rectangle.
+    std::uint8_t outside = 255;
+    /// Off keeps the pixels and stops the mask applying. Deleting one is a
+    /// different action, and it takes the pixels with it.
+    bool enabled = true;
+
+    [[nodiscard]] Tile*       find(TileKey k) noexcept;
+    [[nodiscard]] const Tile* find(TileKey k) const noexcept;
+    /// Allocates on first touch, filled with `outside`. A tile that started at
+    /// zero would turn 256 pixels of a reveal-all mask black the moment a brush
+    /// touched the corner of it.
+    [[nodiscard]] Tile& tileFor(TileKey k);
+};
+
+/// Coverage at a canvas pixel: 0 hides, 255 shows, and everything between is
+/// the soft edge. Deliberately the same units and the same convention as
+/// `Selection::coverage` — a mask and a selection are the same question asked
+/// about different things (#52).
+[[nodiscard]] std::uint8_t maskCoverage(const LayerMask& mask, std::int32_t px,
+                                        std::int32_t py) noexcept;
+
 struct Layer {
     LayerId     id   = NO_LAYER;
     LayerKind   kind = LayerKind::Raster;
@@ -402,6 +450,12 @@ struct Layer {
     /// `text` above: the tiles are generated from these curves, so paint on such
     /// a layer is refused rather than lost the next time one is dragged.
     std::optional<LineworkContent> linework;
+    /// #48. Absent means no mask at all, which is not the same as a mask that
+    /// hides nothing: the second is a channel the artist can paint a hole in.
+    /// Legal on any kind, folders included — a folder's mask applies to what
+    /// its children composited to, which is the one thing `clipToBelow` on each
+    /// child could never express.
+    std::optional<LayerMask> mask;
     // Draw order is the Document's vector order, not a field here.
 
     /// Null when the tile has never been painted. Do not cache the result
@@ -470,6 +524,20 @@ struct TileSnapshot {
     /// must REMOVE it, not fill it with zeros, or the sparse map stops being
     /// sparse.
     std::optional<Tile> before;
+    /// Which of the layer's two tile maps this belongs to (#48). Last, and
+    /// defaulted, so every existing aggregate initialisation still means what it
+    /// meant. A mask tile is budgeted and evicted exactly like a pixel tile —
+    /// it is the same `Tile`, so `memoryBytes()` needed no case for it.
+    bool mask = false;
+};
+
+/// A mask's settings, with no pixels attached — the same bargain `LayerProps`
+/// itself makes, and for the same reason: switching a mask off must not copy
+/// its tiles into the history.
+struct MaskProps {
+    std::uint8_t outside = 255;
+    bool enabled = true;
+    friend bool operator==(const MaskProps&, const MaskProps&) = default;
 };
 
 /// A layer's settings, with no pixels attached. Separated so that changing an
@@ -490,6 +558,12 @@ struct LayerProps {
     /// The curves, for the same reason: dragging a control point is one undo
     /// step covering both the geometry and the line it was drawn as.
     std::optional<LineworkContent> linework;
+    /// The mask's flags, or absent for a layer with no mask (#48). Applying an
+    /// absent one DELETES the mask and every tile in it, which is what makes
+    /// "delete mask" undoable through the machinery that already exists — so a
+    /// caller that only means to change the name must copy this field in, and
+    /// `propsOf` is what does that for all of them.
+    std::optional<MaskProps> mask;
 };
 
 [[nodiscard]] LayerProps propsOf(const Layer&);
@@ -676,5 +750,12 @@ struct Document {
 /// pixel snapshots for the lower layer, a structural delete for the upper.
 [[nodiscard]] UndoRecord mergeLayerDown(Document&, LayerId);
 [[nodiscard]] UndoRecord setLayerProps(Document&, LayerId, const LayerProps&);
+/// Removes the layer's mask, tiles and all, as ONE undoable step (#48).
+///
+/// A separate call rather than `setLayerProps` with an empty `mask`, because
+/// the tiles have to travel into the record before the mask stops existing —
+/// which is exactly what `setLayerProps` promises not to do for every other
+/// property.
+[[nodiscard]] UndoRecord deleteLayerMask(Document&, LayerId);
 
 }  // namespace sbl

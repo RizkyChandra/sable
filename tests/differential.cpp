@@ -261,14 +261,14 @@ InputSample at(double x, double y, float pressure = 1.0f) {
 
 void paintStroke(Document& doc, PaintBackend& backend, LayerId id,
                  const BrushPreset& preset, StraightRgba8 colour,
-                 std::initializer_list<InputSample> path) {
+                 std::initializer_list<InputSample> path, bool toMask = false) {
     Layer* layer = doc.layerById(id);
     REQUIRE(layer != nullptr);
     Stroke s;
     std::vector<Dab> scratch;
     beginStroke(s, preset, colour, id);
     PaintTarget target{*layer,     s.pending, s.touched, doc.width,
-                       doc.height, nullptr,   &backend};
+                       doc.height, nullptr,   &backend,  toMask};
     for (const InputSample& sample : path) paintSample(s, target, sample, scratch);
     doc.undo.push(std::move(s.pending));
 }
@@ -438,6 +438,50 @@ Document rotatedNonUniformTransform(PaintBackend& b) {
     return doc;
 }
 
+/// Layer masks, in the three shapes the compositor treats differently (#48).
+///
+/// A soft mask over a raster layer is the ordinary case. A clipped layer above
+/// it is the one that pins the ORDER of the arithmetic down: the alpha the clip
+/// mask carries has to be the masked one, and a backend that published the
+/// unmasked alpha would show the clipped layer through a hole its base does not
+/// have. The folder mask applies to what the group composited to, which is a
+/// different branch again on both sides — and the mask on the layer below the
+/// group has no tile over most of the canvas, so `outside` is doing the work
+/// there rather than any stored pixel.
+Document maskedLayers(PaintBackend& b) {
+    Document doc = makeDocument(128, 128, StraightRgba8{240, 240, 235, 255});
+    const LayerId back = doc.activeLayer;
+    paintStroke(doc, b, back, softBrush(80.0f, 0.4f), StraightRgba8{30, 90, 160, 255},
+                {at(16.0, 40.0), at(112.0, 48.0)});
+    doc.layerById(back)->mask.emplace();
+    doc.layerById(back)->mask->outside = 180;      // no tile: the default decides
+    paintStroke(doc, b, back, softBrush(52.0f, 0.2f), StraightRgba8{0, 0, 0, 255},
+                {at(30.0, 30.0), at(96.0, 70.0)}, true);
+
+    doc.undo.push(addLayerAbove(doc, back, "clipped"));
+    const LayerId clipped = doc.activeLayer;
+    doc.layerById(clipped)->clipToBelow = true;
+    doc.layerById(clipped)->blend       = BlendMode::Overlay;
+    paintStroke(doc, b, clipped, softBrush(64.0f, 0.6f), StraightRgba8{220, 60, 20, 220},
+                {at(0.0, 60.0), at(128.0, 56.0)});
+
+    doc.undo.push(addLayerAbove(doc, clipped, "group"));
+    const LayerId group = doc.activeLayer;
+    doc.layerById(group)->kind    = LayerKind::Folder;
+    doc.layerById(group)->opacity = 0.75f;
+    doc.layerById(group)->mask.emplace();
+    doc.undo.push(addLayerAbove(doc, group, "in group"));
+    const LayerId inner = doc.activeLayer;
+    doc.layerById(inner)->parent = group;
+    paintStroke(doc, b, inner, softBrush(70.0f, 0.3f), StraightRgba8{250, 220, 40, 255},
+                {at(24.0, 100.0), at(104.0, 92.0)});
+    // Painted after the child, and on the FOLDER: a mask on a group is the one
+    // thing a mask on each child cannot stand in for.
+    paintStroke(doc, b, group, softBrush(58.0f, 0.15f), StraightRgba8{70, 70, 70, 255},
+                {at(40.0, 110.0), at(100.0, 84.0)}, true);
+    return doc;
+}
+
 struct Case {
     std::string name;
     std::function<Document(PaintBackend&)> build;
@@ -460,6 +504,8 @@ const std::vector<Case>& cases() {
             }
         }
         v.push_back({"clipping group inside nested folders", clippingInNestedFolders});
+        v.push_back({"layer masks: raster, clipped over masked, and a folder",
+                     maskedLayers});
         v.push_back({"eraser stroke", eraserStroke});
         v.push_back({"stroke on a preserveOpacity layer", preserveOpacityStroke});
         v.push_back({"bucket fill with tolerance at a region boundary",

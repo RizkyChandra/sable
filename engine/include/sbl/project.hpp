@@ -33,11 +33,12 @@ namespace sbl {
 ///
 /// 5 added linework. 6 added 16-bit colour (D-023): `colour.depth` is 16 and
 /// the tile PNGs are 16 bits per channel. 6 is the first bump that is NOT
-/// written unconditionally — see below.
-inline constexpr int SABLE_FORMAT_VERSION = 6;
+/// written unconditionally — see below. 7 added layer masks (#48): a `mask`
+/// object on a layer and `layers/<id>/mask/<tx>_<ty>.png` beside its tiles.
+inline constexpr int SABLE_FORMAT_VERSION = 7;
 
-/// What a document declares when it is 8-bit, which is the newest version an
-/// older Sable can still read in full.
+/// The newest version a document that uses neither 16-bit colour nor a mask can
+/// declare, which is the newest an older Sable can still read in full.
 ///
 /// Every bump up to 5 was unconditional because each added something an
 /// ordinary document might contain. Depth is different: it is a per-document
@@ -46,7 +47,21 @@ inline constexpr int SABLE_FORMAT_VERSION = 6;
 /// Sable in exchange for nothing, so the version says what the file actually
 /// needs — and a 16-bit file, which an older Sable genuinely would misread,
 /// still gets refused by name.
+///
+/// A mask takes the same deal, and needs it more: an older Sable would open a
+/// masked document, show every layer unmasked, and write the masks away on the
+/// next save. A document with no mask is unaffected either way.
 inline constexpr int SABLE_FORMAT_VERSION_8BIT = 5;
+
+/// What a 16-bit document declares (D-023). Named rather than spelled
+/// `SABLE_FORMAT_VERSION`, which it used to be: the newest version and the
+/// version a wide document needs stopped being the same number the moment
+/// masks were added below.
+inline constexpr int SABLE_FORMAT_VERSION_16BIT = 6;
+
+/// What a document with a layer mask declares whatever its depth (#48). Above
+/// 6 because a masked 16-bit document needs both, and a version is one number.
+inline constexpr int SABLE_FORMAT_VERSION_MASK = 7;
 
 /// Undo history is deliberately not saved.
 [[nodiscard]] std::expected<void, Error> saveProject(
