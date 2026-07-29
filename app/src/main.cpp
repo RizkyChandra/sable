@@ -2737,7 +2737,14 @@ void drawBrushCursor(const App& app) {
     draw->AddCircle(ImVec2(mx, my), radius, IM_COL32(255, 255, 255, 200), 0, 1.0f);
 }
 
-void renderFrame(App& app) {
+/// `present` exists for the self-test. Reading pixels back after
+/// SDL_RenderPresent is undefined — the backbuffer has been handed to the
+/// window system, and a Metal backend recycles drawables from a pool, so what
+/// comes back is some earlier frame rather than the one just drawn. The
+/// existing rotated-blit check already sidesteps this by rendering the canvas
+/// itself and reading before presenting; a check that needs the FULL frame,
+/// overlays included, needs the same thing from here.
+void renderFrame(App& app, bool present = true) {
     // Rebuilding the style on every frame would compound the scaling, so it is
     // applied only when the artist actually changes it.
     if (app.uiScale != app.appliedScale || app.lightTheme != app.appliedLight) {
@@ -2840,7 +2847,7 @@ void renderFrame(App& app) {
     SDL_RenderClear(app.renderer);
     app.canvas->render(app.doc, app.view, app.viewport);
     ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), app.renderer);
-    SDL_RenderPresent(app.renderer);
+    if (present) SDL_RenderPresent(app.renderer);
 
     app.motionLastFrame = app.motionThisFrame;
     app.motionThisFrame = 0;
@@ -3198,7 +3205,7 @@ int main(int argc, char** argv) {
             const auto shoot = [&](double cx, double cy) -> SDL_Surface* {
                 app.symmetry.centreX = cx;
                 app.symmetry.centreY = cy;
-                renderFrame(app);
+                renderFrame(app, false);   // read the frame just drawn
                 return SDL_RenderReadPixels(app.renderer, nullptr);
             };
             app.symmetry.enabled = true;
@@ -3222,17 +3229,17 @@ int main(int argc, char** argv) {
                 const float vy0 = app.viewport.y * sy;
                 const float vx1 = (app.viewport.x + app.viewport.w) * sx;
                 const float vy1 = (app.viewport.y + app.viewport.h) * sy;
-                int escaped = 0;
+                int escaped = 0, within = 0;
                 for (int y = 0; y < shotA->h; ++y) {
                     for (int x = 0; x < shotA->w; ++x) {
                         const bool inside =
                             static_cast<float>(x) >= vx0 && static_cast<float>(y) >= vy0 &&
                             static_cast<float>(x) <  vx1 && static_cast<float>(y) <  vy1;
-                        if (inside) continue;
                         Uint8 ar = 0, ag = 0, ab = 0, aa = 0, br = 0, bg = 0, bb = 0, ba = 0;
                         if (!SDL_ReadSurfacePixel(shotA, x, y, &ar, &ag, &ab, &aa)) continue;
                         if (!SDL_ReadSurfacePixel(shotB,  x, y, &br, &bg, &bb, &ba)) continue;
-                        if (ar != br || ag != bg || ab != bb) ++escaped;
+                        if (ar == br && ag == bg && ab == bb) continue;
+                        if (inside) ++within; else ++escaped;
                     }
                 }
                 if (escaped > 0) {
@@ -3242,9 +3249,11 @@ int main(int argc, char** argv) {
                     SDL_Log("selftest FAILED: %d pixels outside the canvas viewport "
                             "changed when the symmetry centre moved — an overlay is "
                             "drawing over the panels "
-                            "(readback %dx%d, display %.0fx%.0f, scale %.2fx%.2f, "
-                            "viewport %.1f,%.1f %.1fx%.1f)",
-                            escaped, shotA->w, shotA->h, display.x, display.y, sx, sy,
+                            "(%d changed INSIDE it, which is expected and is the "
+                            "control: if that is also near zero the readback is not "
+                            "the frame that was drawn. readback %dx%d, display "
+                            "%.0fx%.0f, scale %.2fx%.2f, viewport %.1f,%.1f %.1fx%.1f)",
+                            escaped, within, shotA->w, shotA->h, display.x, display.y, sx, sy,
                             app.viewport.x, app.viewport.y,
                             app.viewport.w, app.viewport.h);
                     SDL_DestroySurface(shotA);
@@ -3252,7 +3261,8 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 SDL_Log("selftest: ruler guides stay inside the canvas viewport "
-                        "(readback %dx%d at %.2fx%.2f)", shotA->w, shotA->h, sx, sy);
+                        "(%d pixels changed inside it, readback %dx%d at %.2fx%.2f)",
+                        within, shotA->w, shotA->h, sx, sy);
             }
             SDL_DestroySurface(shotA);
             SDL_DestroySurface(shotB);
