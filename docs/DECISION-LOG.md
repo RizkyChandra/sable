@@ -1124,6 +1124,113 @@ the format version is the hook — the same one this used.
 
 ---
 
+## D-029 — Brush shape and texture are masks: one registry, two sampling spaces
+
+**Status:** Decided
+**Affects:** `engine/include/sbl/paint.hpp`, `engine/src/paint.cpp`,
+`engine/src/gpu.cpp`, `engine/src/shaders/dab.comp`, the built-in presets,
+`settings.conf`
+**Answers:** #47
+
+`BrushPreset::shape`, `texture` and `textureStrength` had been declared,
+serialised and read by nothing since v1, and `ShapeId` documented itself as
+existing "so the stamp path has somewhere to land". Something now lands there.
+
+**A mask is a mask.** One type (`BrushMask`, 64 × 64 coverage bytes) and one
+registry serve both jobs, because a dab's footprint and a sheet of paper differ
+only in the space they are sampled in:
+
+- **Shape** rides with the dab. Sampled bilinearly in the dab's own frame,
+  turned by `Dab::angle` — which existed, was mirrored by the symmetry ruler,
+  and was set to zero by `makeDab` with the comment "round brushes only in v1".
+  It now comes from the pen's tilt azimuth plus barrel rotation.
+- **Texture** is nailed to the canvas. Sampled nearest and tiled by
+  `x & 63`, so two dabs that overlap reveal the same tooth in the same place.
+  Grain that rode with the dab would read as noise the brush emits, and a slow
+  stroke would average its own noise flat.
+
+Two masks rather than one field doing both is why `BrushPreset` gained
+`stampMask`: `shape = Stamp` with no way to say *which* stamp is the same kind
+of half-declared field this entry exists to remove.
+
+**The stamp is a hole cut in the round falloff, not a replacement for it.**
+`coverage(distance, radius, hardness) * stamp * grain`, in that order, on both
+backends. Hardness therefore keeps meaning exactly what it meant, the dab's
+bounding box is still `radius` and needs no second answer, and a stamp brush
+simply wants a high hardness — which is why the marker's went to 1.0. The cost,
+stated: dragging hardness down on a chisel rounds its ends off. That is
+visible, explainable and reversible, and the alternative — hardness silently
+doing nothing on stamped brushes — is the defect this entry closes.
+
+**Masks go to the device in a storage buffer, not the uniform block.** The
+first attempt pushed 8 KiB of mask with the rest of the dab parameters, which
+is exactly what `SDL_gpu.h` says not to do ("Don't use uniform buffers for
+large amounts of data... Use a storage buffer instead"). On radv it did not
+fail; it painted the wrong picture — the mask arrived as zeroes and every
+textured dab came out 59 levels off, caught by `tests/differential.cpp` and by
+nothing else. The masks now live in one small buffer uploaded when the batch's
+masks change, which is once per stroke.
+
+**The dab's distance is measured in `float` now, on both sides.** D-025
+accepted a double-on-the-CPU, float-on-the-GPU mismatch as "one fringe pixel of
+an anti-aliased edge". A textured dab multiplies coverage by a mask, so far
+more pixels sit near a rounding boundary, and one fringe pixel became forty —
+past the ±1 the harness allows. Nothing is lost by measuring in float; the
+result is quantised to eight bits either way. The measured effect on the whole
+harness, unchanged tolerances:
+
+| | before #47 | after |
+|---|---|---|
+| scenarios | 32 | 34 |
+| pixels differing, cpu vs gpu | 5 in 570'368 | **1 in 660'480** |
+| worst channel R/G/B/A | 1/1/1/0 | **0/0/1/0** |
+| one stroke, pencil / airbrush | 1 level, 1–8 px | **exact** |
+
+`precise` is what makes that hold: the grain factor is one multiply and two
+subtractions, and without the qualifier the driver contracted it into an FMA
+that the CPU does not use. That alone was worth three levels on a textured
+stroke. Any float the two backends both compute per pixel needs it.
+
+**The built-in masks are generated in code**, from a hash rather than
+`<random>`: D-010 forbids anyone else's brush textures, a procedural mask is
+original by construction, and the bytes have to be identical in every process
+because the GPU is handed them and compared against the CPU. `<random>`'s
+distributions are not specified to be portable.
+
+**Registry ownership.** `DATA-MODEL.md` said the app owns the registry. It is
+process-wide in the engine instead, reached like `paintBackend()`, because the
+dab path needs it and the headless engine tests have no app. The app may still
+add to it; nothing yet does.
+
+**What this does not do**, so nobody reads the fields as promising it:
+
+- **No mask picker in the interface.** A preset's texture can be chosen only in
+  code or in `settings.conf`; the panel offers a strength slider, and only for
+  a preset that already names one, because a dead control is what #47 was
+  about. A brush editor is its own piece of work.
+- **No mipmaps.** A 64 × 64 stamp minified onto a small brush aliases; the
+  built-in chisel is soft-edged to hide it. A mask loaded from an image will
+  crawl at small sizes.
+- **`PressureMapping::toTexture` is still read by nothing.** It is the same
+  defect in the same struct, left alone deliberately: how grain should answer
+  pressure — more tooth at a light touch, or less — is a feel question that
+  wants a real tablet and #16, not a guess committed today.
+- **Linework layers are still round.** `engine/src/linework.cpp` has its own
+  rasteriser (D-028), and it takes no notice of shape or texture.
+
+**Alternative rejected — delete the three fields.** The issue offered it, and
+it is the smaller change. It also gives up the thing that separates a marker
+from a pencil, on the milestone whose whole argument is that brush feel is
+where SAI 2 is actually ahead.
+
+**Alternative rejected — analytic elliptical dabs instead of a mask.** Four
+lines in each backend, no registry, no upload, and it would have given the
+chisel and the tilt response. It cannot give paper grain, which is half of
+#47, and it cannot ever load an image — so it would have been a second shape
+path to keep in step the day one was wanted.
+
+---
+
 ## Open decisions
 
 These blocked the milestone named. They have all been answered — the entries

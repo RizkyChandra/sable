@@ -273,10 +273,21 @@ void paintStroke(Document& doc, PaintBackend& backend, LayerId id,
     doc.undo.push(std::move(s.pending));
 }
 
+/// A plain round brush, with the pencil's paper deliberately taken off.
+///
+/// The scenarios below use this to put *something* on the canvas while they
+/// test blending, clipping, folders and fills. Brush texture (D-029) is a
+/// separate axis and gets its own scenarios at the end of the list; leaving it
+/// switched on here would make all thirty of them texture scenarios as well,
+/// and where a textured dab's coverage tips a rounding boundary underneath a
+/// five-deep clip and blend stack, it is the blend modes that amplify it — a
+/// number that would then be read as a compositor disagreement.
 BrushPreset softBrush(float size, float hardness) {
     BrushPreset p = defaultPencil();
     p.size     = size;
     p.hardness = hardness;
+    p.texture.reset();
+    p.textureStrength = 0.0f;
     return p;
 }
 
@@ -438,6 +449,70 @@ Document rotatedNonUniformTransform(PaintBackend& b) {
     return doc;
 }
 
+/// A sample carrying tilt, which is where `Dab::angle` comes from. Only the
+/// direction the pen leans matters, so the magnitude is left at one.
+InputSample leaning(double x, double y, float pressure, float lean) {
+    InputSample s = at(x, y, pressure);
+    s.tiltX = std::cos(lean);
+    s.tiltY = std::sin(lean);
+    return s;
+}
+
+/// A chisel nib turning as the pen leans, across a tile boundary.
+///
+/// Stamped coverage is bilinear in the dab's own rotated frame — the only
+/// per-pixel arithmetic #47 added that is not integer — so this is the
+/// scenario that says whether two backends sample a mask the same way. The
+/// lean turns through a right angle along the stroke, so no single orientation
+/// can pass it by luck, and the second stroke minifies the same mask onto a
+/// brush a third of the size while the first magnifies it.
+Document stampedStroke(PaintBackend& b) {
+    Document doc = makeDocument(384, 128, StraightRgba8{255, 255, 255, 255});
+    BrushPreset nib = defaultMarker();
+    nib.size = 46.0f;
+    paintStroke(doc, b, doc.activeLayer, nib, StraightRgba8{30, 30, 60, 255},
+                {leaning(28.3, 44.7, 0.35f, 0.0f), leaning(139.1, 61.2, 0.72f, 0.55f),
+                 leaning(241.6, 52.4, 0.98f, 1.1f), leaning(352.9, 76.8, 0.51f, 1.57f)});
+
+    nib.size = 13.0f;
+    paintStroke(doc, b, doc.activeLayer, nib, StraightRgba8{200, 60, 20, 255},
+                {leaning(31.7, 96.3, 0.9f, 2.4f), leaning(198.2, 104.1, 0.6f, 0.9f),
+                 leaning(361.4, 88.5, 0.95f, 4.2f)});
+    return doc;
+}
+
+/// Paper grain, tiled over the CANVAS rather than carried by the dab.
+///
+/// A backend that indexed the mask from the dab centre or the tile origin
+/// instead would still produce something that looks like texture, and it would
+/// not be the same texture — so the strokes here overlap and cross a tile
+/// boundary, which is where those three choices give different answers. The
+/// eraser pass then takes texture through the other branch of the dab loop.
+Document texturedStrokes(PaintBackend& b) {
+    Document doc = makeDocument(320, 128, StraightRgba8{255, 255, 255, 255});
+    const LayerId id = doc.activeLayer;
+
+    BrushPreset pencil = defaultPencil();
+    pencil.size = 29.0f;
+    paintStroke(doc, b, id, pencil, StraightRgba8{25, 25, 25, 255},
+                {at(22.4, 38.6, 0.3f), at(147.9, 71.3, 0.85f), at(288.1, 46.2, 0.62f)});
+
+    BrushPreset coarse = pencil;
+    coarse.texture         = TEXTURE_CANVAS;
+    coarse.textureStrength = 0.85f;       // hard enough to read as holes
+    coarse.size            = 41.0f;
+    paintStroke(doc, b, id, coarse, StraightRgba8{40, 90, 200, 255},
+                {at(19.6, 84.5, 0.95f), at(163.2, 57.8, 0.44f), at(301.3, 92.7, 0.8f)});
+
+    BrushPreset rubber = defaultEraser();
+    rubber.size            = 23.0f;
+    rubber.texture         = TEXTURE_PAPER;
+    rubber.textureStrength = 0.6f;
+    paintStroke(doc, b, id, rubber, StraightRgba8{0, 0, 0, 255},
+                {at(88.7, 63.1, 0.7f), at(244.5, 69.9, 0.4f)});
+    return doc;
+}
+
 struct Case {
     std::string name;
     std::function<Document(PaintBackend&)> build;
@@ -466,6 +541,9 @@ const std::vector<Case>& cases() {
                      bucketFillAtBoundary});
         v.push_back({"transform with rotation and non-uniform scale",
                      rotatedNonUniformTransform});
+        v.push_back({"chisel stamp turning with the pen", stampedStroke});
+        v.push_back({"grain-textured strokes and a textured eraser",
+                     texturedStrokes});
         return v;
     }();
     return all;

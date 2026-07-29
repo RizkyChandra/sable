@@ -381,6 +381,21 @@ void applySettings(App& app, const Settings& settings) {
         preset.blending        = settings.getFloat(key + "blending", 0.0f);
         preset.dilution        = settings.getFloat(key + "dilution", 0.0f);
         preset.persistence     = settings.getFloat(key + "persistence", 0.0f);
+        // A preset saved from the marker is a chisel, and comes back one.
+        // These three were the fields #47 found declared and read by nothing;
+        // leaving them out of the file would have been the same defect one
+        // layer up — the artist's brush would quietly become a round one on
+        // the next launch. An id the registry no longer carries degrades to a
+        // round, untextured dab in `makeDab` rather than failing to load.
+        preset.shape = settings.getInt(key + "stamp", 0) != 0 ? sbl::ShapeId::Stamp
+                                                              : sbl::ShapeId::Round;
+        preset.stampMask = static_cast<sbl::TextureId>(
+            std::max(0, settings.getInt(key + "stampMask",
+                                        static_cast<int>(sbl::SHAPE_CHISEL))));
+        if (const int texture = settings.getInt(key + "texture", -1); texture >= 0)
+            preset.texture = static_cast<sbl::TextureId>(texture);
+        preset.textureStrength =
+            std::clamp(settings.getFloat(key + "textureStrength", 0.0f), 0.0f, 1.0f);
         preset.stabilizerLevel = static_cast<std::uint8_t>(
             std::clamp(settings.getInt(key + "stabilizer", 0), 0, 3));
         preset.pressure.toSize    = settings.getInt(key + "toSize", 1) != 0;
@@ -440,6 +455,13 @@ void collectSettings(const App& app, Settings& settings) {
         settings.setFloat(key + "blending", preset.blending);
         settings.setFloat(key + "dilution", preset.dilution);
         settings.setFloat(key + "persistence", preset.persistence);
+        settings.setInt(key + "stamp", preset.shape == sbl::ShapeId::Stamp ? 1 : 0);
+        settings.setInt(key + "stampMask", static_cast<int>(preset.stampMask));
+        // -1 for "no texture", so that texture id 0 — the paper the pencil
+        // uses — is not indistinguishable from the absent optional.
+        settings.setInt(key + "texture",
+                        preset.texture.has_value() ? static_cast<int>(*preset.texture) : -1);
+        settings.setFloat(key + "textureStrength", preset.textureStrength);
         settings.setInt(key + "stabilizer", preset.stabilizerLevel);
         settings.setInt(key + "toSize", preset.pressure.toSize ? 1 : 0);
         settings.setInt(key + "toDensity", preset.pressure.toDensity ? 1 : 0);
@@ -1891,6 +1913,14 @@ void drawToolPanel(App& app) {
         ImGui::SliderFloat("##hardness", &brush.hardness, 0.0f, 1.0f, "hardness %.2f");
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::SliderFloat("##density", &brush.density, 0.05f, 1.0f, "density %.2f");
+        // Only for a preset that names a texture. There is no picker yet, so a
+        // strength slider on a brush with no mask behind it would be the same
+        // dead control #47 was about.
+        if (brush.texture.has_value()) {
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::SliderFloat("##texture", &brush.textureStrength, 0.0f, 1.0f,
+                               "texture %.2f");
+        }
 
         ImGui::Spacing();
         ImGui::TextDisabled("PRESSURE DRIVES");
@@ -2978,6 +3008,12 @@ int main(int argc, char** argv) {
         {
             const std::size_t undoBefore = app.doc.undo.size();
             app.foreground = sbl::StraightRgba8{20, 20, 20, 255};
+            // The probe below compares a pixel against its mirror byte for
+            // byte, and paper grain is nailed to the CANVAS rather than to the
+            // stroke (D-029) — so a mirrored dab lands on different tooth, by
+            // design. Take the grain off for this stroke: what is under test
+            // here is the ruler, not the brush.
+            app.brushes[app.brushIndex].texture.reset();
             app.symmetry.enabled  = true;
             app.symmetry.vertical = true;
             app.symmetry.radial   = 1;

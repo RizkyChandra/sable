@@ -142,6 +142,24 @@ double gap(const Dab& a, const Dab& b) {
     return std::hypot(a.x - b.x, a.y - b.y);
 }
 
+/// The pencil with its paper taken off and pressure held flat: a mark of
+/// exactly one colour.
+///
+/// The built-in pencil carries paper grain (D-029), which is the point of it —
+/// but a test that asserts a pixel is exactly the colour the artist picked is
+/// testing layers, clipping or selections, and would otherwise be testing the
+/// brush's tooth by accident. The tooth has its own tests.
+BrushPreset flatPencil(float size) {
+    BrushPreset p = defaultPencil();
+    p.size     = size;
+    p.hardness = 1.0f;
+    p.texture.reset();
+    p.textureStrength = 0.0f;
+    p.pressure = PressureMapping{};
+    p.pressure.toSize = false;
+    return p;
+}
+
 std::filesystem::path scratchFile(const char* name) {
     const auto path = std::filesystem::temp_directory_path() / name;
     std::error_code ec;
@@ -340,11 +358,7 @@ TEST_CASE("a solid dab reproduces the chosen colour exactly at its centre") {
     Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
     Layer& layer = *doc.active();
 
-    BrushPreset p = defaultPencil();
-    p.size = 20.0f;
-    p.hardness = 1.0f;
-    p.pressure = PressureMapping{};
-    p.pressure.toSize = false;
+    const BrushPreset p = flatPencil(20.0f);
 
     const StraightRgba8 chosen{37, 142, 211, 255};
     Stroke s;
@@ -356,6 +370,206 @@ TEST_CASE("a solid dab reproduces the chosen colour exactly at its centre") {
     const Tile* tile = layer.find(TileKey{0, 0});
     REQUIRE(tile != nullptr);
     CHECK(narrow(tile->pixel(32, 32)).unpremultiply() == chosen);
+}
+
+// --------------------------------------------------- brush shape and texture
+
+namespace {
+
+/// One dab of `p` at (`x`, `y`) on an empty 128 x 128 layer, as alpha.
+///
+/// Alpha rather than colour because that is what coverage becomes, and a
+/// buffer rather than a document because every test below compares two of
+/// these against each other. The default centre is a pixel CENTRE, so a probe
+/// at an offset of n is exactly n from the middle of the dab and the numbers
+/// below are the mask's, not the half-pixel's.
+std::vector<std::uint8_t> dabAlpha(const BrushPreset& p, double x = 64.5,
+                                   double y = 64.5, float tilt = 0.0f) {
+    Document doc = makeDocument(128, 128, StraightRgba8{0, 0, 0, 0});
+    Layer& layer = *doc.active();
+    Stroke s;
+    std::vector<Dab> scratch;
+    beginStroke(s, p, StraightRgba8{0, 0, 0, 255}, layer.id);
+    PaintTarget target{layer, s.pending, s.touched, doc.width, doc.height};
+
+    InputSample sample = at(x, y);
+    sample.tiltX = std::cos(tilt);
+    sample.tiltY = std::sin(tilt);
+    paintSample(s, target, sample, scratch);
+
+    std::vector<std::uint8_t> out(128 * 128, 0);
+    for (std::int32_t py = 0; py < 128; ++py)
+        for (std::int32_t px = 0; px < 128; ++px)
+            if (const Tile* tile = layer.find(TileKey{tileIndex(px), tileIndex(py)});
+                tile != nullptr)
+                out[static_cast<std::size_t>(py) * 128 + px] =
+                    narrow(tile->pixel(px % TILE_SIZE, py % TILE_SIZE)).a;
+    return out;
+}
+
+std::uint8_t alphaAt(const std::vector<std::uint8_t>& px, int x, int y) {
+    return px[static_cast<std::size_t>(y) * 128 + static_cast<std::size_t>(x)];
+}
+
+BrushPreset chiselBrush(float size) {
+    BrushPreset p;
+    p.size      = size;
+    p.hardness  = 1.0f;
+    p.density   = 1.0f;
+    p.shape     = ShapeId::Stamp;
+    p.stampMask = SHAPE_CHISEL;
+    p.pressure  = PressureMapping{};
+    p.pressure.toSize = false;
+    return p;
+}
+
+}  // namespace
+
+TEST_CASE("a stamped dab is the shape of its mask, not a circle") {
+    // #47: the whole point. A round dab covers the same distance in every
+    // direction, so this test cannot pass on one however its numbers are set.
+    const std::vector<std::uint8_t> px = dabAlpha(chiselBrush(60.0f));
+
+    // Along the nib, well past where its short axis ends.
+    CHECK(alphaAt(px, 64 + 24, 64) == 255);
+    CHECK(alphaAt(px, 64 - 24, 64) == 255);
+    // Across it, at the same distance from the centre: outside the chisel and
+    // comfortably inside the circle of the same radius.
+    CHECK(alphaAt(px, 64, 64 + 24) == 0);
+    CHECK(alphaAt(px, 64, 64 - 24) == 0);
+    // And the short axis is not simply empty.
+    CHECK(alphaAt(px, 64, 64 + 6) == 255);
+}
+
+TEST_CASE("a stamped dab turns with the pen's tilt") {
+    // `Dab::angle` has been in the header since v1 and drove nothing.
+    const std::vector<std::uint8_t> flat = dabAlpha(chiselBrush(60.0f));
+    const std::vector<std::uint8_t> upright =
+        dabAlpha(chiselBrush(60.0f), 64.5, 64.5, 1.5707963f);   // a right angle
+
+    CHECK(alphaAt(upright, 64, 64 + 24) == 255);
+    CHECK(alphaAt(upright, 64 + 24, 64) == 0);
+    // The same mark, a quarter turn on: what is long one way is short the
+    // other, so a rotation that did nothing would make these equal.
+    CHECK(alphaAt(flat, 64 + 24, 64) == alphaAt(upright, 64, 64 + 24));
+    CHECK(alphaAt(flat, 64, 64 + 24) == alphaAt(upright, 64 + 24, 64));
+}
+
+TEST_CASE("texture takes coverage out of a dab, and none of it at strength zero") {
+    BrushPreset plain = flatPencil(50.0f);
+    BrushPreset toothed = plain;
+    toothed.texture         = TEXTURE_PAPER;
+    toothed.textureStrength = 0.6f;
+    BrushPreset zeroed = toothed;
+    zeroed.textureStrength = 0.0f;
+
+    const std::vector<std::uint8_t> flat  = dabAlpha(plain);
+    const std::vector<std::uint8_t> tooth = dabAlpha(toothed);
+
+    // Strength 0 is the untextured dab to the byte. Anything else and every
+    // brush in the program would change the day a texture field appeared.
+    CHECK(dabAlpha(zeroed) == flat);
+
+    // Texture only ever takes away, and it takes away somewhere.
+    std::size_t lighter = 0;
+    for (std::size_t i = 0; i < flat.size(); ++i) {
+        REQUIRE(tooth[i] <= flat[i]);
+        if (tooth[i] < flat[i]) ++lighter;
+    }
+    CHECK(lighter > 500);
+    // The dab is still all but solid where the tooth peaks, so this is a grain
+    // and not a uniform fade. Not 255: the noise's own peaks are sampled at
+    // texel centres and land a step or two below the top of the range.
+    CHECK(*std::ranges::max_element(tooth) > 245);
+}
+
+TEST_CASE("paper grain is fixed to the canvas, not carried by the dab") {
+    // Two dabs one mask apart see the same tooth; two dabs one pixel apart do
+    // not. Grain that rode with the dab would pass the first and fail the
+    // second — and would average itself away wherever a stroke overlapped.
+    BrushPreset p = flatPencil(30.0f);
+    p.texture         = TEXTURE_PAPER;
+    p.textureStrength = 0.7f;
+
+    const std::vector<std::uint8_t> a = dabAlpha(p, 40.5, 64.5);
+    const std::vector<std::uint8_t> tiled = dabAlpha(p, 40.5 + MASK_SIZE, 64.5);
+    const std::vector<std::uint8_t> moved = dabAlpha(p, 41.5, 64.5);
+
+    std::size_t sameTiled = 0, sameMoved = 0;
+    for (int y = 48; y < 80; ++y) {
+        for (int dx = -14; dx <= 14; ++dx) {
+            if (alphaAt(a, 40 + dx, y) == alphaAt(tiled, 40 + MASK_SIZE + dx, y))
+                ++sameTiled;
+            if (alphaAt(a, 40 + dx, y) == alphaAt(moved, 41 + dx, y)) ++sameMoved;
+        }
+    }
+    CHECK(sameTiled == 32 * 29);        // every pixel, exactly
+    CHECK(sameMoved < 32 * 29);
+}
+
+TEST_CASE("a preset naming a mask the registry does not have still paints") {
+    // DATA-MODEL has always said a preset naming a missing texture loads with
+    // it empty rather than failing. Now that something reads the field, the
+    // same has to be true of a dab: an id from a build with more masks than
+    // this one must give a plain round dab, not a crash and not an empty one.
+    const TextureId absent = static_cast<TextureId>(textureRegistry().size() + 99);
+
+    BrushPreset ghost = flatPencil(40.0f);
+    ghost.texture         = absent;
+    ghost.textureStrength = 0.9f;
+    CHECK(dabAlpha(ghost) == dabAlpha(flatPencil(40.0f)));
+
+    BrushPreset shaped = flatPencil(40.0f);
+    shaped.shape     = ShapeId::Stamp;
+    shaped.stampMask = absent;
+    CHECK(dabAlpha(shaped) == dabAlpha(flatPencil(40.0f)));
+}
+
+TEST_CASE("the texture registry is a registry: the app can add to it") {
+    // `TextureId` is documented as an index into a registry the app owns, so
+    // one that only ever holds what the engine put in it would not be one.
+    TextureRegistry& registry = textureRegistry();
+    const std::size_t before = registry.size();
+
+    BrushMask blank;
+    blank.name = "test: nothing at all";
+    blank.coverage.assign(static_cast<std::size_t>(MASK_SIZE) * MASK_SIZE, 0);
+    const TextureId id = registry.add(std::move(blank));
+
+    CHECK(registry.size() == before + 1);
+    REQUIRE(registry.find(id) != nullptr);
+    CHECK(registry.find(id)->name == "test: nothing at all");
+    CHECK(registry.find(static_cast<TextureId>(registry.size())) == nullptr);
+
+    // And it is used: a dab stamped through an empty mask paints nothing.
+    BrushPreset p = chiselBrush(40.0f);
+    p.stampMask = id;
+    const std::vector<std::uint8_t> px = dabAlpha(p);
+    CHECK(std::ranges::none_of(px, [](std::uint8_t a) { return a != 0; }));
+}
+
+TEST_CASE("the built-in presets differ in the mark they make, not only in numbers") {
+    // What #47 was actually about: seven presets that all laid down the same
+    // round, smooth dab. A preset set where nothing reads shape or texture
+    // passes every other test in this file.
+    const std::vector<BrushPreset> brushes = defaultBrushes();
+    CHECK(std::ranges::any_of(brushes, [](const BrushPreset& p) {
+        return p.shape == ShapeId::Stamp;
+    }));
+    CHECK(std::ranges::count_if(brushes, [](const BrushPreset& p) {
+              return p.texture.has_value() && p.textureStrength > 0.0f;
+          }) >= 2);
+
+    // The marker is the chisel, and it is a different mark from the pencil's
+    // at the same size — not merely a fainter one.
+    BrushPreset marker = defaultMarker();
+    marker.size = 40.0f;
+    const std::vector<std::uint8_t> nib = dabAlpha(marker);
+    CHECK(alphaAt(nib, 64 + 16, 64) > 0);
+    CHECK(alphaAt(nib, 64, 64 + 16) == 0);
+
+    // An eraser must not inherit the pencil's tooth: it is a copy of it.
+    CHECK(!defaultEraser().texture.has_value());
 }
 
 TEST_CASE("a soft stroke on a transparent canvas has no dark halo") {
@@ -770,11 +984,7 @@ namespace {
 void paintSquare(Document& doc, LayerId id, StraightRgba8 colour, double x, double y) {
     Layer* layer = doc.layerById(id);
     REQUIRE(layer != nullptr);
-    BrushPreset p = defaultPencil();
-    p.size = 40.0f;
-    p.hardness = 1.0f;
-    p.pressure = PressureMapping{};
-    p.pressure.toSize = false;
+    const BrushPreset p = flatPencil(40.0f);
 
     Stroke s;
     std::vector<Dab> scratch;
@@ -961,11 +1171,7 @@ TEST_CASE("a clipped layer shows only where its base has paint") {
     // Paint the clipped layer right across the canvas, well past the base.
     {
         Layer* layer = doc.layerById(shade);
-        BrushPreset p = defaultPencil();
-        p.size = 60.0f;
-        p.hardness = 1.0f;
-        p.pressure = PressureMapping{};
-        p.pressure.toSize = false;
+        const BrushPreset p = flatPencil(60.0f);
         Stroke s;
         std::vector<Dab> scratch;
         beginStroke(s, p, StraightRgba8{255, 0, 0, 255}, shade);
@@ -1804,11 +2010,8 @@ TEST_CASE("painting is clipped to the selection") {
     const Selection selection{40, 40, 20, 20};
 
     Layer* layer = doc.active();
-    BrushPreset p = defaultPencil();
-    p.size = 60.0f;                     // deliberately larger than the selection
-    p.hardness = 1.0f;
-    p.pressure = PressureMapping{};
-    p.pressure.toSize = false;
+    // Deliberately larger than the selection.
+    const BrushPreset p = flatPencil(60.0f);
 
     Stroke s;
     std::vector<Dab> scratch;

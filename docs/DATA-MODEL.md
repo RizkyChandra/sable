@@ -444,6 +444,13 @@ struct Dab {
     /// it away — this is where the banding is made, before storage is reached.
     PremulRgba16 colour{};
     bool  erase = false;       // from BrushPreset::isEraser
+
+    /// Resolved once per dab and borrowed from the registry, which only ever
+    /// grows: the pixel loop pays no lookup and no lifetime question. Null is
+    /// the ordinary round, untextured dab (D-029).
+    const BrushMask* stamp = nullptr;   // footprint, in the dab's turned frame
+    const BrushMask* grain = nullptr;   // tiled over the CANVAS, not the dab
+    float grainStrength = 0.0f;         // 0..1; 0 is the untextured dab exactly
 };
 ```
 
@@ -487,16 +494,35 @@ allocates nothing (D-012).
 
 ## Brushes
 
-`Round` is the only shape in v1; the enum exists so the stamp path has somewhere
-to land. Textures are looked up in a registry the app owns, so a preset that
-names a missing texture loads with `texture` empty rather than failing.
+`Round` is the analytic falloff `applyDab` computes from the distance to the dab
+centre. `Stamp` cuts that falloff to the shape of a mask, turned by `Dab::angle`
+— so hardness still owns the dab's edge and the mask owns its outline (D-029).
+
+Shapes and textures are the same thing sampled in different spaces, and come out
+of the same registry: a shape rides with the dab, a texture is tiled over the
+canvas so overlapping dabs reveal the same tooth. A preset naming a mask this
+build does not have paints a plain round dab rather than failing.
 
 ```cpp
 enum class ShapeId : uint8_t { Round, Stamp };
 
-/// Index into the loaded texture registry. Not a pointer — presets are
-/// serialised, and the registry outlives none of them.
+/// Index into the texture registry. Not a pointer — presets are serialised,
+/// and the registry outlives none of them.
 using TextureId = uint32_t;
+
+/// Coverage, 0..255, on a fixed square grid. 64 on a side: smaller repeats
+/// visibly when grain is tiled across a wide fill, larger strains the transfer
+/// to the GPU.
+inline constexpr int32_t MASK_SIZE = 64;
+
+struct BrushMask {
+    std::string name;
+    std::vector<uint8_t> coverage;   // MASK_SIZE * MASK_SIZE, row-major
+};
+
+/// Process-wide, reached like `paintBackend()`, and append-only: a `Dab`
+/// borrows a pointer to a mask for the length of a stroke.
+TextureRegistry& textureRegistry();
 
 struct BrushPreset {
     std::string id;             // stable slug, used by preset files on disk
@@ -509,9 +535,10 @@ struct BrushPreset {
     float spacingFactor   = 0.1f;   // fraction of diameter
     float hardness        = 1.0f;   // 0..1; 1 crisp pencil, 0 airbrush falloff
 
-    ShapeId shape = ShapeId::Round;         // round, or a stamp image
-    std::optional<TextureId> texture;
-    float textureStrength = 0.0f;
+    ShapeId shape = ShapeId::Round;         // round, or a stamp mask
+    TextureId stampMask = SHAPE_CHISEL;      // which mask, when shape is Stamp
+    std::optional<TextureId> texture;        // grain, multiplied into coverage
+    float textureStrength = 0.0f;            // 0..1; 0 leaves coverage untouched
 
     // Watercolour / smudge family only.
     float blending    = 0.0f;   // 0..1, canvas colour picked up
