@@ -50,8 +50,20 @@ struct Error {
                                                     std::int32_t w, std::int32_t h);
 
 /// Never modifies the document, and never clears the dirty flag (US-07.5).
+///
+/// Carries `doc.colourProfile` out in the PNG's `iCCP` chunk when there is one
+/// (D-034), so the numbers Sable wrote are read back as the colours it meant.
 [[nodiscard]] std::expected<void, Error> exportPng(
     const Document& doc, const std::filesystem::path& path);
+
+/// The profile in a PNG's `iCCP` chunk, or an empty one if it carries none.
+///
+/// Parses the chunk rather than decoding the image: this is called on a
+/// `mergedimage.png` an ORA or KRA container happens to hold, and inflating a
+/// whole canvas to read a header would be the expensive way to learn nothing
+/// most of the time. Never throws and never trusts a length — a PNG is a file
+/// somebody else wrote.
+[[nodiscard]] IccProfile iccProfileFromPng(const void* bytes, std::size_t size);
 
 /// The colour actually visible at a canvas pixel: every visible layer
 /// composited over the background, then unpremultiplied (US-13.3, US-13.4).

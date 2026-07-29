@@ -57,7 +57,26 @@ UndoRecord mergeLayerDown(Document& doc, LayerId id) {
 
 std::vector<PremulRgba8> compositeRect(const Document& doc, std::int32_t x,
                                        std::int32_t y, std::int32_t w, std::int32_t h) {
-    return paintBackend().compositeRect(doc, x, y, w, h);
+    std::vector<PremulRgba8> px = paintBackend().compositeRect(doc, x, y, w, h);
+
+    // The display conversion (D-034) lives HERE, above the backend, and not in
+    // CpuBackend::compositeRect and GpuBackend::compositeRect both.
+    //
+    // This is the whole answer to "CPU and GPU must agree after conversion":
+    // there is one conversion, applied to whichever backend's output, so the
+    // two cannot drift — a colour transform written into one compositor and
+    // forgotten in the other is exactly the divergence tests/differential.cpp
+    // exists to catch, and the cheapest way to pass that test is to make the
+    // bug unrepresentable. It also keeps the conversion off `flatten` and
+    // `exportPng`, which go through the backend member directly: an export
+    // carries the document's own colour and its own profile, never the
+    // monitor's.
+    //
+    // No-op — not even a copy — unless a display profile has been set and it
+    // differs from the document's, which is what leaves an untagged document on
+    // a default build bit for bit as it was.
+    (void)convertToDisplay(doc.colourProfile, px.data(), px.size());
+    return px;
 }
 
 StraightRgba8 pickColour(const Document& doc, std::int32_t x, std::int32_t y) {

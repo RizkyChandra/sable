@@ -27,6 +27,8 @@
 #include <string_view>
 #include <vector>
 
+#include "lcms2.h"   // this file builds the monitor profile it converts to
+
 #include "sbl/backend.hpp"
 #include "sbl/gpu.hpp"
 #include "sbl/canvas.hpp"
@@ -717,6 +719,85 @@ TEST_CASE("the reference and the candidate backend agree on every scenario") {
         const Deviation twice = differ(*subject, *subject, c, width);
         CHECK_MESSAGE(twice.colour() == 0, c.name << ": " << describe(twice, width));
         CHECK_MESSAGE(twice.alpha() == 0, c.name << ": " << describe(twice, width));
+    }
+}
+
+TEST_CASE("the display conversion cannot diverge between the two backends") {
+    // #53's third acceptance criterion. A colour transform written into one
+    // compositor and forgotten in the other is precisely the divergence this
+    // file exists to catch — so D-034 put the conversion ABOVE both of them, in
+    // the free `compositeRect` every display path goes through, and this case
+    // is what says it stayed there.
+    //
+    // It runs with a display profile actually installed, because with none the
+    // question is vacuous: the conversion is a no-op, and any two backends
+    // agree about doing nothing.
+    PaintBackend* subject = candidate();
+    if (subject == nullptr) {
+        MESSAGE("no GPU device — the display conversion was not compared");
+        return;
+    }
+
+    // Adobe RGB (1998) as the monitor, so an unconverted buffer is a visibly
+    // different picture rather than a rounding away from one.
+    struct Restore {
+        IccProfile saved = displayProfile();
+        ~Restore() { setDisplayProfile(saved); }
+    } restore;
+
+    const cmsCIExyY white{0.3127, 0.3290, 1.0};
+    const cmsCIExyYTRIPLE primaries{{0.6400, 0.3300, 1.0},
+                                    {0.2100, 0.7100, 1.0},
+                                    {0.1500, 0.0600, 1.0}};
+    cmsToneCurve* curve = cmsBuildGamma(nullptr, 563.0 / 256.0);
+    REQUIRE(curve != nullptr);
+    cmsToneCurve* curves[3]{curve, curve, curve};
+    cmsHPROFILE handle = cmsCreateRGBProfile(&white, &primaries, curves);
+    cmsFreeToneCurve(curve);
+    REQUIRE(handle != nullptr);
+    cmsUInt32Number size = 0;
+    REQUIRE(cmsSaveProfileToMem(handle, nullptr, &size) != 0);
+    IccProfile monitor;
+    monitor.data.resize(size);
+    REQUIRE(cmsSaveProfileToMem(handle, monitor.data.data(), &size) != 0);
+    cmsCloseProfile(handle);
+    setDisplayProfile(monitor);
+
+    // The FREE function, not the member: that is the one the canvas view calls
+    // and the one the conversion hangs off.
+    const auto displayFrame = [](PaintBackend& backend, const Case& c,
+                                 std::int32_t& width) {
+        const InstalledBackend installed{backend};
+        Document doc = c.build(backend);
+        width = doc.width;
+        REQUIRE(backend.readback(doc).has_value());
+        std::vector<PremulRgba8> px = compositeRect(doc, 0, 0, doc.width, doc.height);
+        CHECK_MESSAGE(!backend.takeError().has_value(), c.name);
+        return px;
+    };
+
+    for (const Case& c : cases()) {
+        std::int32_t width = 0, unusedWidth = 0;
+        const std::vector<PremulRgba8> reference = displayFrame(cpuBackend(), c, width);
+        const std::vector<PremulRgba8> device = displayFrame(*subject, c, unusedWidth);
+
+        // That the conversion happened at all. Without this the case passes
+        // just as happily on a build where nothing converts anything, which is
+        // the state it was written to rule out.
+        std::vector<PremulRgba8> unmanaged;
+        {
+            const InstalledBackend installed{cpuBackend()};
+            Document doc = c.build(cpuBackend());
+            unmanaged = cpuBackend().compositeRect(doc, 0, 0, doc.width, doc.height);
+        }
+        CHECK_MESSAGE(compare(reference, unmanaged).colour() > kColourTolerance,
+                      "the display conversion did nothing in " << c.name);
+
+        const Deviation dev = compare(reference, device);
+        CHECK_MESSAGE(dev.colour() <= kColourTolerance,
+                      c.name << ": " << describe(dev, width));
+        CHECK_MESSAGE(dev.alpha() <= kAlphaTolerance,
+                      c.name << ": " << describe(dev, width));
     }
 }
 

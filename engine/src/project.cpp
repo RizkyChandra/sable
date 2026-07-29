@@ -225,8 +225,12 @@ std::expected<void, Error> saveProject(const Document& doc,
     // needs would lock older Sables out for no gain.
     const bool anyStored = std::ranges::any_of(
         doc.storedSelections, [](const StoredSelection& s) { return !s.selection.empty(); });
+    const bool tagged = !doc.colourProfile.empty();
+    // Highest wins: a version is one number, and a document that is tagged AND
+    // carries stored selections needs a reader that understands both.
     manifest["format_version"] =
-        anyStored                          ? SABLE_FORMAT_VERSION_STORED
+        tagged                             ? SABLE_FORMAT_VERSION_ICC
+      : anyStored                          ? SABLE_FORMAT_VERSION_STORED
       : anyMask                            ? SABLE_FORMAT_VERSION_MASK
       : doc.depth == ColourDepth::Bits16   ? SABLE_FORMAT_VERSION_16BIT
                                            : SABLE_FORMAT_VERSION_8BIT;
@@ -236,9 +240,26 @@ std::expected<void, Error> saveProject(const Document& doc,
     manifest["dpi"]            = doc.dpi;
     manifest["background"]     = hexColour(doc.background);
     manifest["tile_size"]      = TILE_SIZE;
+    // D-105 wrote `"space": "sRGB"` unconditionally so that a future ICC-aware
+    // Sable could tell its files apart. D-034 is that version, and this is the
+    // slot: untagged still says exactly "sRGB" and nothing more, so a file this
+    // build writes for an ordinary document is byte-identical to the one it
+    // wrote yesterday. A tagged document names its profile and points at the
+    // container entry holding the bytes — the description alone is a label, and
+    // reconstructing a profile from its name is how colour gets it wrong.
     manifest["colour"] = {{"depth", static_cast<int>(doc.depth)},
-                          {"space", "sRGB"},
+                          {"space", profileDescription(doc.colourProfile)},
                           {"premultiplied", true}};
+    if (tagged) {
+        manifest["colour"]["profile"] = "colour.icc";
+        // Stored, not deflated — D-100's reasoning for the tiles applies here
+        // too: `unzip -p x.sable colour.icc` should hand a working profile
+        // straight to any colour tool.
+        if (!mz_zip_writer_add_mem(&zip, "colour.icc", doc.colourProfile.data.data(),
+                                   doc.colourProfile.data.size(), MZ_NO_COMPRESSION))
+            return abort(ErrorKind::Io,
+                         "could not write the colour profile to " + path.string());
+    }
     manifest["active_layer"]   = doc.activeLayer;
     manifest["layers"]         = json::array();
 
@@ -498,6 +519,41 @@ std::expected<Document, Error> loadProject(const std::filesystem::path& path) {
     if (manifest.contains("colour") && manifest["colour"].is_object() &&
         manifest["colour"].value("depth", 8) == 16)
         doc.depth = ColourDepth::Bits16;
+
+    // D-034. A v1-era manifest says `"space": "sRGB"` and names no profile, so
+    // it takes this branch not at all and loads as the untagged sRGB document
+    // it has always been — which is the acceptance criterion this feature is
+    // not allowed to break. Only an explicit `colour.profile` entry is read.
+    if (manifest.contains("colour") && manifest["colour"].is_object()) {
+        const std::string entry = manifest["colour"].value("profile", std::string{});
+        // Anywhere inside the container, but only inside it: a manifest is
+        // something a user can hand-edit, and "../../etc/passwd" must resolve
+        // to nothing rather than to a file read. miniz looks up by exact name
+        // and never touches the filesystem, so the containment is free — the
+        // check below is only that the name is one we wrote.
+        if (entry == "colour.icc") {
+            std::size_t size = 0;
+            void* data =
+                mz_zip_reader_extract_file_to_heap(&zip, entry.c_str(), &size, 0);
+            if (data != nullptr) {
+                IccProfile profile;
+                const auto* bytes = static_cast<const std::uint8_t*>(data);
+                profile.data.assign(bytes, bytes + size);
+                mz_free(data);
+                // A profile that will not parse is dropped rather than carried:
+                // the document then behaves as untagged sRGB, which is what it
+                // did before this feature and is never worse than a transform
+                // built from rubbish. The artist is told, because the file did
+                // claim a colour space and they are no longer getting it.
+                if (isUsableProfile(profile) && !profile.empty())
+                    doc.colourProfile = std::move(profile);
+                else
+                    doc.warnings.push_back(
+                        "The colour profile in this project could not be read, so "
+                        "it has been opened as sRGB.");
+            }
+        }
+    }
 
     // Absent before v3, and in any v3 document with nothing selected. A
     // malformed one is dropped rather than repaired: a selection that is not

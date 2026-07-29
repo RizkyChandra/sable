@@ -8,6 +8,8 @@
 #include <system_error>
 #include <vector>
 
+#include "sbl/io.hpp"   // iccProfileFromPng
+
 #include "blit.hpp"
 #include "lodepng.h"
 #include "miniz.h"
@@ -395,6 +397,13 @@ std::expected<Document, Error> readOpenRaster(const std::filesystem::path& path)
         return fail(ErrorKind::Malformed,
                     "the stack.xml in " + path.string() + " is not a valid "
                     "OpenRaster manifest");
+
+    // OpenRaster's stack.xml has no colour space attribute at all, so the only
+    // place a profile can be is the `iCCP` chunk of the mergedimage.png the
+    // spec already asks for — which is where Krita and GIMP both put it
+    // (D-034). Absent in most ORA files, and absent means sRGB, as before.
+    const std::string merged = importer.entry("mergedimage.png");
+    adoptColourProfile(doc, iccProfileFromPng(merged.data(), merged.size()));
 
     doc.width  = parseInt(image->attributeOr("w", "0"));
     doc.height = parseInt(image->attributeOr("h", "0"));

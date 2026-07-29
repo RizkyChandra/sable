@@ -17,6 +17,8 @@
 // For VanishingPoint. The input boundary depends on nothing, so this is a
 // one-way edge, not a tangle.
 #include "sbl/input.hpp"
+// For IccProfile (D-034). Same one-way edge: colour.hpp knows nothing of tiles.
+#include "sbl/colour.hpp"
 
 namespace sbl {
 
@@ -695,6 +697,17 @@ struct Document {
     /// and one going down would throw away exactly what they turned it on for.
     /// Written to and read from the `.sable` manifest as `colour.depth`.
     ColourDepth depth = ColourDepth::Bits8;
+
+    /// What the pixel values MEAN (D-034, superseding D-105). Empty is the
+    /// default for a new document and for everything Sable wrote before this
+    /// existed: untagged, which is sRGB.
+    ///
+    /// Set only by an importer that found an embedded profile, or by loading a
+    /// `.sable` that recorded one. Nothing converts the pixels when it is set —
+    /// the document keeps the numbers the file had, and the conversion happens
+    /// on the way to the screen. Repainting an artist's file on import is the
+    /// one thing an importer must never do.
+    IccProfile colourProfile;
 
     std::vector<Layer> layers;             // index 0 = bottom
     LayerId  activeLayer = NO_LAYER;
