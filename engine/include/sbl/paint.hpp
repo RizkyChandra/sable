@@ -210,6 +210,53 @@ std::size_t paintSample(Stroke& s, PaintTarget& t, const InputSample& sample,
 [[nodiscard]] UndoRecord fillSelection(Document& doc, LayerId target,
                                        StraightRgba8 colour);
 
+// ------------------------------------------------------------------ gradient
+
+/// Linear and radial cover the overwhelming majority of use (#49). Anything
+/// further — angle, reflected, a multi-stop ramp — is a new member here and a
+/// new branch in one loop, so the enum is where it lands.
+enum class GradientShape : std::uint8_t { Linear, Radial };
+
+/// The axis the artist dragged, and what to ramp along it.
+struct Gradient {
+    GradientShape shape = GradientShape::Linear;
+
+    /// Canvas pixels. Linear ramps `from` to `to` along the axis and holds each
+    /// end's colour beyond it; radial takes (x0, y0) as the centre and the
+    /// axis's length as the radius.
+    double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
+
+    /// Straight alpha because that is what a colour picker deals in; the
+    /// interpolation between them is not (see `gradientFill`). `to.a == 0` is
+    /// the foreground-to-transparent case and needs no separate flag.
+    StraightRgba8 from{};
+    StraightRgba8 to{};
+
+    /// Ordered dither, applied only on an 8-bit document — see D-030. Off is
+    /// the exact ramp, which is what a test can pin and what a 16-bit document
+    /// gets anyway.
+    bool dither = true;
+};
+
+/// Lays a gradient over `target`, as one undoable step.
+///
+/// Composited `over` what is already there rather than replacing it, which is
+/// what makes a foreground-to-transparent gradient fade into the art beneath
+/// instead of erasing a hole through it. Honours the selection, `locked` and
+/// `preserveOpacity` exactly as `fillSelection` and `applyDab` do.
+///
+/// **The ends are interpolated PREMULTIPLIED**, for the reason `transformRegion`
+/// gives below: it is the only space where colour and alpha blend together
+/// correctly. Ramping straight-alpha values toward a transparent end drags the
+/// colour channels to zero alongside the alpha, and the fade comes out with a
+/// grey haze down it.
+///
+/// A zero-length axis does nothing and costs no undo step — a click that missed
+/// is not an edit, and which end of a ramp with no length to fill would be a
+/// coin toss.
+[[nodiscard]] UndoRecord gradientFill(Document& doc, LayerId target,
+                                      const Gradient& gradient);
+
 /// Move, scale and rotate, as one undoable action.
 struct Transform {
     double dx = 0.0, dy = 0.0;    // canvas pixels

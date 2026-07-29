@@ -21,7 +21,7 @@ namespace sbl {
 /// The background is left fully transparent, because PSD has no notion of one:
 /// whatever backs the artwork is a layer in the file and stays a layer here.
 ///
-/// A layer mask arrives as a `LayerMask` and stays editable (D-029, #48),
+/// A layer mask arrives as a `LayerMask` and stays editable (D-031, #48),
 /// including a mask on a GROUP — which used to be dropped because it applies to
 /// the folder's composited result rather than to any one child's pixels. It
 /// used to be multiplied into the layer's alpha instead (D-027), which made the
@@ -46,7 +46,7 @@ namespace sbl {
 /// exported, and identical pixels.
 ///
 /// A layer mask goes out as PSD's channel -2 with its own rectangle and default
-/// colour (D-029), so it is still a mask in Photoshop and still a mask when it
+/// colour (D-031), so it is still a mask in Photoshop and still a mask when it
 /// comes back.
 [[nodiscard]] std::expected<void, Error> writePsd(const Document& doc,
                                                   const std::filesystem::path& path);

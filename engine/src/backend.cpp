@@ -40,6 +40,10 @@ UndoRecord fillSelection(Document& doc, LayerId target, StraightRgba8 colour) {
     return paintBackend().fillSelection(doc, target, colour);
 }
 
+UndoRecord gradientFill(Document& doc, LayerId target, const Gradient& gradient) {
+    return paintBackend().gradientFill(doc, target, gradient);
+}
+
 UndoRecord transformRegion(Document& doc, LayerId target, const Selection& source,
                            const Transform& transform) {
     return paintBackend().transformRegion(doc, target, source, transform);

@@ -315,6 +315,10 @@ std::expected<void, Error> saveProject(const Document& doc,
                 strokes.push_back({{"colour", hexColour(stroke.colour)},
                                    {"width", stroke.width},
                                    {"min_width", stroke.minWidthRatio},
+                                   // No format bump for this: a reader that has
+                                   // never heard of it still sees the closed
+                                   // shape, because the tiles are what renders.
+                                   {"closed", stroke.closed},
                                    {"points", std::move(points)}});
             }
             entry["linework"] = {{"strokes", std::move(strokes)}};
@@ -561,6 +565,7 @@ std::expected<Document, Error> loadProject(const std::filesystem::path& path) {
                 stroke.colour = parseColour(s.value("colour", std::string("#000000ff")));
                 stroke.width  = std::clamp(s.value("width", 4.0f), 0.1f, 4000.0f);
                 stroke.minWidthRatio = std::clamp(s.value("min_width", 0.15f), 0.0f, 1.0f);
+                stroke.closed = s.value("closed", false);
                 if (s.contains("points") && s["points"].is_array()) {
                     for (const auto& p : s["points"]) {
                         // A point that is not three numbers is skipped rather

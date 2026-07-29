@@ -76,6 +76,36 @@ constexpr double kAlpha = 0.5;
     return c;
 }
 
+/// The four knots the spline needs for one segment of a stroke.
+struct Segment {
+    LinePoint p0, p1, p2, p3;
+};
+
+/// How many segments a stroke has. A closed one has the extra segment from its
+/// last point back to its first — that is the whole of what `closed` means to
+/// the geometry, so every walk below asks this rather than testing the flag.
+[[nodiscard]] std::size_t segmentCount(const LineStroke& stroke) noexcept {
+    const std::size_t n = stroke.points.size();
+    if (n < 2) return 0;
+    return stroke.closed ? n : n - 1;
+}
+
+/// Segment `i` of `stroke`, with its neighbours.
+///
+/// A closed stroke wraps for the neighbours as well as for the segment itself:
+/// taking a reflected end there would leave the tangent discontinuous at the
+/// join, which reads as a corner in a shape the artist drew as a smooth ring.
+[[nodiscard]] Segment segmentAt(const LineStroke& stroke, std::size_t i) noexcept {
+    const std::vector<LinePoint>& p = stroke.points;
+    const std::size_t n = p.size();
+    const LinePoint& p1 = p[i];
+    const LinePoint& p2 = p[(i + 1) % n];
+    if (stroke.closed)
+        return Segment{p[(i + n - 1) % n], p1, p2, p[(i + 2) % n]};
+    return Segment{i == 0 ? reflect(p1, p2) : p[i - 1], p1, p2,
+                   i + 2 < n ? p[i + 2] : reflect(p2, p1)};
+}
+
 [[nodiscard]] double radiusAt(const LineStroke& stroke, float pressure) noexcept {
     const float ratio = std::clamp(stroke.minWidthRatio, 0.0f, 1.0f);
     const float scale = ratio + (1.0f - ratio) * std::clamp(pressure, 0.0f, 1.0f);
@@ -147,21 +177,16 @@ struct CurveHit {
     std::optional<CurveHit> best;
     for (std::size_t s = 0; s < content.strokes.size(); ++s) {
         const LineStroke& stroke = content.strokes[s];
-        if (stroke.points.size() < 2) continue;
 
-        for (std::size_t i = 0; i + 1 < stroke.points.size(); ++i) {
-            const LinePoint& p1 = stroke.points[i];
-            const LinePoint& p2 = stroke.points[i + 1];
-            const LinePoint p0 = i == 0 ? reflect(p1, p2) : stroke.points[i - 1];
-            const LinePoint p3 = i + 2 < stroke.points.size() ? stroke.points[i + 2]
-                                                             : reflect(p2, p1);
+        for (std::size_t i = 0; i < segmentCount(stroke); ++i) {
+            const Segment seg = segmentAt(stroke, i);
 
-            const double chord = std::hypot(p2.x - p1.x, p2.y - p1.y);
+            const double chord = std::hypot(seg.p2.x - seg.p1.x, seg.p2.y - seg.p1.y);
             const auto steps = static_cast<int>(
                 std::max(1.0, std::ceil(chord * 1.5 / 1.0)));
             for (int k = 0; k <= steps; ++k) {
-                const LinePoint at =
-                    interpolate(p0, p1, p2, p3, static_cast<double>(k) / steps);
+                const LinePoint at = interpolate(seg.p0, seg.p1, seg.p2, seg.p3,
+                                                 static_cast<double>(k) / steps);
                 const double d = std::hypot(at.x - x, at.y - y);
                 // <= so that a later stroke wins a tie: it is the one drawn on
                 // top, so it is the one under the artist's cursor.
@@ -185,20 +210,21 @@ std::vector<LinePoint> samplePoints(const LineStroke& stroke, double stepPx) {
 
     const double step = std::max(stepPx, 0.05);
     out.push_back(stroke.points.front());
-    for (std::size_t i = 0; i + 1 < stroke.points.size(); ++i) {
-        const LinePoint& p1 = stroke.points[i];
-        const LinePoint& p2 = stroke.points[i + 1];
-        const LinePoint p0 = i == 0 ? reflect(p1, p2) : stroke.points[i - 1];
-        const LinePoint p3 = i + 2 < stroke.points.size() ? stroke.points[i + 2]
-                                                         : reflect(p2, p1);
+    const std::size_t segments = segmentCount(stroke);
+    for (std::size_t i = 0; i < segments; ++i) {
+        const Segment seg = segmentAt(stroke, i);
 
         // The chord underestimates a curved segment's length, so the 1.5 buys
         // back the slack. Overshooting costs a few stamps that land on pixels
         // already covered; undershooting leaves gaps in the line.
-        const double chord = std::hypot(p2.x - p1.x, p2.y - p1.y);
+        const double chord = std::hypot(seg.p2.x - seg.p1.x, seg.p2.y - seg.p1.y);
         const auto steps = static_cast<int>(std::max(1.0, std::ceil(chord * 1.5 / step)));
-        for (int k = 1; k <= steps; ++k)
-            out.push_back(interpolate(p0, p1, p2, p3, static_cast<double>(k) / steps));
+        // The last sample of a closed stroke's last segment IS the start point,
+        // already emitted above. Dropped so the ring is not closed twice.
+        const int emit = (stroke.closed && i + 1 == segments) ? steps - 1 : steps;
+        for (int k = 1; k <= emit; ++k)
+            out.push_back(interpolate(seg.p0, seg.p1, seg.p2, seg.p3,
+                                      static_cast<double>(k) / steps));
     }
     return out;
 }
@@ -276,6 +302,66 @@ std::optional<PointRef> nearestPoint(const LineworkContent& content, double x, d
         }
     }
     return best;
+}
+
+bool appendFreehand(LineStroke& stroke, const LinePoint& at, double spacingPx) {
+    if (!stroke.points.empty() &&
+        std::hypot(at.x - stroke.points.back().x, at.y - stroke.points.back().y) <
+            spacingPx)
+        return false;
+    stroke.points.push_back(at);
+    return true;
+}
+
+std::optional<std::size_t> nearestStroke(const LineworkContent& content, double x,
+                                         double y, double within) {
+    const std::optional<CurveHit> hit = nearestOnCurve(content, x, y, within);
+    if (!hit.has_value()) return std::nullopt;
+    return hit->stroke;
+}
+
+void transformStrokes(LineworkContent& content, const std::vector<std::size_t>& which,
+                      const Transform& transform) {
+    double minX = 0.0, minY = 0.0, maxX = 0.0, maxY = 0.0;
+    bool any = false;
+    for (const std::size_t s : which) {
+        if (s >= content.strokes.size()) continue;
+        for (const LinePoint& p : content.strokes[s].points) {
+            if (!any) { minX = maxX = p.x; minY = maxY = p.y; any = true; }
+            minX = std::min(minX, p.x); maxX = std::max(maxX, p.x);
+            minY = std::min(minY, p.y); maxY = std::max(maxY, p.y);
+        }
+    }
+    if (!any) return;
+
+    // The centre of the selection's own bounding box, exactly as
+    // `transformRegion` takes the centre of the region it was handed: a
+    // rotation about anything else moves a line the artist only asked to turn.
+    const double centreX = (minX + maxX) * 0.5;
+    const double centreY = (minY + maxY) * 0.5;
+    // Degenerate scales are clamped rather than refused, for the same reason
+    // as `transformRegion`: a zero here would collapse the curve to a point
+    // the artist can no longer grab to undo it by hand.
+    const double scaleX = std::abs(transform.scaleX) < 1e-6 ? 1e-6 : transform.scaleX;
+    const double scaleY = std::abs(transform.scaleY) < 1e-6 ? 1e-6 : transform.scaleY;
+    const double cosA = std::cos(transform.angle);
+    const double sinA = std::sin(transform.angle);
+    // One number for a width that has only one, taken as the area scale so a
+    // stroke stretched on one axis alone still thickens, just less.
+    const auto widthScale =
+        static_cast<float>(std::sqrt(std::abs(scaleX * scaleY)));
+
+    for (const std::size_t s : which) {
+        if (s >= content.strokes.size()) continue;
+        LineStroke& stroke = content.strokes[s];
+        for (LinePoint& p : stroke.points) {
+            const double ox = (p.x - centreX) * scaleX;
+            const double oy = (p.y - centreY) * scaleY;
+            p.x = ox * cosA - oy * sinA + centreX + transform.dx;
+            p.y = ox * sinA + oy * cosA + centreY + transform.dy;
+        }
+        stroke.width *= widthScale;
+    }
 }
 
 std::optional<PointRef> insertPoint(LineworkContent& content, double x, double y,

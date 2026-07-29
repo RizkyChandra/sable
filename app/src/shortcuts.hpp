@@ -24,7 +24,7 @@ enum class Action {
     FitToWindow, ActualSize, ZoomIn, ZoomOut,
     RotateLeft, RotateRight, ResetRotation,
     ToolBrush, ToolEraser, ToolFill, ToolSelect, ToolLasso, ToolWand,
-    ToolTransform, ToolText, ToolLinework,
+    ToolTransform, ToolText, ToolLinework, ToolGradient,
     SizeDown, SizeUp, SwapColours, ResetColours,
     ToggleSymmetry, TogglePerspective,
     Count,
