@@ -325,6 +325,10 @@ struct Document {
 
     UndoStack undo;
     std::optional<Selection> selection;     // Milestone 3; empty = whole canvas
+    // Selections kept by name (#52, D-033). Document data, saved and reloaded.
+    // The current one above is still the only one anything paints through;
+    // these are sources to restore or combine with.
+    std::vector<StoredSelection> storedSelections;
     std::filesystem::path path;             // empty until first save
     bool dirty = false;
 
@@ -716,6 +720,7 @@ compressed and deflating them again wastes save time for nothing.
 document.json                          manifest
 thumbnail.png                          256 px preview for file browsers
 selection.png                          8-bit greyscale coverage mask, when there is one
+selections/<n>.png                     the same, for stored selection n (D-033)
 layers/<layerId>/tiles/<tx>_<ty>.png   one PNG per non-empty tile, straight alpha
 layers/<layerId>/mask/<tx>_<ty>.png    one PNG per allocated mask tile (D-031)
 ```
@@ -755,7 +760,12 @@ layers/<layerId>/mask/<tx>_<ty>.png    one PNG per allocated mask tile (D-031)
   ],
   "active_layer": 1,
   "vanishing_points": [ { "x": -320.5, "y": 512.0, "enabled": true } ],
-  "selection": { "x": 100, "y": 80, "w": 240, "h": 300, "mask": true }
+  "selection": { "x": 100, "y": 80, "w": 240, "h": 300, "mask": true },
+  "selections": [
+    { "name": "Character", "x": 100, "y": 80, "w": 240, "h": 300,
+      "mask": true, "file": "selections/0.png" },
+    { "name": "Sky", "x": 0, "y": 0, "w": 1024, "h": 300, "mask": false }
+  ]
 }
 ```
 
@@ -765,17 +775,26 @@ Rules:
   message rather than reading it wrong. Version 2 added `vanishing_points`,
   version 3 `selection`, version 4 `"kind": "text"` and the `text` object
   beside it, version 5 `"kind": "linework"` and the `linework` object beside
-  it, version 6 16-bit colour, version 7 layer masks. Everything each adds is
-  optional, so v1 to v6 files still load unchanged.
-- **Version 6 is written only by a 16-bit document, and version 7 only by a
-  document with a layer mask.** Every earlier bump was unconditional because
-  each added something an ordinary document might contain; depth and masks are
-  per-document choices most documents never make. An 8-bit document with no
-  mask keeps declaring 5, so saving from a build that has both does not lock an
-  ordinary painting out of an older Sable in exchange for nothing — and a file
-  an older Sable genuinely would misread is still refused by name. A masked
-  document needs that most: an older Sable would open it, show every layer
-  unmasked, and write the masks away on the next save.
+  it, version 6 16-bit colour, version 7 layer masks, version 8 the
+  `selections` array. Everything each adds is optional, so v1 to v7 files still
+  load unchanged.
+- **Version 6 is written only by a 16-bit document, version 7 only by a
+  document with a layer mask, and version 8 only by one carrying stored
+  selections.** Every earlier bump was unconditional because each added
+  something an ordinary document might contain; depth, masks and stored
+  selections are per-document choices most documents never make. An 8-bit
+  document with none of them keeps declaring 5, so saving from a build that has
+  all three does not lock an ordinary painting out of an older Sable in
+  exchange for nothing — and a file an older Sable genuinely would misread is
+  still refused by name. A masked document needs that most: an older Sable
+  would open it, show every layer unmasked, and write the masks away on the
+  next save. Stored selections would go the same way.
+- Each entry of `selections` is the `selection` object plus a `name` and, when
+  it has a coverage mask, the `file` that holds it. Named rather than derived
+  from the array position because an entry can be dropped on the way out — an
+  empty one — and the wrong mask on the right name is worse than none. The ZIP
+  path is numbered rather than named for the same reason nothing else here is:
+  a name is the artist's and may contain a slash.
 - A layer's `mask` object carries `enabled` and `outside`; its tiles are PNGs
   under `mask/`, opaque grey, coverage in the red channel. **Every allocated
   mask tile is written, including a fully transparent one** — unlike the
@@ -837,11 +856,15 @@ at the original path. Never written over `Document::path`.
 
 ## What is deliberately not modelled yet
 
-Nothing that was listed here is still missing. Layer masks were the last of
-them, and they arrived at format version 7 through exactly the hook this
+Nothing that was listed here is still missing. Stored selections were the last
+of them, and they arrived at format version 8 through exactly the hook this
 section named — the same one perspective rulers (version 2), selection masks
-(version 3), text (version 4), linework (version 5) and 16-bit colour
-(version 6) used. See D-031, and #52 for the other half of the coverage story:
-a selection and a mask are the same per-pixel question asked about different
-things, and `maskCoverage()` and `Selection::coverage()` answer it in the same
-units on purpose.
+(version 3), text (version 4), linework (version 5), 16-bit colour (version 6)
+and layer masks (version 7) used.
+
+The other half of the coverage story is answered too. D-033 keeps a selection
+and a mask two representations of one convention rather than one type: they are
+the same per-pixel question asked about different things, `maskCoverage()` and
+`Selection::coverage()` answer it in the same units on purpose, and
+`selectionFromMask` / `maskFromSelection` cross between them with no rounding
+in either direction.

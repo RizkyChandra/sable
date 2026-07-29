@@ -57,4 +57,43 @@ enum class SelectMode : std::uint8_t { Replace, Add, Subtract, Intersect };
 [[nodiscard]] Selection combineSelections(const Selection& current,
                                           const Selection& next, SelectMode mode);
 
+// ------------------------------------------------------------------- sources
+// #52. Coverage the artist already made, somewhere else in the document.
+//
+// D-033: a mask and a selection stay two representations of one convention —
+// 0 hides, 255 shows, in between is the soft edge (D-031 wrote `maskCoverage`
+// to that convention for exactly this). These three functions are the whole of
+// the crossing, and because the units already agree none of them rounds, ramps
+// or thresholds anything: an anti-aliased edge goes across intact in either
+// direction.
+
+/// A layer's own alpha, as a selection — the shape of what is painted on it.
+///
+/// Folds in the layer's mask when it has an enabled one, because the shape the
+/// artist means is the shape they can see: a masked-away corner is not part of
+/// the layer any more, and selecting it would put the next fill somewhere the
+/// screen says is empty.
+///
+/// Clipped to the canvas, and trimmed to what it actually covers. A layer with
+/// nothing on it selects nothing.
+[[nodiscard]] Selection selectionFromLayerAlpha(const Layer& layer,
+                                                std::int32_t width,
+                                                std::int32_t height);
+
+/// A layer mask's coverage, as a selection, over the canvas rectangle.
+///
+/// Bounded by the canvas rather than by the mask's tiles: `LayerMask::outside`
+/// covers the whole plane, so "the tiles that exist" would drop everything a
+/// reveal-all mask says about the rest of the picture.
+[[nodiscard]] Selection selectionFromMask(const LayerMask& mask,
+                                          std::int32_t width, std::int32_t height);
+
+/// A selection's coverage, as a layer mask.
+///
+/// `outside` is 0 and only the tiles the selection's rectangle touches are
+/// allocated: everything beyond a selection is unselected, and a mask that
+/// spelled that out tile by tile would cost 64 MiB on a large canvas to say
+/// nothing. No canvas size needed for the same reason.
+[[nodiscard]] LayerMask maskFromSelection(const Selection& selection);
+
 }  // namespace sbl

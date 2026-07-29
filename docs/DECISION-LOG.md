@@ -1456,6 +1456,110 @@ path to keep in step the day one was wanted.
 
 ---
 
+## D-033 — Selections and masks share a convention, not a representation
+
+**Status:** Decided
+**Affects:** `Document`, `Selection`, `sbl/select.hpp`, `engine/src/select.cpp`,
+`engine/src/canvas.cpp`, `engine/src/project.cpp`, `app/src/main.cpp`,
+`.sable` format version 8
+**Answers:** #52 · **Follows:** D-031
+
+D-031 left this open on purpose: `maskCoverage()` and `Selection::coverage()`
+were written to the same units and the same convention "so #52 can convert
+either way without a new definition of coverage", and the conversion itself was
+left to whoever knew what it needed. This is that answer.
+
+**They stay two types.** A mask and a selection genuinely are the same
+per-pixel question — 0 hides, 255 shows, in between is the soft edge — but they
+are asked in different shapes, and merging them would cost each one the thing
+that makes it good at its job:
+
+- A `Selection` is a **bounding box plus an optional dense byte array**, and its
+  empty-mask fast path is the entire reason a plain rectangular marquee costs
+  four comparisons per pixel instead of a megabyte of 255s and a cache miss
+  (D-011's `selection.png` exists only for the other case). A `LayerMask` has no
+  way to express "this rectangle and nothing else": `outside = 255` with no
+  tiles means the whole plane, and a marquee expressed that way would turn every
+  bounded loop in the paint path into a full-canvas walk.
+- A `LayerMask` is **sparse tiles plus an `outside` byte**, because it is
+  painted with the ordinary brush and has to be undoable, snapshottable and
+  uploadable tile by tile (D-031). Giving `Selection` that shape would put a
+  hash lookup inside `coverage()` — which the fill, the dab and the transform
+  all call per pixel.
+
+So the crossing is three functions in `sbl/select.hpp` and nothing else:
+`selectionFromLayerAlpha`, `selectionFromMask` and `maskFromSelection`. Because
+the units already agree, **none of them rounds, ramps or thresholds anything**:
+a lasso converted to a mask and back is byte-identical, and there is one test
+that says so pixel by pixel.
+
+**Booleans were already right, and now they are pinned.** `combineSelections`
+has combined coverage elementwise — `max`, `a * (255 - b) / 255`, `min` — since
+#18. What #52 adds is the case that would have caught it going wrong: two
+anti-aliased edges half a pixel apart, so both operands are partly covered in
+the *same* pixels. The failure this guards is not "the wrong region" — it is
+the right region with its gradient snapped to 0 or 255 along the overlap, which
+the artist sees as a jagged seam the next time they fill through it. Making the
+boolean binary fails both new cases; making it binary and *nothing else* passes
+every case that existed before.
+
+**A layer's alpha, not a new `LayerKind`.** The issue offered a dedicated
+selection-layer kind. Alpha-of-an-existing-layer covers what an artist actually
+does — select the shape they already painted — for one function and no new case
+in the compositor, the layer panel, the PSD writer, the ORA writer or
+`cloneDocument`. A paintable selection layer is a different feature; #48's mask
+is already a paintable coverage channel, and `From layer mask` reaches it.
+
+`selectionFromLayerAlpha` folds in an enabled mask, because the shape an artist
+means is the shape they can see: a masked-away corner is not part of the layer
+any more, and selecting it would send the next fill somewhere the screen says
+is empty.
+
+**Stored selections are document data with names, and are not undoable.**
+`Document::storedSelections` is a `std::vector<StoredSelection>` — a name and a
+`Selection`. A vector rather than a map because the order the artist stored them
+in is the order they expect to see them, and a handful is the realistic count.
+Storing and restoring do not push undo records: Ctrl+Z on a drawing application
+takes back a *mark*, selecting has never been on that stack, and spending an
+artist's history on it would be a surprise in the one place surprises cost work.
+Writing a layer's mask from a selection **is** an undo step, and goes through a
+new `setLayerMask` for exactly that reason — the tiles it replaces have to
+travel into the record before they stop existing, which is `deleteLayerMask`'s
+argument applied in the other direction.
+
+**Format version 8, written only by a document that has one.** The same deal as
+D-023's depth and D-031's masks, and needed for the same reason: an older Sable
+would open the document, show none of the selections the artist kept, and write
+them away on the next save.
+
+**What this does not do**, so nobody reads the API as promising it:
+
+- **No `LayerKind::Selection`.** See above. The enum still has room.
+- **No selection keyboard shortcuts.** Store and restore are menu items under
+  Edit → Selection. Which stored selection a key would mean is not a question
+  one default answers, and every binding here would have to be reassignable
+  (D-101) for something an artist does a few times a session.
+- **No stored selections in PSD, ORA or KRA.** PSD has alpha channels that
+  could hold one; the mapping is not obvious (name, colour, opacity, "spot vs
+  mask"), and guessing it would produce files other applications read wrong.
+  The `.sable` keeps them.
+- **`maskFromSelection` allocates a full tile per tile the selection touches**,
+  which is D-031's stated 256 KiB-where-64-would-do, now paid by a second
+  caller. Same upgrade path: a narrow tile type confined to `LayerMask`.
+
+**Alternative rejected — make `Selection` hold a `LayerMask`.** One
+representation, one conversion fewer, and the sparse tiles would have made a
+full-canvas selection cheap. It puts a hash lookup in `coverage()` — called per
+pixel by the fill, the dab, the gradient and the transform — and it deletes the
+"empty mask means solid rectangle" fast path that every marquee in the program
+depends on. Neither cost buys the artist anything.
+
+**Alternative rejected — store selections outside the document**, in the
+application's settings. It would have needed no format bump. A selection is
+measured in the pixels of one particular canvas, so it is meaningless beside any
+other document, and a file the artist sends to themselves on another machine
+would arrive without the work — which is the whole of what #52 is about.
+
 ## D-035 — Several open documents: an `OpenDocument` per tab, a texture cache each
 
 **Status:** Decided
