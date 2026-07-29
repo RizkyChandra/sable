@@ -3186,6 +3186,14 @@ int main(int argc, char** argv) {
         // the panels pixel-identical between the two frames (the tool panel
         // shows the ruler's state, not its position), so anything that differs
         // outside the viewport is an overlay that escaped.
+        //
+        // The two spaces here are NOT the same one. `app.viewport` comes from
+        // the dockspace's central node, so it is in ImGui's coordinates, which
+        // are window points; SDL_RenderReadPixels hands back backing pixels.
+        // On a 1x display they coincide, which is why this passed on Linux and
+        // failed the macOS build with three quarters of the frame counted as
+        // outside. The ratio is measured rather than assumed, so it stays
+        // right on whatever the runner turns out to be.
         {
             const auto shoot = [&](double cx, double cy) -> SDL_Surface* {
                 app.symmetry.centreX = cx;
@@ -3205,14 +3213,21 @@ int main(int argc, char** argv) {
                                       static_cast<double>(app.doc.height) - 80.0);
             if (shotA != nullptr && shotB != nullptr &&
                 shotA->w == shotB->w && shotA->h == shotB->h) {
+                const ImVec2 display = ImGui::GetIO().DisplaySize;
+                const float sx = display.x > 0.0f
+                               ? static_cast<float>(shotA->w) / display.x : 1.0f;
+                const float sy = display.y > 0.0f
+                               ? static_cast<float>(shotA->h) / display.y : 1.0f;
+                const float vx0 = app.viewport.x * sx;
+                const float vy0 = app.viewport.y * sy;
+                const float vx1 = (app.viewport.x + app.viewport.w) * sx;
+                const float vy1 = (app.viewport.y + app.viewport.h) * sy;
                 int escaped = 0;
                 for (int y = 0; y < shotA->h; ++y) {
                     for (int x = 0; x < shotA->w; ++x) {
                         const bool inside =
-                            static_cast<float>(x) >= app.viewport.x &&
-                            static_cast<float>(y) >= app.viewport.y &&
-                            static_cast<float>(x) <  app.viewport.x + app.viewport.w &&
-                            static_cast<float>(y) <  app.viewport.y + app.viewport.h;
+                            static_cast<float>(x) >= vx0 && static_cast<float>(y) >= vy0 &&
+                            static_cast<float>(x) <  vx1 && static_cast<float>(y) <  vy1;
                         if (inside) continue;
                         Uint8 ar = 0, ag = 0, ab = 0, aa = 0, br = 0, bg = 0, bb = 0, ba = 0;
                         if (!SDL_ReadSurfacePixel(shotA, x, y, &ar, &ag, &ab, &aa)) continue;
@@ -3221,14 +3236,23 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (escaped > 0) {
+                    // The geometry goes with the failure: the first thing to
+                    // rule out is the two coordinate spaces disagreeing, and
+                    // that is unanswerable from a bare count.
                     SDL_Log("selftest FAILED: %d pixels outside the canvas viewport "
                             "changed when the symmetry centre moved — an overlay is "
-                            "drawing over the panels", escaped);
+                            "drawing over the panels "
+                            "(readback %dx%d, display %.0fx%.0f, scale %.2fx%.2f, "
+                            "viewport %.1f,%.1f %.1fx%.1f)",
+                            escaped, shotA->w, shotA->h, display.x, display.y, sx, sy,
+                            app.viewport.x, app.viewport.y,
+                            app.viewport.w, app.viewport.h);
                     SDL_DestroySurface(shotA);
                     SDL_DestroySurface(shotB);
                     return 1;
                 }
-                SDL_Log("selftest: ruler guides stay inside the canvas viewport");
+                SDL_Log("selftest: ruler guides stay inside the canvas viewport "
+                        "(readback %dx%d at %.2fx%.2f)", shotA->w, shotA->h, sx, sy);
             }
             SDL_DestroySurface(shotA);
             SDL_DestroySurface(shotB);
