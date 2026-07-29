@@ -10,18 +10,10 @@
     <name>The Sable contributors</name>
   </developer>
 
-  <!-- REQUIRED BEFORE ANY PUBLIC RELEASE.
-       appstreamcli reports url-homepage-missing, and it is right to: a
-       painting application shipped to a software centre with no homepage
-       gives users nowhere to report a bug. It is left absent rather than
-       filled with a placeholder, because a URL that does not resolve is worse
-       than an honestly missing one. Add these once the project is hosted:
-
-       <url type="homepage">https://.../</url>
-       <url type="bugtracker">https://.../issues</url>
-       <url type="help">https://.../docs</url>
-  -->
-
+  <url type="homepage">https://github.com/RizkyChandra/sable</url>
+  <url type="bugtracker">https://github.com/RizkyChandra/sable/issues</url>
+  <url type="help">https://github.com/RizkyChandra/sable/blob/main/docs/README.md</url>
+  <url type="vcs-browser">https://github.com/RizkyChandra/sable</url>
 
   <description>
     <p>
@@ -65,7 +57,26 @@
 
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="0.1.0" date="2026-07-28">
+    <release version="2.0.1" date="2026-07-29">
+      <description>
+        <p>
+          Fixes canvas overlays drawing outside the canvas. Ruler guides, the
+          selection outline and the brush cursor could paint over the docked
+          panels and out of the window.
+        </p>
+      </description>
+    </release>
+    <release version="2.0.0" date="2026-07-28">
+      <description>
+        <p>
+          Optional GPU painting and compositing, 16-bit colour, linework
+          layers, text layers, lasso and magic wand selection, perspective and
+          symmetry rulers, canvas rotation, and import and export of PSD,
+          OpenRaster and Krita files.
+        </p>
+      </description>
+    </release>
+    <release version="1.0.0" date="2026-07-28">
       <description><p>First release. Milestones 1 to 4.</p></description>
     </release>
   </releases>

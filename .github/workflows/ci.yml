@@ -169,5 +169,7 @@ jobs:
         run: |
           desktop-file-validate packaging/sable.desktop
           xmllint --noout packaging/*.xml
-          appstreamcli validate packaging/org.sable.Sable.metainfo.xml \
-            || echo "::warning::AppStream validation is failing; see D-018 (homepage URL)"
+          # A hard gate now that the homepage URLs exist and validation is
+          # clean. It was allowed to fail only because the project had nowhere
+          # to point at; a warning nobody has to fix stops being read.
+          appstreamcli validate packaging/org.sable.Sable.metainfo.xml
