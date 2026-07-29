@@ -94,11 +94,33 @@ struct NewCanvasForm {
 /// SDL delivers axis changes and motion as SEPARATE events. There is no single
 /// event carrying both position and pressure, so the app keeps the latest axis
 /// values per pen and snapshots them when a motion event arrives.
+///
+/// Pressure starts at FULL, not at zero. "Unsupported axes are always zero"
+/// (SDL_pen.h), and a pen whose pressure SDL never reports would otherwise
+/// draw every stroke at the brush's minimum size and density for the life of
+/// the run — the mouse path calls that same absence 1.0, and so does this one.
 struct PenAxisState {
-    float pressure = 0.0f;
+    float pressure = 1.0f;
     float tiltX = 0.0f, tiltY = 0.0f;
     float rotation = 0.0f;
     float distance = 0.0f;
+};
+
+/// A pen position waiting for the axis values that belong to it (#16).
+///
+/// SDL sends a frame's SDL_EVENT_PEN_AXIS *after* the motion or touch event of
+/// that same frame — see tablet_tool_handle_frame in SDL_waylandevents.c, and
+/// the XI_Motion handler in SDL_x11xinput2.c, which both send position first
+/// and axes second. Painting the moment the position arrives therefore uses
+/// the pressure from the frame BEFORE it, and the first dab of a stroke uses
+/// whatever hovering left behind — zero, on every backend that reports a
+/// hovering pen at all. Holding the position until the axis events behind it
+/// have been read gives every dab the pressure SDL measured with it.
+struct HeldPen {
+    SDL_PenID which = 0;
+    float x = 0.0f, y = 0.0f;
+    bool  press = false;   ///< first sample of a stroke, not a continuation
+    bool  valid = false;
 };
 
 /// Everything that belongs to ONE open document (#50).
@@ -245,6 +267,7 @@ struct App {
 
     // --- tablet
     std::unordered_map<SDL_PenID, PenAxisState> penAxes;
+    HeldPen             heldPen;              // waiting for its axis events
     sbl::TabletProfile  profile;              // see D-015: one profile, all pens
     sbl::PressureFilter pressureFilter;
     sbl::Stabilizer     stabilizer;
@@ -1308,6 +1331,32 @@ void lineworkRelease(App& app) {
     syncTextures(app, app.cur().linework.takeChanged());
 }
 
+/// Paints the pen position that was held back for its axis events (see
+/// HeldPen). Called before handling any event that is not an axis update, and
+/// once more when the queue has drained — by then the axes that SDL sent
+/// behind the position are in `penAxes`, whether there were any or not.
+void flushPen(App& app) {
+    if (!app.heldPen.valid) return;
+    const HeldPen held = app.heldPen;
+    app.heldPen.valid = false;
+
+    const sbl::InputSample sample = penSample(app, held.which, held.x, held.y);
+    if (held.press && app.tool == Tool::Linework)
+        lineworkPress(app, held.x, held.y, sample.pressure);
+    else if (!held.press && app.cur().linework.busy())
+        lineworkDrag(app, held.x, held.y, sample.pressure);
+    else if (app.painting)
+        paintWith(app, sample);
+}
+
+/// Records where the pen is, to be painted once its axes have arrived.
+void holdPen(App& app, SDL_PenID which, float x, float y, bool press) {
+    // Two positions cannot be held at once: the earlier one has had its axis
+    // events by definition — they came before the event carrying this one.
+    flushPen(app);
+    app.heldPen = HeldPen{which, x, y, press, true};
+}
+
 /// Selects the text tool, resuming the active layer's text if it has any.
 void chooseTextTool(App& app) {
     app.tool = Tool::Text;
@@ -1831,6 +1880,10 @@ void handleEvent(App& app, const SDL_Event& e) {
 
     const ImGuiIO& io = ImGui::GetIO();
 
+    // Anything that is not an axis update means the axes of the held position
+    // are all in, so it can be painted before this event is looked at.
+    if (e.type != SDL_EVENT_PEN_AXIS) flushPen(app);
+
     switch (e.type) {
         case SDL_EVENT_QUIT:
             requestQuit(app);
@@ -1914,9 +1967,7 @@ void handleEvent(App& app, const SDL_Event& e) {
                 break;
             }
             if (app.tool == Tool::Linework) {
-                lineworkPress(app, e.ptouch.x, e.ptouch.y,
-                              penSample(app, e.ptouch.which,
-                                        e.ptouch.x, e.ptouch.y).pressure);
+                holdPen(app, e.ptouch.which, e.ptouch.x, e.ptouch.y, true);
                 break;
             }
             if (app.tool == Tool::Wand) {
@@ -1932,7 +1983,7 @@ void handleEvent(App& app, const SDL_Event& e) {
                 break;
             }
             beginPaint(app);
-            paintWith(app, penSample(app, e.ptouch.which, e.ptouch.x, e.ptouch.y));
+            holdPen(app, e.ptouch.which, e.ptouch.x, e.ptouch.y, true);
             break;
 
         case SDL_EVENT_PEN_MOTION:
@@ -1944,14 +1995,10 @@ void handleEvent(App& app, const SDL_Event& e) {
                 moveGuide(app, e.pmotion.x, e.pmotion.y);
             else if (app.selecting)
                 dragSelection(app, e.pmotion.x, e.pmotion.y);
-            else if (app.cur().linework.busy())
-                lineworkDrag(app, e.pmotion.x, e.pmotion.y,
-                             penSample(app, e.pmotion.which,
-                                       e.pmotion.x, e.pmotion.y).pressure);
             else if (app.gradientDragging)
                 previewGradient(app, e.pmotion.x, e.pmotion.y);
-            else if (app.painting)
-                paintWith(app, penSample(app, e.pmotion.which, e.pmotion.x, e.pmotion.y));
+            else if (app.cur().linework.busy() || app.painting)
+                holdPen(app, e.pmotion.which, e.pmotion.x, e.pmotion.y, false);
             break;
 
         case SDL_EVENT_PEN_UP:
@@ -4869,6 +4916,55 @@ int main(int argc, char** argv) {
                     "last tab closed leaves a fresh canvas");
         }
 
+        // A pen frame, in the order SDL really sends one: position first, axes
+        // behind it (#16). The dab must be painted with the pressure of its own
+        // frame — reading the axis cache at the touch event instead paints the
+        // FIRST dab of every stroke at whatever hovering left there, which on a
+        // freshly started app is nothing at all.
+        {
+            app.tool = Tool::Brush;
+            const SDL_PenID pen = 1;
+            const float sx = static_cast<float>(
+                toScreenX(app.cur().view, app.cur().doc.width * 0.5,
+                                          app.cur().doc.height * 0.5));
+            const float sy = static_cast<float>(
+                toScreenY(app.cur().view, app.cur().doc.width * 0.5,
+                                          app.cur().doc.height * 0.5));
+
+            SDL_Event down{};
+            down.type = SDL_EVENT_PEN_DOWN;
+            down.ptouch.which = pen;
+            down.ptouch.x = sx;
+            down.ptouch.y = sy;
+            SDL_Event axis{};
+            axis.type = SDL_EVENT_PEN_AXIS;
+            axis.paxis.which = pen;
+            axis.paxis.axis  = SDL_PEN_AXIS_PRESSURE;
+            axis.paxis.value = 0.5f;
+            axis.paxis.x = sx;
+            axis.paxis.y = sy;
+
+            handleEvent(app, down);
+            handleEvent(app, axis);
+            flushPen(app);                  // what the frame loop does on drain
+            const float painted = app.lastNormPressure;
+
+            SDL_Event up{};
+            up.type = SDL_EVENT_PEN_UP;
+            up.ptouch.which = pen;
+            up.ptouch.x = sx;
+            up.ptouch.y = sy;
+            handleEvent(app, up);
+
+            if (app.lastFromMouse || std::abs(painted - 0.5f) > 0.01f) {
+                SDL_Log("selftest FAILED: a stroke opened at pressure %.2f, not "
+                        "the 0.50 SDL reported for that same frame (#16)", painted);
+                return 1;
+            }
+            SDL_Log("selftest: a pen frame paints at its own pressure, not the "
+                    "one before it");
+        }
+
         SDL_Log("selftest OK");
 
         // Exit before the settings write below. The self-test drives the app
@@ -4900,6 +4996,9 @@ int main(int argc, char** argv) {
             // and keeping only the newest visibly degrades stroke quality.
             while (SDL_PollEvent(&e)) handleEvent(app, e);
         }
+        // The last position of the batch: nothing follows it to trigger the
+        // flush, and its axes have already been read out of the same queue.
+        flushPen(app);
         pumpDialog(app);
         maybeAutosave(app, SDL_GetTicks());
         renderFrame(app);

@@ -57,6 +57,17 @@
 
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.1.0" date="2026-07-30">
+      <description>
+        <p>
+          Pen pressure now reaches the first dab of a stroke. SDL reports a
+          frame's pressure after the position it belongs to, so every stroke
+          opened at the pressure of the frame before it — nothing at all on a
+          freshly started application. A pen whose pressure the driver never
+          reports is treated as full pressure rather than none.
+        </p>
+      </description>
+    </release>
     <release version="3.0.0" date="2026-07-29">
       <description>
         <p>
