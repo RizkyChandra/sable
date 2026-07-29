@@ -2006,6 +2006,14 @@ void handleEvent(App& app, const SDL_Event& e) {
         case SDL_EVENT_PEN_MOTION:
             app.activePen = e.pmotion.which;
             ++app.motionThisFrame;
+            // ImGui's SDL3 backend has no pen handling, and the synthetic mouse
+            // events it would otherwise have learned from are off at startup so
+            // that a stroke is not painted twice. Left alone, `WantCaptureMouse`
+            // answers about wherever the MOUSE last was — which on a backend
+            // with no global cursor to poll, Wayland's, is wherever the artist
+            // left it. Hovering a panel with the pen would then do nothing, and
+            // a stroke started while the mouse sat over one would be swallowed.
+            ImGui::GetIO().AddMousePosEvent(e.pmotion.x, e.pmotion.y);
             // Hovering without contact does not paint (US-08.8) — the pen only
             // paints between PEN_DOWN and PEN_UP.
             if (app.draggingGuide != kNoGuide)
@@ -5194,12 +5202,11 @@ int main(int argc, char** argv) {
         {
             app.tool = Tool::Brush;
             const SDL_PenID pen = 1;
-            const float sx = static_cast<float>(
-                toScreenX(app.cur().view, app.cur().doc.width * 0.5,
-                                          app.cur().doc.height * 0.5));
-            const float sy = static_cast<float>(
-                toScreenY(app.cur().view, app.cur().doc.width * 0.5,
-                                          app.cur().doc.height * 0.5));
+            // The middle of the viewport, which is inside it by construction:
+            // a point that missed would refuse the touch for a reason that has
+            // nothing to do with what is being measured here.
+            const float sx = app.viewport.x + app.viewport.w * 0.5f;
+            const float sy = app.viewport.y + app.viewport.h * 0.5f;
 
             SDL_Event down{};
             down.type = SDL_EVENT_PEN_DOWN;
@@ -5214,6 +5221,12 @@ int main(int argc, char** argv) {
             axis.paxis.x = sx;
             axis.paxis.y = sy;
 
+            // What is under test is the pressure a dab is painted with, not
+            // whether ImGui thought the pointer was over a panel. It does think
+            // so on a CI runner: the SDL3 backend has no pen handling at all,
+            // so it polls the OS cursor, which on a machine nobody is sitting
+            // at is parked at (0, 0) — on top of the Tools panel.
+            ImGui::GetIO().WantCaptureMouse = false;
             handleEvent(app, down);
             handleEvent(app, axis);
             flushPen(app);                  // what the frame loop does on drain
