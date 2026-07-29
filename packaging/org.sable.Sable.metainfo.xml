@@ -57,6 +57,14 @@
 
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.5.1" date="2026-07-30">
+      <description>
+        <p>
+          Holding space and dragging pans the canvas with a stylus, as it
+          always has with a mouse. The pen path only knew about the hand tool.
+        </p>
+      </description>
+    </release>
     <release version="3.5.0" date="2026-07-30">
       <description>
         <p>

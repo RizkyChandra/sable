@@ -2220,10 +2220,12 @@ void handleEvent(App& app, const SDL_Event& e) {
             app.pointerX = e.ptouch.x;
             app.pointerY = e.ptouch.y;
             app.pointerSeen = app.pointerFromPen = true;
-            // The hand pans with a stylus as well as a mouse: on a tablet it
-            // is the ONLY way to pan, since there is no middle button to hold
-            // and no second hand free for the space bar.
-            if (app.tool == Tool::Hand && overCanvas(app, e.ptouch.x, e.ptouch.y) &&
+            // The hand pans with a stylus as well as a mouse, and so does the
+            // space bar: an artist drawing on a tablet still has a hand on the
+            // keyboard, and space-and-drag is the pan every painting
+            // application has. It was on the mouse path only.
+            if ((app.tool == Tool::Hand || app.spaceHeld) &&
+                overCanvas(app, e.ptouch.x, e.ptouch.y) &&
                 !ImGui::GetIO().WantCaptureMouse) {
                 app.panning    = true;
                 app.panAnchorX = e.ptouch.x - app.cur().view.panX;
@@ -6032,6 +6034,51 @@ int main(int argc, char** argv) {
                 // Whatever ImGui believes, and it is asked to believe something
                 // else on purpose.
                 ImGui::GetIO().MousePos = ImVec2(px + 300.0f, py + 200.0f);
+
+                // Space and a pen drag pans, the same as space and a mouse
+                // drag: an artist on a tablet still has a hand on the keyboard.
+                {
+                    app.spaceHeld = true;
+                    const double panBefore = app.cur().view.panX;
+                    SDL_Event press{};
+                    press.type = SDL_EVENT_PEN_DOWN;
+                    press.ptouch.which = 4;
+                    press.ptouch.x = px;
+                    press.ptouch.y = py;
+                    ImGui::GetIO().WantCaptureMouse = false;
+                    handleEvent(app, press);
+                    SDL_Event move{};
+                    move.type = SDL_EVENT_PEN_MOTION;
+                    move.pmotion.which = 4;
+                    move.pmotion.x = px + 40.0f;
+                    move.pmotion.y = py;
+                    handleEvent(app, move);
+                    const bool panned = app.cur().view.panX - panBefore > 30.0;
+                    SDL_Event lift{};
+                    lift.type = SDL_EVENT_PEN_UP;
+                    lift.ptouch.which = 4;
+                    lift.ptouch.x = px + 40.0f;
+                    lift.ptouch.y = py;
+                    handleEvent(app, lift);
+                    app.spaceHeld = false;
+                    // Put the view AND the pen back: everything after this
+                    // names canvas positions, and they are only where they were
+                    // if the canvas is — and the pointer follows the pen, so the
+                    // pen has to be moved back rather than assumed back.
+                    app.cur().view.panX = panBefore;
+                    SDL_Event home{};
+                    home.type = SDL_EVENT_PEN_MOTION;
+                    home.pmotion.which = 4;
+                    home.pmotion.x = px;
+                    home.pmotion.y = py;
+                    handleEvent(app, home);
+                    if (!panned) {
+                        SDL_Log("selftest FAILED: space and a pen drag moved the "
+                                "canvas by %.1f px, not the 40 it was dragged",
+                                app.cur().view.panX - panBefore);
+                        return 1;
+                    }
+                }
 
                 const ImVec2 at = pointerPos(app);
                 // And Alt with a stylus samples the canvas, which was a mouse
