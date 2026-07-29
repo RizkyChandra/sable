@@ -1329,18 +1329,23 @@ void chooseTextTool(App& app) {
 /// happened halfway through — which is what this prevents. A half-finished text
 /// or linework session is a different thing entirely and stays with its own
 /// document, which is why neither is ended here.
-void settleGestures(App& app, double sx, double sy) {
+void settleGestures(App& app) {
+    // Where the pointer actually is, not an assumed origin: `endSelectDrag`
+    // COMMITS a lasso, so a hard-coded (0, 0) would close the loop with a spike
+    // across the canvas to a corner the artist never went near.
+    float mx = 0.0f, my = 0.0f;
+    SDL_GetMouseState(&mx, &my);
     app.panning       = false;
     app.draggingGuide = kNoGuide;
-    endSelectDrag(app, sx, sy);
+    endSelectDrag(app, mx, my);
     lineworkRelease(app);
-    endGradient(app, sx, sy);
+    endGradient(app, mx, my);
     endPaint(app);
 }
 
 void switchToDocument(App& app, std::size_t index) {
     if (index >= app.docs.size() || index == app.activeDoc) return;
-    settleGestures(app, 0.0, 0.0);
+    settleGestures(app);
 
     // The backend paints whichever document is active and holds its tiles until
     // asked for them. Fetch them before this tab stops being the one anything
@@ -1372,7 +1377,7 @@ void cycleDocument(App& app, int delta) {
 /// `requestClose`, which is what every close gesture actually goes through.
 void closeDocument(App& app, std::size_t index) {
     if (index >= app.docs.size()) return;
-    settleGestures(app, 0.0, 0.0);
+    settleGestures(app);
 
     // Before the OpenDocument is destroyed: the recovery worker holds a raw
     // pointer to it for its bookkeeping. This is the one thing that makes that
