@@ -57,6 +57,18 @@
 
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.4.1" date="2026-07-30">
+      <description>
+        <p>
+          The pointer now says which tool is in hand: a grab for the hand tool
+          and for panning, a move or a diagonal resize over the transform box
+          and its corners, and nothing at all inside the brush ring, which was
+          drawn with an arrow sitting in the middle of the pixel being aimed
+          at. The ring also follows a stylus while hovering, rather than
+          staying where the mouse was left.
+        </p>
+      </description>
+    </release>
     <release version="3.4.0" date="2026-07-30">
       <description>
         <p>

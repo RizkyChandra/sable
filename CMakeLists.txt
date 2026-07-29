@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.24)
 # C is here only for miniz, which is a C library (D-003/D-014). Sable's own
 # code is C++23 throughout — no .c file belongs under engine/ or app/.
-project(sable LANGUAGES C CXX VERSION 3.4.0)
+project(sable LANGUAGES C CXX VERSION 3.4.1)
 
 # D-001: C++23, no compiler-specific extensions.
 set(CMAKE_CXX_STANDARD 23)

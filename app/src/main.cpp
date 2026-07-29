@@ -4204,19 +4204,75 @@ void drawEmptyCanvasHint(const App& app, ImDrawList* overlay) {
                      IM_COL32(128, 128, 132, 190), line);
 }
 
+/// The radius of the brush ring at the current zoom, or 0 when there is no
+/// ring to draw. Below a pixel it is a dot the artist cannot aim with, and the
+/// system cursor stays visible instead of being hidden behind nothing.
+[[nodiscard]] float brushRingRadius(const App& app) {
+    if (!paintingTool(app)) return 0.0f;
+    const float radius =
+        activeBrush(const_cast<App&>(app)).size * 0.5f * app.cur().view.zoom;
+    return radius < 1.0f ? 0.0f : radius;
+}
+
+/// Which pointer the tool in hand asks for, at a screen point.
+///
+/// A separate answer from the setting of it, so the rules can be checked
+/// without a frame, a window or a pointer to move: the self-test asks this
+/// directly.
+[[nodiscard]] ImGuiMouseCursor cursorFor(const App& app, float x, float y) {
+    if (!overCanvas(app, x, y)) return ImGuiMouseCursor_Arrow;
+
+    // Panning, however it was started: the hand tool, the space bar, or the
+    // middle button held with any tool at all.
+    if (app.panning || app.tool == Tool::Hand || app.spaceHeld)
+        return ImGuiMouseCursor_Hand;
+
+    if (app.tool == Tool::Transform) {
+        // The corners first: they sit ON the edge of the box, so an "inside"
+        // test would claim half of them.
+        const int handle = transformHandleAt(app, x, y);
+        // Top-left and bottom-right pull along one diagonal, the other two
+        // along the other. Corner order is the engine's: bit 0 right, bit 1
+        // bottom.
+        if (handle == 0 || handle == 3) return ImGuiMouseCursor_ResizeNWSE;
+        if (handle == 1 || handle == 2) return ImGuiMouseCursor_ResizeNESW;
+        if (insideTransformBox(app, x, y)) return ImGuiMouseCursor_ResizeAll;
+        return ImGuiMouseCursor_Arrow;
+    }
+
+    // The brush ring IS the cursor when there is one: an arrow sitting in the
+    // middle of it hides the pixel being aimed at, which is the one thing the
+    // ring exists to show.
+    if (brushRingRadius(app) > 0.0f) return ImGuiMouseCursor_None;
+    return ImGuiMouseCursor_Arrow;
+}
+
+/// Asks ImGui for the pointer rather than calling SDL_SetCursor: the backend
+/// re-applies ImGui's choice every frame, so a cursor set behind its back
+/// survives exactly until the next one.
+void applyCursor(const App& app) {
+    const ImGuiIO& io = ImGui::GetIO();
+    if (io.WantCaptureMouse) return;      // a panel's own cursor wins there
+    ImGui::SetMouseCursor(cursorFor(app, io.MousePos.x, io.MousePos.y));
+}
+
 void drawBrushCursor(const App& app) {
-    if (ImGui::GetIO().WantCaptureMouse) return;
-    float mx = 0.0f, my = 0.0f;
-    SDL_GetMouseState(&mx, &my);
+    const ImGuiIO& io = ImGui::GetIO();
+    if (io.WantCaptureMouse) return;
+    // Where ImGui thinks the pointer is, not SDL_GetMouseState: the pen feeds
+    // that position (there being no synthetic mouse events to carry it), and
+    // asking SDL would draw the ring at the mouse while the artist hovers with
+    // a stylus.
+    const float mx = io.MousePos.x;
+    const float my = io.MousePos.y;
     if (!overCanvas(app, mx, my)) return;
 
     if (!paintingTool(app)) return;
     // Zoom only: the cursor is a circle about the pointer, and a circle is the
     // one shape rotation leaves alone. It follows the view because the pointer
     // does.
-    const float radius =
-        activeBrush(const_cast<App&>(app)).size * 0.5f * app.cur().view.zoom;
-    if (radius < 1.0f) return;
+    const float radius = brushRingRadius(app);
+    if (radius <= 0.0f) return;
 
     ImDrawList* draw = ImGui::GetForegroundDrawList();
     draw->AddCircle(ImVec2(mx, my), radius, IM_COL32(0, 0, 0, 160), 0, 3.0f);
@@ -4335,6 +4391,7 @@ void renderFrame(App& app, bool present = true) {
     overlay->PushClipRect(ImVec2(app.viewport.x, app.viewport.y),
                           ImVec2(app.viewport.x + app.viewport.w,
                                  app.viewport.y + app.viewport.h), true);
+    applyCursor(app);
     drawEmptyCanvasHint(app, overlay);
     drawRulerGuides(app);
     drawSelectionOutline(app);
@@ -5805,7 +5862,13 @@ int main(int argc, char** argv) {
         {
             app.tool = Tool::Transform;
             app.foreground = sbl::StraightRgba8{200, 30, 30, 255};
-            app.cur().doc.selection = sbl::Selection{10, 10, 40, 40};
+            // In the middle of the canvas, so every point this check names is
+            // somewhere the artist can actually see and click: at 100% zoom a
+            // canvas wider than the viewport has its own top-left corner off
+            // screen, and a cursor is only ever asked for over the canvas.
+            const std::int32_t midX = app.cur().doc.width / 2;
+            const std::int32_t midY = app.cur().doc.height / 2;
+            app.cur().doc.selection = sbl::Selection{midX - 20, midY - 20, 40, 40};
             app.cur().doc.undo.push(sbl::fillSelection(app.cur().doc,
                                                        app.cur().doc.activeLayer,
                                                        app.foreground));
@@ -5820,20 +5883,22 @@ int main(int argc, char** argv) {
                 const sbl::StraightRgba8 c = sbl::pickColour(app.cur().doc, x, y);
                 return c.r > 150 && c.g < 100;
             };
-            if (!isRed(30, 30)) {
+            if (!isRed(midX, midY)) {
                 SDL_Log("selftest FAILED: the transform check painted nothing to move");
                 return 1;
             }
 
             const std::size_t steps = app.cur().doc.undo.size();
-            if (!beginTransformDrag(app, screenX(30.0, 30.0), screenY(30.0, 30.0))) {
+            const auto mx = static_cast<double>(midX);
+            const auto my = static_cast<double>(midY);
+            if (!beginTransformDrag(app, screenX(mx, my), screenY(mx, my))) {
                 SDL_Log("selftest FAILED: a press inside the transform box did not "
                         "grab it, so the region cannot be dragged at all");
                 return 1;
             }
-            dragTransform(app, screenX(60.0, 30.0), screenY(60.0, 30.0));
+            dragTransform(app, screenX(mx + 30.0, my), screenY(mx + 30.0, my));
             endTransformDrag(app);
-            if (!isRed(60, 30) || isRed(15, 30)) {
+            if (!isRed(midX + 30, midY) || isRed(midX - 15, midY)) {
                 SDL_Log("selftest FAILED: dragging the transform box did not move "
                         "the pixels with it");
                 return 1;
@@ -5844,15 +5909,56 @@ int main(int argc, char** argv) {
                 return 1;
             }
             cancelTransform(app);
-            if (!isRed(30, 30) || isRed(60, 30)) {
+            if (!isRed(midX, midY) || isRed(midX + 30, midY)) {
                 SDL_Log("selftest FAILED: cancelling the transform did not put the "
                         "pixels back");
                 return 1;
             }
+            // The pointer says which tool is in hand. Asked of the rule rather
+            // than of a frame, so it can be checked on a machine where nobody
+            // is holding the mouse.
+            {
+                // The middle of the SELECTION, which is where the box is; the
+                // middle of the viewport is the middle of the canvas and has
+                // nothing to do with it.
+                const auto cx = static_cast<float>(toScreenX(app.cur().view, mx, my));
+                const auto cy = static_cast<float>(toScreenY(app.cur().view, mx, my));
+                const auto corner = transformCorners(app)[0];
+                const auto handleX = static_cast<float>(
+                    toScreenX(app.cur().view, corner.first, corner.second));
+                const auto handleY = static_cast<float>(
+                    toScreenY(app.cur().view, corner.first, corner.second));
+
+                const bool ok =
+                    cursorFor(app, cx, cy) == ImGuiMouseCursor_ResizeAll &&
+                    cursorFor(app, handleX, handleY) == ImGuiMouseCursor_ResizeNWSE &&
+                    cursorFor(app, app.viewport.x - 20.0f, cy) == ImGuiMouseCursor_Arrow;
+                if (!ok) {
+                    SDL_Log("selftest FAILED: the transform box does not ask for a "
+                            "move or resize pointer over itself");
+                    return 1;
+                }
+            }
+
             app.cur().doc.selection.reset();
-            app.tool = Tool::Brush;
+            app.tool = Tool::Hand;
+            {
+                const float cx = app.viewport.x + app.viewport.w * 0.5f;
+                const float cy = app.viewport.y + app.viewport.h * 0.5f;
+                if (cursorFor(app, cx, cy) != ImGuiMouseCursor_Hand) {
+                    SDL_Log("selftest FAILED: the hand tool leaves the pointer as "
+                            "an arrow, so nothing on screen says it is in hand");
+                    return 1;
+                }
+                app.tool = Tool::Brush;
+                if (cursorFor(app, cx, cy) != ImGuiMouseCursor_None) {
+                    SDL_Log("selftest FAILED: the brush ring is drawn with an arrow "
+                            "sitting in the middle of it");
+                    return 1;
+                }
+            }
             SDL_Log("selftest: the transform box drags, previews as one undo step "
-                    "and cancels");
+                    "and cancels; the pointer follows the tool");
         }
 
         SDL_Log("selftest OK");
