@@ -57,6 +57,22 @@
 
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.2.0" date="2026-07-30">
+      <description>
+        <p>
+          The bucket, fill, gradient and clear tools write a layer mask when
+          Paint on mask is on, instead of being held back. A gradient down a
+          mask is how a layer is faded out, which is most of the reason to
+          want one.
+        </p>
+        <p>
+          New artists open on a seven-step walkthrough, reachable again from
+          Help or F1. The key map and the tablet pages moved to a Help menu,
+          an untouched canvas says how to start, and the canvas is centred in
+          the window rather than left in a corner.
+        </p>
+      </description>
+    </release>
     <release version="3.1.0" date="2026-07-30">
       <description>
         <p>
