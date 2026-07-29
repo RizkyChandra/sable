@@ -514,6 +514,20 @@ struct Selection {
     friend bool operator==(const Selection&, const Selection&) = default;
 };
 
+/// A selection the artist chose to keep (#52). Document data, saved in the
+/// `.sable`, so a lasso that took a minute is still there after lunch.
+///
+/// A plain name and a `Selection`, deliberately: the name is what the artist
+/// picks it out of a list by, and nothing else about it needs an identity. Two
+/// stored selections may share a name — the list is ordered and the artist can
+/// see it, and refusing a duplicate is a dialog nobody asked for.
+struct StoredSelection {
+    std::string name;
+    Selection   selection;
+
+    friend bool operator==(const StoredSelection&, const StoredSelection&) = default;
+};
+
 // ---------------------------------------------------------------------- undo
 // D-006: copy-on-first-touch tile snapshots. One record per stroke.
 
@@ -688,6 +702,12 @@ struct Document {
 
     UndoStack undo;
     std::optional<Selection> selection;    // Milestone 3; empty = whole canvas
+    /// Selections kept by name (#52). The current one above is still the only
+    /// one anything paints through; these are sources to restore or combine
+    /// with. A vector rather than a map because the order the artist stored
+    /// them in is the order they expect to see, and a handful is the realistic
+    /// count — a linear search over five names is not worth a hash table.
+    std::vector<StoredSelection> storedSelections;
     std::filesystem::path path;            // empty until first save
     bool dirty = false;
 
@@ -757,5 +777,15 @@ struct Document {
 /// which is exactly what `setLayerProps` promises not to do for every other
 /// property.
 [[nodiscard]] UndoRecord deleteLayerMask(Document&, LayerId);
+/// Replaces a layer's mask, tiles and all, as ONE undoable step (#52).
+///
+/// The counterpart to `deleteLayerMask` and needed for the same reason: the old
+/// tiles have to travel into the record before they stop existing, and the
+/// tiles only the NEW mask has need a null snapshot each so undo removes them
+/// rather than leaving fresh coverage behind under the restored flags.
+///
+/// What `maskFromSelection` (`sbl/select.hpp`) is for. A no-op on a layer id
+/// that does not exist, like every other operation here.
+[[nodiscard]] UndoRecord setLayerMask(Document&, LayerId, LayerMask&&);
 
 }  // namespace sbl

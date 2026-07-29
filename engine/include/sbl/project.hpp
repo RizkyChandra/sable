@@ -35,7 +35,9 @@ namespace sbl {
 /// the tile PNGs are 16 bits per channel. 6 is the first bump that is NOT
 /// written unconditionally — see below. 7 added layer masks (#48): a `mask`
 /// object on a layer and `layers/<id>/mask/<tx>_<ty>.png` beside its tiles.
-inline constexpr int SABLE_FORMAT_VERSION = 7;
+/// 8 added stored selections (#52): a `selections` array and
+/// `selections/<n>.png` for the coverage mask of each one that has one.
+inline constexpr int SABLE_FORMAT_VERSION = 8;
 
 /// The newest version a document that uses neither 16-bit colour nor a mask can
 /// declare, which is the newest an older Sable can still read in full.
@@ -62,6 +64,12 @@ inline constexpr int SABLE_FORMAT_VERSION_16BIT = 6;
 /// What a document with a layer mask declares whatever its depth (#48). Above
 /// 6 because a masked 16-bit document needs both, and a version is one number.
 inline constexpr int SABLE_FORMAT_VERSION_MASK = 7;
+
+/// What a document carrying stored selections declares, whatever else it has
+/// (#52). Same deal again, and the same reason: an older Sable would open the
+/// document, show none of the selections the artist kept, and write them away
+/// on the next save — which is the exact loss #52 exists to prevent.
+inline constexpr int SABLE_FORMAT_VERSION_STORED = 8;
 
 /// Undo history is deliberately not saved.
 [[nodiscard]] std::expected<void, Error> saveProject(

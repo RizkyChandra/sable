@@ -1698,6 +1698,113 @@ void buildDefaultLayout(ImGuiID dockspace) {
     ImGui::DockBuilderFinish(dockspace);
 }
 
+/// The "Selection" submenu (#52): keeping one, combining it back in, and the
+/// two places in the document a selection can be made out of.
+///
+/// Storing and restoring are NOT undo steps, because selecting is not one
+/// either — Ctrl+Z on a drawing application takes back a mark, and an artist
+/// who has just spent a minute lassoing would not thank us for spending their
+/// undo history on it. Writing a layer's mask IS one, and goes through
+/// `setLayerMask` for exactly that reason.
+void drawSelectionMenu(App& app) {
+    if (!ImGui::BeginMenu("Selection")) return;
+
+    const bool haveSelection =
+        app.doc.selection.has_value() && !app.doc.selection->empty();
+    sbl::Layer* layer = app.doc.active();
+
+    // A static buffer rather than a field on App: this is the whole of the
+    // widget's state, it lives exactly as long as the menu, and App is being
+    // restructured under us by #50.
+    static std::array<char, 64> nameBuffer{};
+    ImGui::BeginDisabled(!haveSelection);
+    ImGui::SetNextItemWidth(140.0f * app.uiScale);
+    ImGui::InputTextWithHint("##selname", "name", nameBuffer.data(), nameBuffer.size());
+    ImGui::SameLine();
+    if (ImGui::Button("Store")) {
+        std::string name(nameBuffer.data());
+        if (name.empty())
+            name = "Selection " + std::to_string(app.doc.storedSelections.size() + 1);
+        app.doc.storedSelections.push_back(
+            sbl::StoredSelection{std::move(name), *app.doc.selection});
+        nameBuffer.fill('\0');
+        app.doc.dirty = true;
+    }
+    ImGui::EndDisabled();
+
+    if (app.doc.storedSelections.empty()) {
+        ImGui::TextDisabled("Nothing stored yet.");
+    } else {
+        ImGui::Separator();
+        std::size_t remove = app.doc.storedSelections.size();
+        for (std::size_t i = 0; i < app.doc.storedSelections.size(); ++i) {
+            const sbl::StoredSelection& stored = app.doc.storedSelections[i];
+            ImGui::PushID(static_cast<int>(i));
+            if (ImGui::BeginMenu(stored.name.c_str())) {
+                // The four modifiers the selection tools already offer, against
+                // whatever is selected now. Replace on an empty current
+                // selection is the plain "restore this" case and needs no
+                // separate item.
+                const std::array<std::pair<const char*, sbl::SelectMode>, 4> modes{{
+                    {"Replace",   sbl::SelectMode::Replace},
+                    {"Add",       sbl::SelectMode::Add},
+                    {"Subtract",  sbl::SelectMode::Subtract},
+                    {"Intersect", sbl::SelectMode::Intersect}}};
+                for (const auto& [label, mode] : modes) {
+                    if (!ImGui::MenuItem(label)) continue;
+                    const sbl::Selection base =
+                        app.doc.selection.has_value() ? *app.doc.selection : sbl::Selection{};
+                    sbl::Selection combined =
+                        sbl::combineSelections(base, stored.selection, mode);
+                    if (combined.empty()) app.doc.selection.reset();
+                    else                  app.doc.selection = std::move(combined);
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Forget")) remove = i;
+                ImGui::EndMenu();
+            }
+            ImGui::PopID();
+        }
+        // After the loop: erasing inside it would invalidate the reference the
+        // loop is reading through.
+        if (remove < app.doc.storedSelections.size()) {
+            app.doc.storedSelections.erase(app.doc.storedSelections.begin() +
+                                           static_cast<std::ptrdiff_t>(remove));
+            app.doc.dirty = true;
+        }
+    }
+
+    ImGui::Separator();
+    if (ImGui::MenuItem("From layer alpha", nullptr, false,
+                        layer != nullptr && !layer->tiles.empty())) {
+        sbl::Selection shape =
+            sbl::selectionFromLayerAlpha(*layer, app.doc.width, app.doc.height);
+        if (shape.empty()) app.doc.selection.reset();
+        else               app.doc.selection = std::move(shape);
+    }
+    if (ImGui::MenuItem("From layer mask", nullptr, false,
+                        layer != nullptr && layer->mask.has_value())) {
+        sbl::Selection shape =
+            sbl::selectionFromMask(*layer->mask, app.doc.width, app.doc.height);
+        if (shape.empty()) app.doc.selection.reset();
+        else               app.doc.selection = std::move(shape);
+    }
+    if (ImGui::MenuItem("To layer mask", nullptr, false,
+                        haveSelection && layer != nullptr)) {
+        sbl::UndoRecord rec =
+            sbl::setLayerMask(app.doc, layer->id,
+                              sbl::maskFromSelection(*app.doc.selection));
+        if (!rec.empty()) {
+            // releaseAll rather than per-tile: the mask covers whatever the
+            // selection did, and the composite of every tile under it changed.
+            app.canvas->releaseAll();
+            app.doc.undo.push(std::move(rec));
+            app.doc.dirty = true;
+        }
+    }
+    ImGui::EndMenu();
+}
+
 void drawMenuBar(App& app, float& menuHeight) {
     if (!ImGui::BeginMainMenuBar()) return;
     menuHeight = ImGui::GetWindowSize().y;
@@ -1749,6 +1856,7 @@ void drawMenuBar(App& app, float& menuHeight) {
         if (ImGui::MenuItem("Deselect", app.shortcuts.get(Action::Deselect).label().c_str(), false,
                             app.doc.selection.has_value()))
             app.doc.selection.reset();
+        drawSelectionMenu(app);
         ImGui::Separator();
         ImGui::TextDisabled("History: %zu steps, %.1f MB of %d MB",
                             app.doc.undo.size(),
