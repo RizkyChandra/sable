@@ -6361,11 +6361,10 @@ void paintMaskSquare(Document& doc, LayerId id, StraightRgba8 grey, double x,
     Layer* layer = doc.layerById(id);
     REQUIRE(layer != nullptr);
     REQUIRE(layer->mask.has_value());
-    BrushPreset p = defaultPencil();
-    p.size     = size;
-    p.hardness = 1.0f;
-    p.pressure = PressureMapping{};
-    p.pressure.toSize = false;
+    // flatPencil, not defaultPencil: the built-in pencil carries paper grain
+    // (D-032), and a mask painted through grain has no one coverage value to
+    // assert. These cases are measuring mask arithmetic, not the brush.
+    const BrushPreset p = flatPencil(size);
 
     Stroke s;
     std::vector<Dab> scratch;
