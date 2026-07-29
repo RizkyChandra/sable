@@ -149,6 +149,17 @@ void drawIcon(ImDrawList* draw, Icon icon, ImVec2 topLeft, float size, ImU32 col
             p.disc(0.86f, 0.28f, 0.10f);
             break;
 
+        case Icon::Gradient:
+            // A framed ramp, drawn as bars that thin out. One colour is all a
+            // Pen has, so the fade has to be made of coverage rather than of
+            // value — which is what a dithered gradient looks like anyway.
+            p.rect(0.12f, 0.16f, 0.88f, 0.84f, 0.06f);
+            p.fillRect(0.18f, 0.22f, 0.40f, 0.78f);
+            p.line(0.47f, 0.22f, 0.47f, 0.78f, 0.09f);
+            p.line(0.58f, 0.22f, 0.58f, 0.78f, 0.06f);
+            p.line(0.68f, 0.22f, 0.68f, 0.78f, 0.04f);
+            break;
+
         case Icon::Plus:
             p.line(0.50f, 0.14f, 0.50f, 0.86f, 0.15f);
             p.line(0.14f, 0.50f, 0.86f, 0.50f, 0.15f);

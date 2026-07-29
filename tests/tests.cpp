@@ -1849,6 +1849,240 @@ TEST_CASE("a locked layer refuses paint and fill") {
     CHECK(doc.active()->tiles.empty());
 }
 
+// ------------------------------------------------------ gradient (#49)
+
+namespace {
+
+/// A horizontal linear gradient with the exact ramp — dithering off, so the
+/// values a test reads are the ones the interpolation produced and not the
+/// ones a threshold matrix nudged. D-029.
+Gradient horizontalRamp(double x0, double x1, StraightRgba8 from, StraightRgba8 to) {
+    Gradient g;
+    g.x0 = x0;
+    g.x1 = x1;
+    g.from = from;
+    g.to = to;
+    g.dither = false;
+    return g;
+}
+
+}  // namespace
+
+TEST_CASE("a linear gradient ramps monotonically and holds both ends") {
+    Document doc = makeDocument(256, 4, StraightRgba8{255, 255, 255, 255});
+    const Gradient g = horizontalRamp(64.0, 192.0, StraightRgba8{0, 0, 0, 255},
+                                      StraightRgba8{255, 255, 255, 255});
+    doc.undo.push(gradientFill(doc, doc.activeLayer, g));
+
+    // Beyond either end of the axis the ramp holds that end's colour exactly:
+    // no overshoot past black or past white, which is what an unclamped
+    // projection would produce off the ends of a short drag.
+    CHECK(pickColour(doc, 0, 2)   == StraightRgba8{0, 0, 0, 255});
+    CHECK(pickColour(doc, 63, 2)  == StraightRgba8{0, 0, 0, 255});
+    CHECK(pickColour(doc, 192, 2) == StraightRgba8{255, 255, 255, 255});
+    CHECK(pickColour(doc, 255, 2) == StraightRgba8{255, 255, 255, 255});
+
+    int previous = -1;
+    bool monotonic = true;
+    for (std::int32_t x = 0; x < 256; ++x) {
+        const StraightRgba8 c = pickColour(doc, x, 2);
+        if (c.r < previous) monotonic = false;
+        previous = c.r;
+        CHECK(c.g == c.r);          // a grey ramp stays grey
+        CHECK(c.b == c.r);
+    }
+    CHECK(monotonic);
+    CHECK(pickColour(doc, 128, 2).r == doctest::Approx(128).epsilon(0.02));
+}
+
+TEST_CASE("a gradient to transparent fades without a grey haze") {
+    // THE failure this feature exists to get right. Interpolating the two ends
+    // on straight alpha drags the colour channels toward the transparent end's
+    // zero alongside the alpha, and every pixel of the fade comes out darker
+    // than the colour the artist picked. Premultiplied, the red stays red and
+    // only the alpha moves.
+    //
+    // A transparent BLACK far end on purpose: that is what "fade to nothing"
+    // means to the app, and a `to` that carried the foreground's own RGB would
+    // hide the bug rather than test it.
+    Document doc = makeDocument(256, 4, StraightRgba8{0, 0, 0, 0});
+    doc.undo.push(gradientFill(
+        doc, doc.activeLayer,
+        horizontalRamp(0.0, 256.0, StraightRgba8{255, 0, 0, 255},
+                       StraightRgba8{0, 0, 0, 0})));
+
+    int previousAlpha = 256;
+    for (std::int32_t x = 0; x < 256; ++x) {
+        const StraightRgba8 c = pickColour(doc, x, 2);
+        if (c.a == 0) continue;              // the far end, fully faded out
+        CHECK(c.r == 255);                   // still the foreground, not a dulled one
+        CHECK(c.g == 0);
+        CHECK(c.b == 0);
+        CHECK(c.a <= previousAlpha);         // and the fade only ever thins
+        previousAlpha = c.a;
+    }
+    CHECK(previousAlpha < 8);                // it does reach the far end
+}
+
+TEST_CASE("a gradient to transparent does not darken the art beneath it") {
+    // The same failure seen from the other side: composited over white, a
+    // half-faded pure red must stay at full red. Straight-alpha interpolation
+    // reads as a grey wash lying over the fade.
+    Document doc = makeDocument(256, 4, StraightRgba8{255, 255, 255, 255});
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{255, 255, 255, 255}));
+    doc.undo.push(gradientFill(
+        doc, doc.activeLayer,
+        horizontalRamp(0.0, 256.0, StraightRgba8{255, 0, 0, 255},
+                       StraightRgba8{0, 0, 0, 0})));
+
+    for (std::int32_t x = 0; x < 256; ++x) {
+        const StraightRgba8 c = pickColour(doc, x, 2);
+        CHECK(c.r == 255);
+        CHECK(c.g == c.b);                   // no colour cast either way
+    }
+}
+
+TEST_CASE("a radial gradient runs outward from its centre") {
+    Document doc = makeDocument(200, 200, StraightRgba8{255, 255, 255, 255});
+    Gradient g;
+    g.shape = GradientShape::Radial;
+    // The centre of pixel (100, 100), not its corner: distances are measured
+    // from pixel centres, so a centre on a corner is half a pixel nearer one
+    // side than the other and the symmetry checks below would be off by one.
+    g.x0 = 100.5;
+    g.y0 = 100.5;
+    g.x1 = 150.5;                            // radius 50
+    g.y1 = 100.5;
+    g.from = StraightRgba8{0, 0, 0, 255};
+    g.to   = StraightRgba8{255, 255, 255, 255};
+    g.dither = false;
+    doc.undo.push(gradientFill(doc, doc.activeLayer, g));
+
+    CHECK(pickColour(doc, 100, 100).r == 0);            // the centre
+    // Equal distances in any direction give equal colour — the thing a linear
+    // gradient with the same endpoints would get wrong.
+    const int right = pickColour(doc, 125, 100).r;
+    CHECK(pickColour(doc, 75, 100).r  == right);
+    CHECK(pickColour(doc, 100, 125).r == right);
+    CHECK(right == doctest::Approx(128).epsilon(0.03));
+    CHECK(pickColour(doc, 0, 0)     == StraightRgba8{255, 255, 255, 255});  // past it
+    CHECK(pickColour(doc, 100, 160) == StraightRgba8{255, 255, 255, 255});
+}
+
+TEST_CASE("a gradient lands only inside the selection") {
+    Document doc = makeDocument(128, 128, StraightRgba8{255, 255, 255, 255});
+    doc.selection = Selection{32, 32, 64, 64};
+    doc.undo.push(gradientFill(
+        doc, doc.activeLayer,
+        horizontalRamp(0.0, 128.0, StraightRgba8{0, 0, 0, 255},
+                       StraightRgba8{0, 0, 255, 255})));
+
+    CHECK(pickColour(doc, 31, 64) == StraightRgba8{255, 255, 255, 255});
+    CHECK(pickColour(doc, 96, 64) == StraightRgba8{255, 255, 255, 255});
+    CHECK(pickColour(doc, 64, 31) == StraightRgba8{255, 255, 255, 255});
+    CHECK(pickColour(doc, 64, 96) == StraightRgba8{255, 255, 255, 255});
+    CHECK(pickColour(doc, 64, 64).b > 0);
+    CHECK(pickColour(doc, 64, 64).r == 0);
+}
+
+TEST_CASE("a gradient is one undo step and restores exactly") {
+    Document doc = makeDocument(160, 160, StraightRgba8{255, 255, 255, 255});
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{0, 90, 200, 255}));
+    const std::uint64_t before = hashCanvas(doc);
+
+    doc.undo.push(gradientFill(
+        doc, doc.activeLayer,
+        horizontalRamp(20.0, 140.0, StraightRgba8{255, 255, 0, 255},
+                       StraightRgba8{0, 0, 0, 0})));
+    CHECK(doc.undo.size() == 2);
+    const std::uint64_t after = hashCanvas(doc);
+    CHECK(after != before);
+
+    doc.undo.undo(doc);
+    CHECK(hashCanvas(doc) == before);
+    doc.undo.redo(doc);
+    CHECK(hashCanvas(doc) == after);
+}
+
+TEST_CASE("a gradient obeys locked, preserveOpacity and a zero-length axis") {
+    Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+    const Gradient g = horizontalRamp(0.0, 64.0, StraightRgba8{255, 0, 0, 255},
+                                      StraightRgba8{0, 0, 255, 255});
+
+    doc.active()->locked = true;
+    CHECK(gradientFill(doc, doc.activeLayer, g).empty());
+    CHECK(doc.active()->tiles.empty());
+    doc.active()->locked = false;
+
+    // No drag, no axis, no undo step to clear up afterwards.
+    CHECK(gradientFill(doc, doc.activeLayer,
+                       horizontalRamp(10.0, 10.0, g.from, g.to)).empty());
+
+    // preserveOpacity: paint only where there is already paint.
+    doc.selection = Selection{0, 0, 32, 64};
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{255, 255, 255, 255}));
+    doc.selection.reset();
+    doc.active()->preserveOpacity = true;
+    doc.undo.push(gradientFill(doc, doc.activeLayer, g));
+
+    CHECK(pickColour(doc, 16, 32).r < 255);                 // painted half: gradient
+    const Tile* tile = doc.active()->find(TileKey{0, 0});
+    REQUIRE(tile != nullptr);
+    CHECK(tile->pixel(40, 32) == PremulRgba16{});           // empty half: still empty
+}
+
+TEST_CASE("dithering breaks the bands of a shallow 8-bit ramp") {
+    // 256 pixels across five levels: without dither the row is five flat bands
+    // with four steps in it, and on a real canvas those edges are visible.
+    // Counting the steps is the blunt way to say "the bands were broken up".
+    const auto stepsAlongRow = [](bool dither) {
+        Document doc = makeDocument(256, 8, StraightRgba8{0, 0, 0, 0});
+        Gradient g = horizontalRamp(0.0, 256.0, StraightRgba8{0, 0, 0, 255},
+                                    StraightRgba8{4, 4, 4, 255});
+        g.dither = dither;
+        doc.undo.push(gradientFill(doc, doc.activeLayer, g));
+
+        int steps = 0;
+        for (std::int32_t x = 1; x < 256; ++x)
+            if (pickColour(doc, x, 3).r != pickColour(doc, x - 1, 3).r) ++steps;
+        return steps;
+    };
+    CHECK(stepsAlongRow(false) == 4);
+    CHECK(stepsAlongRow(true) > 20);
+}
+
+TEST_CASE("dither leaves a colour that needs no dithering alone") {
+    // The other half of D-029: a dither that reaches a whole 8-bit step rather
+    // than half of one also wobbles values that were exactly representable,
+    // speckling the flat ends of every ramp and every solid colour under one.
+    Document doc = makeDocument(64, 64, StraightRgba8{0, 0, 0, 0});
+    Gradient g = horizontalRamp(0.0, 64.0, StraightRgba8{200, 30, 40, 255},
+                                StraightRgba8{200, 30, 40, 255});
+    g.dither = true;
+    doc.undo.push(gradientFill(doc, doc.activeLayer, g));
+
+    for (std::int32_t y = 0; y < 8; ++y)
+        for (std::int32_t x = 0; x < 8; ++x)
+            CHECK(pickColour(doc, x, y) == StraightRgba8{200, 30, 40, 255});
+}
+
+TEST_CASE("a gradient on a 16-bit document keeps the levels between 8-bit ones") {
+    Document doc = makeDocument(256, 4, StraightRgba8{0, 0, 0, 0}, ColourDepth::Bits16);
+    doc.undo.push(gradientFill(
+        doc, doc.activeLayer,
+        horizontalRamp(0.0, 256.0, StraightRgba8{0, 0, 0, 255},
+                       StraightRgba8{4, 4, 4, 255})));
+
+    // 4 levels at 8 bits, 1028 at 16: the ramp must not have been quantised on
+    // its way through, which is what makes the extra storage worth its memory.
+    const Tile* tile = doc.active()->find(TileKey{0, 0});
+    REQUIRE(tile != nullptr);
+    int distinct = 1;
+    for (std::int32_t x = 1; x < 256; ++x)
+        if (tile->pixel(x, 2).r != tile->pixel(x - 1, 2).r) ++distinct;
+    CHECK(distinct > 200);
+}
+
 // ----------------------------------------------------- transform (M3)
 
 TEST_CASE("moving a selection carries the pixels and leaves the source empty") {

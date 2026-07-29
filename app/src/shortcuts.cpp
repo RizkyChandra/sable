@@ -61,6 +61,11 @@ constexpr std::array<Entry, static_cast<std::size_t>(Action::Count)> kDefaults{{
     // whichever came first in this table wins. F is free and reads as "font".
     {Action::ToolText,      "Text tool",      SDLK_F, SDL_KMOD_NONE},
     {Action::ToolLinework,  "Linework tool",  SDLK_V, SDL_KMOD_NONE},
+    // R for ramp. G is the bucket's, and for the reason given above moving an
+    // existing default would land on the key an upgrading artist has already
+    // stored for it. R is free and the two tools sit next to each other in the
+    // panel, which is where the association is actually made.
+    {Action::ToolGradient,  "Gradient tool",  SDLK_R, SDL_KMOD_NONE},
     {Action::SizeDown,      "Smaller brush",  SDLK_LEFTBRACKET,  SDL_KMOD_NONE},
     {Action::SizeUp,        "Larger brush",   SDLK_RIGHTBRACKET, SDL_KMOD_NONE},
     {Action::SwapColours,   "Swap colours",   SDLK_X, SDL_KMOD_NONE},
