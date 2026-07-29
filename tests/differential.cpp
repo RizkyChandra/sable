@@ -208,17 +208,20 @@ public:
         cpuBackend().applyDab(t, wrong);
     }
     UndoRecord bucketFill(Document& doc, LayerId target, std::int32_t x, std::int32_t y,
-                          StraightRgba8 colour, int tolerance) override {
-        return cpuBackend().bucketFill(doc, target, x, y, colour, tolerance);
+                          StraightRgba8 colour, int tolerance, bool toMask) override {
+        return cpuBackend().bucketFill(doc, target, x, y, colour, tolerance, toMask);
     }
-    UndoRecord fillSelection(Document& doc, LayerId target, StraightRgba8 c) override {
-        return cpuBackend().fillSelection(doc, target, c);
+    UndoRecord fillSelection(Document& doc, LayerId target, StraightRgba8 c,
+                             bool toMask) override {
+        return cpuBackend().fillSelection(doc, target, c, toMask);
     }
     UndoRecord transformRegion(Document& doc, LayerId target, const Selection& source,
                                const Transform& transform) override {
         return cpuBackend().transformRegion(doc, target, source, transform);
     }
-    UndoRecord clearLayer(Layer& layer) override { return cpuBackend().clearLayer(layer); }
+    UndoRecord clearLayer(Layer& layer, bool toMask) override {
+        return cpuBackend().clearLayer(layer, toMask);
+    }
     UndoRecord mergeLayerDown(Document& doc, LayerId id) override {
         return cpuBackend().mergeLayerDown(doc, id);
     }
@@ -433,6 +436,33 @@ Document bucketFillAtBoundary(PaintBackend& b) {
     return doc;
 }
 
+/// The fill family writing a MASK rather than pixels (#58).
+///
+/// Worth a scenario of its own because it is two agreements in one: the bucket
+/// finds its region on the image THIS backend composited, and the gradient
+/// ramps through a mask that is 8-bit whatever the layer is. A backend that
+/// composited half a level differently picks a different region here, and a
+/// backend that read the mask back late shows a differently faded layer.
+Document filledMask(PaintBackend& b) {
+    Document doc = makeDocument(128, 96, StraightRgba8{250, 248, 240, 255});
+    const LayerId id = doc.activeLayer;
+    paintStroke(doc, b, id, softBrush(70.0f, 0.35f), StraightRgba8{20, 60, 140, 255},
+                {at(10.0, 30.0), at(118.0, 62.0)});
+    doc.layerById(id)->mask.emplace();
+
+    Gradient g;
+    g.x0 = 0.0;   g.y0 = 0.0;
+    g.x1 = 128.0; g.y1 = 0.0;
+    g.from   = StraightRgba8{255, 255, 255, 255};
+    g.to     = StraightRgba8{0, 0, 0, 255};
+    g.dither = false;                  // the exact ramp: a difference is a bug
+    doc.undo.push(gradientFill(doc, id, g, true));
+    // Clicked in the paper, not the stroke, so the region is decided by the
+    // stroke's own soft edge — pixels sitting right on the tolerance.
+    doc.undo.push(bucketFill(doc, id, 6, 88, StraightRgba8{40, 40, 40, 255}, 40, true));
+    return doc;
+}
+
 /// Transform with rotation and a non-uniform scale — bilinear sampling on
 /// premultiplied values, which is the most float-heavy path in the engine and
 /// the one where a GPU's own sampler is most tempting and most likely to
@@ -587,6 +617,7 @@ const std::vector<Case>& cases() {
         v.push_back({"stroke on a preserveOpacity layer", preserveOpacityStroke});
         v.push_back({"bucket fill with tolerance at a region boundary",
                      bucketFillAtBoundary});
+        v.push_back({"gradient and bucket writing a layer mask", filledMask});
         v.push_back({"transform with rotation and non-uniform scale",
                      rotatedNonUniformTransform});
         v.push_back({"chisel stamp turning with the pen", stampedStroke});

@@ -1755,6 +1755,71 @@ argument from "the compiler checked it" to "somebody remembered every field".
 
 ---
 
+## D-036 — The fill family writes a mask through the same flag the brush does, and the bucket still floods the composite
+
+**Status:** Decided
+**Affects:** `engine/include/sbl/backend.hpp`, `engine/include/sbl/paint.hpp`,
+`engine/src/paint.cpp`, `engine/src/gpu.cpp`, `app/src/main.cpp`
+**Answers:** #58 · **Follows:** D-031
+
+D-031 gave the brush `PaintTarget::toMask`. `bucketFill`, `fillSelection`,
+`gradientFill` and `clearLayer` are `PaintBackend` methods rather than free
+functions, so they wrote layer tiles whatever the artist had selected, and the
+app held them back with a notice rather than let them land on the artwork.
+
+**One flag, threaded, not a parallel set of entry points.** Each of the four
+takes `bool toMask`. It is NOT a default argument on the virtuals: a default on
+a virtual is read off the static type, so a backend whose override spelled it
+differently would silently answer a different question. The default lives on
+the free functions in `sbl/paint.hpp`, which is where callers are.
+
+**`PixelWriter` is the only thing that changed shape.** All four already shared
+it, and a mask tile is an ordinary 8-bit tile, so routing `get`/`set` through
+`layer.mask->find` / `tileFor` and setting `TileSnapshot::mask` is the whole of
+the mask path. Undo already understood mask snapshots.
+
+**An absent tile is the difference, and the only one.** An absent PIXEL tile is
+transparent; an absent MASK tile reads as the mask's `outside`. A fill blending
+into one has to mix against the grey that is really there, or a soft selection
+edge over an untouched reveal-all mask fades toward black.
+
+**The mix is at 8 bits for a mask however deep the layer is**, because a mask is
+8-bit however deep the document is (D-031). For the same reason a gradient into
+a mask dithers on a 16-bit document, where a gradient into the pixels would not:
+the destination is the 8-bit one the dither exists for.
+
+**`preserveOpacity` is ignored on a mask**, exactly as `applyDab` ignores it.
+"Keep alpha" is about the layer's own silhouette; a mask tile is opaque grey, so
+honouring it would mean every mask fill at full strength or none at all.
+
+**The bucket still finds its region on the composited image.** The artist
+clicked a shape they can see, and which channel the paint lands in does not move
+where that shape ends. Two consequences worth stating rather than leaving
+implied: a GPU backend still has to flood on ITS own composite (the existing
+`floodFill` rule), and the "already that colour, nothing to do" shortcut is
+skipped for a mask fill — it compares the seed on screen against a grey going
+into a different channel, which is not the same question. Filling a mask black
+inside a black shape is an ordinary thing to want.
+
+**Guards mirror `applyDab` exactly:** `locked` refuses both, a mask write needs
+a mask to exist, and a pixel write still needs a `Raster` layer. Painting a mask
+on a Folder, Text or Linework layer is allowed — D-031 says why — and their
+pixels stay out of reach.
+
+**`clearLayer` on a mask empties it and leaves the mask in place**, reading as
+its `outside` everywhere. Removing a mask is `removeLayerMask`, takes the tiles
+with it, and is a different action.
+
+**Alternative rejected — a separate `maskFill`, `maskGradient` set.** Two entry
+points per operation is two places to change the day the fill rules move, and
+the flag is one branch inside a writer both would have shared anyway.
+
+**Alternative rejected — flooding the mask's own contents for the bucket.** It
+is defensible ("fill the region of similar coverage") and it is not what the
+click means: the artist is looking at the picture, not at the mask's greys.
+
+---
+
 ## Open decisions
 
 These blocked the milestone named. They have all been answered — the entries

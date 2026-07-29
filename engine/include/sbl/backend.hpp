@@ -59,11 +59,22 @@ public:
     /// may allocate. The CPU path still allocates nothing per dab.
     virtual void applyDab(PaintTarget& target, const Dab& dab) = 0;
 
+    /// `toMask` writes the layer's MASK rather than its pixels (#58), the same
+    /// flag `PaintTarget` carries for a dab and with the same rules: a mask
+    /// write needs a mask to exist, a pixel write still needs a Raster layer,
+    /// and `locked` refuses both.
+    ///
+    /// Not defaulted here, deliberately. A default argument on a virtual is
+    /// read off the STATIC type, so a backend that spelled its override
+    /// differently would silently answer a different question. The free
+    /// functions in `sbl/paint.hpp` are where the default lives.
     [[nodiscard]] virtual UndoRecord bucketFill(Document& doc, LayerId target,
                                                 std::int32_t x, std::int32_t y,
-                                                StraightRgba8 colour, int tolerance) = 0;
+                                                StraightRgba8 colour, int tolerance,
+                                                bool toMask) = 0;
     [[nodiscard]] virtual UndoRecord fillSelection(Document& doc, LayerId target,
-                                                   StraightRgba8 colour) = 0;
+                                                   StraightRgba8 colour,
+                                                   bool toMask) = 0;
     [[nodiscard]] virtual UndoRecord transformRegion(Document& doc, LayerId target,
                                                      const Selection& source,
                                                      const Transform& transform) = 0;
@@ -75,9 +86,14 @@ public:
     /// A GPU override remains a pure optimisation, and forgetting to write one
     /// is a slow gradient rather than a missing tool.
     [[nodiscard]] virtual UndoRecord gradientFill(Document& doc, LayerId target,
-                                                  const Gradient& gradient);
+                                                  const Gradient& gradient,
+                                                  bool toMask);
 
-    [[nodiscard]] virtual UndoRecord clearLayer(Layer& layer) = 0;
+    /// `toMask` empties the mask instead, leaving the pixels alone. The mask
+    /// itself stays: an empty one reads as its `outside` everywhere, which is
+    /// "clear" in the sense the artist means. Deleting a mask is
+    /// `removeLayerMask`, and a different action.
+    [[nodiscard]] virtual UndoRecord clearLayer(Layer& layer, bool toMask) = 0;
     [[nodiscard]] virtual UndoRecord mergeLayerDown(Document& doc, LayerId id) = 0;
 
     // --------------------------------------------------------------- reads
@@ -128,7 +144,8 @@ protected:
     /// The caller is responsible for the tiles being on the host first.
     [[nodiscard]] UndoRecord floodFill(Document& doc, LayerId target,
                                        std::int32_t x, std::int32_t y,
-                                       StraightRgba8 colour, int tolerance);
+                                       StraightRgba8 colour, int tolerance,
+                                       bool toMask);
 
 private:
     std::optional<Error> failure_;
@@ -148,13 +165,14 @@ public:
 
     [[nodiscard]] UndoRecord bucketFill(Document& doc, LayerId target,
                                         std::int32_t x, std::int32_t y,
-                                        StraightRgba8 colour, int tolerance) override;
+                                        StraightRgba8 colour, int tolerance,
+                                        bool toMask) override;
     [[nodiscard]] UndoRecord fillSelection(Document& doc, LayerId target,
-                                           StraightRgba8 colour) override;
+                                           StraightRgba8 colour, bool toMask) override;
     [[nodiscard]] UndoRecord transformRegion(Document& doc, LayerId target,
                                              const Selection& source,
                                              const Transform& transform) override;
-    [[nodiscard]] UndoRecord clearLayer(Layer& layer) override;
+    [[nodiscard]] UndoRecord clearLayer(Layer& layer, bool toMask) override;
     [[nodiscard]] UndoRecord mergeLayerDown(Document& doc, LayerId id) override;
 
     [[nodiscard]] std::vector<PremulRgba8> compositeRect(

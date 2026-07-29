@@ -196,13 +196,13 @@ public:
 
     [[nodiscard]] UndoRecord bucketFill(Document& doc, LayerId target, std::int32_t x,
                                         std::int32_t y, StraightRgba8 colour,
-                                        int tolerance) override;
+                                        int tolerance, bool toMask) override;
     [[nodiscard]] UndoRecord fillSelection(Document& doc, LayerId target,
-                                           StraightRgba8 colour) override;
+                                           StraightRgba8 colour, bool toMask) override;
     [[nodiscard]] UndoRecord transformRegion(Document& doc, LayerId target,
                                              const Selection& source,
                                              const Transform& transform) override;
-    [[nodiscard]] UndoRecord clearLayer(Layer& layer) override;
+    [[nodiscard]] UndoRecord clearLayer(Layer& layer, bool toMask) override;
     [[nodiscard]] UndoRecord mergeLayerDown(Document& doc, LayerId id) override;
 
     [[nodiscard]] std::vector<PremulRgba8> compositeRect(const Document& doc,
@@ -995,7 +995,8 @@ std::expected<void, Error> GpuBackend::readback(const Document& doc) {
 // these out as acceptable stalls — the measurements are in the PR.
 
 UndoRecord GpuBackend::bucketFill(Document& doc, LayerId target, std::int32_t x,
-                                  std::int32_t y, StraightRgba8 colour, int tolerance) {
+                                  std::int32_t y, StraightRgba8 colour, int tolerance,
+                                  bool toMask) {
     if (const auto ready = readback(doc); !ready.has_value()) {
         recordFailure(ready.error());
         return {};
@@ -1003,15 +1004,16 @@ UndoRecord GpuBackend::bucketFill(Document& doc, LayerId target, std::int32_t x,
     // floodFill, not cpuBackend().bucketFill: the region has to be found on
     // the image THIS backend composited, or the fill stops at a boundary the
     // artist cannot see.
-    return floodFill(doc, target, x, y, colour, tolerance);
+    return floodFill(doc, target, x, y, colour, tolerance, toMask);
 }
 
-UndoRecord GpuBackend::fillSelection(Document& doc, LayerId target, StraightRgba8 c) {
+UndoRecord GpuBackend::fillSelection(Document& doc, LayerId target, StraightRgba8 c,
+                                     bool toMask) {
     if (const auto ready = readback(doc); !ready.has_value()) {
         recordFailure(ready.error());
         return {};
     }
-    return cpuBackend().fillSelection(doc, target, c);
+    return cpuBackend().fillSelection(doc, target, c, toMask);
 }
 
 UndoRecord GpuBackend::transformRegion(Document& doc, LayerId target,
@@ -1024,14 +1026,14 @@ UndoRecord GpuBackend::transformRegion(Document& doc, LayerId target,
     return cpuBackend().transformRegion(doc, target, source, transform);
 }
 
-UndoRecord GpuBackend::clearLayer(Layer& layer) {
+UndoRecord GpuBackend::clearLayer(Layer& layer, bool toMask) {
     submitPending();
     // The undo record has to hold what was painted, not what the host last saw.
     if (!syncLayer(layer))
         recordFailure(Error{ErrorKind::Io,
                             "could not read painted tiles back from the GPU: " +
                                 std::string(SDL_GetError())});
-    UndoRecord rec = cpuBackend().clearLayer(layer);
+    UndoRecord rec = cpuBackend().clearLayer(layer, toMask);
     dropLayer(layer.id);
     return rec;
 }

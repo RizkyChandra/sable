@@ -302,7 +302,16 @@ struct App {
     bool showTestPad     = false;
     bool showCalibration = false;
     bool showShortcuts   = false;
+    /// The walkthrough, and which of its steps is on screen. `tutorialAgain`
+    /// is what the preferences file remembers, and reading it at startup
+    /// CONSUMES it: the checkbox offers one more showing, not a standing one.
+    bool showTutorial    = false;
+    bool tutorialAgain   = false;
+    int  tutorialStep    = 0;
     bool resetLayout     = false;
+    /// The blank canvas of a fresh start, waiting for a viewport to be placed
+    /// in. Cleared by the first frame that has one.
+    bool placeFirstCanvas = true;
     bool lightTheme      = false;
     bool appliedLight    = false;
     sbl::Transform pendingTransform;   // edited live, applied as one step
@@ -465,6 +474,11 @@ void applySettings(App& app, const Settings& settings) {
     app.foreground.g = static_cast<std::uint8_t>(settings.getInt("colour.g", 0));
     app.foreground.b = static_cast<std::uint8_t>(settings.getInt("colour.b", 0));
     app.profile = readProfile(settings, "tablet");
+    // Shown on a first run — a preferences file with nothing in it is what a
+    // first run looks like — and after that only when it was asked for again.
+    // An artist who already has settings has already found their way around,
+    // and Help is where they would look if they had not.
+    app.showTutorial = settings.getInt("ui.tutorial", settings.values.empty() ? 1 : 0) != 0;
     app.uiScale = std::clamp(settings.getFloat("ui.scale", 1.0f), 0.75f, 2.5f);
     app.lightTheme = settings.getInt("ui.lightTheme", 0) != 0;
     app.undoBudgetMb = std::clamp(settings.getInt("undo.budgetMb", 256), 16, 2048);
@@ -546,6 +560,7 @@ void collectSettings(const App& app, Settings& settings) {
     settings.setInt("colour.g", app.foreground.g);
     settings.setInt("colour.b", app.foreground.b);
     storeProfile(settings, "tablet", app.profile);
+    settings.setInt("ui.tutorial", app.tutorialAgain ? 1 : 0);
     settings.setFloat("ui.scale", app.uiScale);
     settings.setInt("ui.lightTheme", app.lightTheme ? 1 : 0);
     settings.setInt("undo.budgetMb", app.undoBudgetMb);
@@ -738,36 +753,34 @@ void doRedo(App& app) {
     app.cur().doc.dirty = true;
 }
 
-/// True when "Paint on mask" is on and the tool about to run cannot honour it.
+/// Whether the fill family should write the active layer's mask rather than its
+/// pixels: the artist asked for it, and there is a mask to write (#58).
 ///
-/// The brush family takes `PaintTarget::toMask` and paints the mask properly
-/// (D-031). The fill family — bucket, fill selection, gradient, clear — does
-/// not: those are `PaintBackend` methods that write layer tiles, so a mask path
-/// means changing the backend interface and both implementations, and that is
-/// its own change (#58).
-///
-/// What must not happen in the meantime is the silent version. The artist has
-/// said "I am editing the mask"; a fill that quietly lands on the artwork
-/// instead is destructive, is easy to miss until the mask is switched off, and
-/// is exactly the class of defect this project keeps finding — a control that
-/// reports one thing and does another. Refusing and saying so is worse than
-/// working and better than lying.
-bool refusesMask(App& app) {
+/// The same question the brush answers through `PaintTarget::toMask`, asked in
+/// one place so bucket, fill, gradient and clear cannot drift apart from each
+/// other or from the brush.
+[[nodiscard]] bool onMask(const App& app) {
     const sbl::Layer* layer = app.cur().doc.layerById(app.cur().doc.activeLayer);
-    if (!app.cur().paintOnMask || layer == nullptr || !layer->mask.has_value()) return false;
-    app.notices = {"Paint on mask is on, and fill, bucket, gradient and clear "
-                   "still write the layer rather than its mask (#58) — so they "
-                   "are held back. Paint the mask with a brush, or switch Paint "
-                   "on mask off to use these on the layer."};
-    return true;
+    return app.cur().paintOnMask && layer != nullptr && layer->mask.has_value();
 }
 
 void doClear(App& app) {
-    if (refusesMask(app)) return;
     sbl::Layer* layer = app.cur().doc.active();
-    if (layer == nullptr || layer->tiles.empty()) return;   // harmless when empty
-    sbl::UndoRecord rec = sbl::clearLayer(*layer);
-    for (const auto& snap : rec.tiles) app.cur().canvas->release(snap.key);
+    if (layer == nullptr) return;
+    const bool mask = onMask(app);
+    // Harmless when there is nothing to clear, and an undo step for nothing is
+    // not harmless.
+    if ((mask ? layer->mask->tiles.empty() : layer->tiles.empty())) return;
+
+    sbl::UndoRecord rec = sbl::clearLayer(*layer, mask);
+    // A cleared mask leaves the layer's own tile exactly where it was, so the
+    // texture is stale rather than gone. Releasing one that still has pixels
+    // would drop it from the cache and re-upload it next frame — the same
+    // picture, by a longer road.
+    for (const auto& snap : rec.tiles) {
+        if (layer->find(snap.key) != nullptr) app.cur().canvas->markDirty(snap.key);
+        else                                  app.cur().canvas->release(snap.key);
+    }
     app.cur().doc.undo.push(std::move(rec));
     app.cur().doc.dirty = true;
 }
@@ -1043,13 +1056,12 @@ void endPaint(App& app) {
 }
 
 void doFill(App& app, double sx, double sy) {
-    if (refusesMask(app)) return;
     const auto x = static_cast<std::int32_t>(std::floor(toCanvasX(app.cur().view, sx, sy)));
     const auto y = static_cast<std::int32_t>(std::floor(toCanvasY(app.cur().view, sx, sy)));
 
     sbl::UndoRecord rec =
         sbl::bucketFill(app.cur().doc, app.cur().doc.activeLayer, x, y, app.foreground,
-                        app.fillTolerance);
+                        app.fillTolerance, onMask(app));
     if (rec.empty()) return;
 
     for (const auto& snap : rec.tiles) app.cur().canvas->markDirty(snap.key);
@@ -1058,7 +1070,6 @@ void doFill(App& app, double sx, double sy) {
 }
 
 void beginGradient(App& app, double sx, double sy) {
-    if (refusesMask(app)) return;   // refuse before the drag, not after it draws
     app.gradientDragging  = true;
     app.gradientPreviewed = false;
     app.gradientAnchorX   = toCanvasX(app.cur().view, sx, sy);
@@ -1099,7 +1110,8 @@ void previewGradient(App& app, double sx, double sy) {
                    ? sbl::StraightRgba8{0, 0, 0, 0} : app.background;
     g.dither = app.gradientDither;
 
-    sbl::UndoRecord rec = sbl::gradientFill(app.cur().doc, app.cur().doc.activeLayer, g);
+    sbl::UndoRecord rec =
+        sbl::gradientFill(app.cur().doc, app.cur().doc.activeLayer, g, onMask(app));
     if (rec.empty()) return;                  // a drag too short to have an axis
 
     for (const auto& snap : rec.tiles) app.cur().canvas->markDirty(snap.key);
@@ -1795,9 +1807,9 @@ void handleKey(App& app, const SDL_KeyboardEvent& key) {
         case Action::Paste: doPaste(app); break;
         case Action::Clear: doClear(app); break;
         case Action::FillSelection: {
-            if (refusesMask(app)) break;
             sbl::UndoRecord rec =
-                sbl::fillSelection(app.cur().doc, app.cur().doc.activeLayer, app.foreground);
+                sbl::fillSelection(app.cur().doc, app.cur().doc.activeLayer,
+                                   app.foreground, onMask(app));
             if (!rec.empty()) {
                 for (const auto& snap : rec.tiles) app.cur().canvas->markDirty(snap.key);
                 app.cur().doc.undo.push(std::move(rec));
@@ -1868,6 +1880,11 @@ void handleKey(App& app, const SDL_KeyboardEvent& key) {
             break;
         case Action::TogglePerspective:
             app.perspective.enabled = !app.perspective.enabled;
+            break;
+
+        case Action::GettingStarted:
+            app.showTutorial = !app.showTutorial;
+            if (app.showTutorial) app.tutorialStep = 0;
             break;
 
         case Action::Count: break;   // not bound to anything
@@ -2348,13 +2365,17 @@ void drawMenuBar(App& app, float& menuHeight) {
             doPaste(app);
         ImGui::Separator();
         const sbl::Layer* layer = app.cur().doc.layerById(app.cur().doc.activeLayer);
-        if (ImGui::MenuItem("Clear", nullptr, false,
-                            layer != nullptr && !layer->tiles.empty())) doClear(app);
+        // Enabled on what the artist is actually editing: with Paint on mask
+        // on, an empty mask over a painted layer has nothing to clear.
+        const bool clearable =
+            layer != nullptr && (onMask(app) ? !layer->mask->tiles.empty()
+                                             : !layer->tiles.empty());
+        if (ImGui::MenuItem("Clear", nullptr, false, clearable)) doClear(app);
         ImGui::Separator();
-        if (ImGui::MenuItem("Fill selection", nullptr, false, layer != nullptr) &&
-            !refusesMask(app)) {
+        if (ImGui::MenuItem("Fill selection", nullptr, false, layer != nullptr)) {
             sbl::UndoRecord rec =
-                sbl::fillSelection(app.cur().doc, app.cur().doc.activeLayer, app.foreground);
+                sbl::fillSelection(app.cur().doc, app.cur().doc.activeLayer,
+                                   app.foreground, onMask(app));
             if (!rec.empty()) {
                 for (const auto& snap : rec.tiles) app.cur().canvas->markDirty(snap.key);
                 app.cur().doc.undo.push(std::move(rec));
@@ -2406,11 +2427,23 @@ void drawMenuBar(App& app, float& menuHeight) {
                 haveGpu ? app.gpuWhy.c_str() : "This build has no GPU backend.");
         }
         ImGui::Separator();
+        if (ImGui::MenuItem("Reset panel layout")) app.resetLayout = true;
+        ImGui::EndMenu();
+    }
+
+    // The tablet pages and the key map used to be under View, between the zoom
+    // levels and the GPU switch. They are where somebody stuck goes looking,
+    // and View is not where anybody looks when they are stuck.
+    if (ImGui::BeginMenu("Help")) {
+        if (ImGui::MenuItem("Getting started",
+                            app.shortcuts.get(Action::GettingStarted).label().c_str())) {
+            app.showTutorial = true;
+            app.tutorialStep = 0;
+        }
+        ImGui::Separator();
+        ImGui::MenuItem("Keyboard and interface", nullptr, &app.showShortcuts);
         ImGui::MenuItem("Pressure calibration", nullptr, &app.showCalibration);
         ImGui::MenuItem("Tablet test pad", nullptr, &app.showTestPad);
-        ImGui::MenuItem("Keyboard and interface", nullptr, &app.showShortcuts);
-        ImGui::Separator();
-        if (ImGui::MenuItem("Reset panel layout")) app.resetLayout = true;
         ImGui::EndMenu();
     }
 
@@ -2845,11 +2878,17 @@ void drawLayerPanel(App& app) {
                         propsFor = layer.id;
                     }
                     ImGui::SameLine();
-                    // Which of the two the brush lands in. A preference rather
-                    // than a document property, and shown here because the mask
-                    // is the thing it is about — an artist who cannot see which
-                    // one they are painting paints the wrong one.
+                    // Which of the two the paint lands in — every tool's, since
+                    // #58, not only the brush's. A preference rather than a
+                    // document property, and shown here because the mask is the
+                    // thing it is about: an artist who cannot see which one
+                    // they are painting paints the wrong one.
                     ImGui::Checkbox("Paint on mask", &app.cur().paintOnMask);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(
+                            "Brush, eraser, bucket, fill, gradient and clear all "
+                            "write the mask while this is on.\n"
+                            "White reveals, black hides.");
                     ImGui::SameLine();
                     if (ImGui::SmallButton("Delete mask")) {
                         deleteMaskFor = layer.id;
@@ -3037,12 +3076,145 @@ void drawTestPad(App& app) {
         ImGui::Text("Motion events last frame: %d", app.motionLastFrame);
         if (app.motionLastFrame == 1 && !app.lastFromMouse)
             ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f),
-                               "Only one per frame — samples may be being dropped.");
+                               "Only one per frame: samples may be being dropped.");
 
         ImGui::Separator();
         ImGui::TextDisabled("Active curve, with current input marked:");
         pressureCurveEditor("padcurve", app.profile.curve, 200.0f,
                             app.lastFromMouse ? -1.0f : app.pressureFilter.lastRescaled());
+    }
+    ImGui::End();
+}
+
+/// The walkthrough a first run opens on: one idea per step, in the order
+/// somebody actually needs them — make a mark, change it, take it back, keep
+/// it. Seven screens is the whole of it; anything longer gets closed unread.
+///
+/// Every key it names is read out of the shortcut table rather than typed into
+/// the text, the same rule the tool panel follows: a rebound key must not turn
+/// the tutorial into a lie, and a newcomer is exactly who cannot tell.
+void drawTutorial(App& app) {
+    if (!app.showTutorial) return;
+    constexpr int kSteps = 7;
+
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f,
+                                   vp->WorkPos.y + vp->WorkSize.y * 0.5f),
+                            ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(460.0f, 320.0f), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Getting started", &app.showTutorial)) {
+        const auto key = [&app](Action action) {
+            return app.shortcuts.get(action).label();
+        };
+        const auto heading = [](const char* text) {
+            ImGui::PushFont(nullptr, ImGui::GetFontSize() * 1.25f);
+            ImGui::TextUnformatted(text);
+            ImGui::PopFont();
+            ImGui::Spacing();
+        };
+
+        ImGui::TextDisabled("Step %d of %d", app.tutorialStep + 1, kSteps);
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // The body of each step sits between the heading and the footer, in a
+        // child so a long one scrolls rather than pushing the buttons off.
+        ImGui::BeginChild("body", ImVec2(0.0f, -ImGui::GetFrameHeightWithSpacing() * 2.2f));
+        switch (app.tutorialStep) {
+            case 0:
+                heading("Make a mark");
+                ImGui::TextWrapped(
+                    "Press %s for the brush, then drag across the canvas in the "
+                    "middle. With a graphics tablet, press harder for a wider, "
+                    "darker mark; that is what Sable is for.\n\n"
+                    "No tablet? Everything below still works; the mouse simply "
+                    "draws at full pressure.",
+                    key(Action::ToolBrush).c_str());
+                break;
+            case 1:
+                heading("Size and colour");
+                ImGui::TextWrapped(
+                    "%s and %s step the brush through its sizes. The Colour panel "
+                    "on the right sets what you paint with, and %s swaps the two "
+                    "colours it holds.\n\n"
+                    "The Tools panel picks a preset: pencil, opaque, airbrush, "
+                    "marker and the rest make genuinely different marks.",
+                    key(Action::SizeDown).c_str(), key(Action::SizeUp).c_str(),
+                    key(Action::SwapColours).c_str());
+                break;
+            case 2:
+                heading("Take it back");
+                ImGui::TextWrapped(
+                    "%s undoes, %s redoes, and a whole stroke is one step however "
+                    "many dabs it took.\n\n"
+                    "%s is the eraser. It is a tool rather than a mode, so it "
+                    "keeps its own size, and the far end of a tablet stylus "
+                    "picks it up on its own.",
+                    key(Action::Undo).c_str(), key(Action::Redo).c_str(),
+                    key(Action::ToolEraser).c_str());
+                break;
+            case 3:
+                heading("Layers");
+                ImGui::TextWrapped(
+                    "The Layers panel adds, hides and reorders layers, and paint "
+                    "lands on the highlighted one. If a stroke seems to vanish, "
+                    "that is usually why.\n\n"
+                    "A layer can carry a mask, which is painted with the ordinary "
+                    "brushes: white shows, black hides.");
+                if (ImGui::SmallButton("Add a layer now"))
+                    pushLayerAction(app, sbl::addLayerAbove(app.cur().doc,
+                                                            app.cur().doc.activeLayer, "Layer"));
+                break;
+            case 4:
+                heading("Move around");
+                ImGui::TextWrapped(
+                    "The wheel zooms about the pointer, and holding space turns "
+                    "any drag into a pan. %s fits the drawing to the window, %s "
+                    "returns to actual size.",
+                    key(Action::FitToWindow).c_str(), key(Action::ActualSize).c_str());
+                ImGui::Spacing();
+                if (ImGui::SmallButton("Fit to window"))
+                    fitToViewport(app.cur().view, app.cur().doc, app.viewport);
+                break;
+            case 5:
+                heading("Keep it");
+                ImGui::TextWrapped(
+                    "%s saves a .sable project, with layers, masks and history intact. "
+                    "Export writes a flat PNG for everyone else.\n\n"
+                    "Sable also keeps a recovery copy of unsaved work while you "
+                    "draw, and offers it back after a crash. It never overwrites "
+                    "your own files.",
+                    key(Action::Save).c_str());
+                break;
+            default:
+                heading("Where the rest lives");
+                ImGui::TextWrapped(
+                    "Help lists everything else: the full key map, which is "
+                    "reassignable down to the last binding, and the tablet pages: "
+                    "a pressure curve to suit your hand, and a test pad that "
+                    "shows what your stylus is actually reporting.\n\n"
+                    "%s opens this walkthrough again at any time.",
+                    key(Action::GettingStarted).c_str());
+                ImGui::Spacing();
+                if (ImGui::SmallButton("Open the key map")) app.showShortcuts = true;
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Open the tablet test pad")) app.showTestPad = true;
+                break;
+        }
+        ImGui::EndChild();
+
+        ImGui::Separator();
+        ImGui::BeginDisabled(app.tutorialStep == 0);
+        if (ImGui::Button("Back")) --app.tutorialStep;
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (app.tutorialStep + 1 < kSteps) {
+            if (ImGui::Button("Next")) ++app.tutorialStep;
+        } else if (ImGui::Button("Start drawing")) {
+            app.showTutorial = false;
+        }
+        ImGui::SameLine();
+        ImGui::Checkbox("Show this again next time", &app.tutorialAgain);
     }
     ImGui::End();
 }
@@ -3257,7 +3429,7 @@ void drawModals(App& app) {
         ImGui::Checkbox("16 bits per channel", &app.form.wideColour);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip(
-                "Smoother build-up from stacked low-opacity passes — soft "
+                "Smoother build-up from stacked low-opacity passes: soft "
                 "shading and airbrush work.\n\nCosts double the memory per "
                 "tile, so the same undo budget holds about half the history, "
                 "and the GPU backend cannot paint it.\n\nCannot be changed "
@@ -3544,6 +3716,26 @@ void drawRulerGuides(const App& app) {
     }
 }
 
+/// What an untouched canvas says, in the middle of it: the two things needed
+/// to start, and where the rest is. It goes at the first dab and does not come
+/// back — an empty canvas is the only moment it is worth the room.
+void drawEmptyCanvasHint(const App& app, ImDrawList* overlay) {
+    const OpenDocument& open = app.cur();
+    if (open.doc.dirty || open.doc.undo.size() > 0 || app.painting) return;
+    if (app.showTutorial || open.text.active()) return;
+
+    char line[160];
+    std::snprintf(line, sizeof line, "%s to draw     %s to get started",
+                  app.shortcuts.get(Action::ToolBrush).label().c_str(),
+                  app.shortcuts.get(Action::GettingStarted).label().c_str());
+    const ImVec2 size = ImGui::CalcTextSize(line);
+    overlay->AddText(ImVec2(app.viewport.x + (app.viewport.w - size.x) * 0.5f,
+                            app.viewport.y + (app.viewport.h - size.y) * 0.5f),
+                     // Grey either way: it sits on the artist's paper, whose
+                     // colour is theirs and not the theme's.
+                     IM_COL32(128, 128, 132, 190), line);
+}
+
 void drawBrushCursor(const App& app) {
     if (ImGui::GetIO().WantCaptureMouse) return;
     float mx = 0.0f, my = 0.0f;
@@ -3634,6 +3826,7 @@ void renderFrame(App& app, bool present = true) {
     drawCalibration(app);
     drawTestPad(app);
     drawShortcutEditor(app);
+    drawTutorial(app);
     drawModals(app);
 
     // The canvas lives in whatever the central node has been left as, so it
@@ -3644,6 +3837,18 @@ void renderFrame(App& app, bool present = true) {
         central != nullptr && central->Size.x > 1.0f && central->Size.y > 1.0f) {
         app.viewport = SDL_FRect{central->Pos.x, central->Pos.y,
                                  central->Size.x, central->Size.y};
+    }
+    // The canvas Sable opens on used to sit in the top-left corner with the
+    // rest of the viewport empty beside it: nothing had placed it, because
+    // where the viewport IS is only known once the docking has been laid out,
+    // which is here, one frame in. An opened file has gone through
+    // adoptDocument and been placed already; this is the blank one nothing
+    // else touches. Same pair of calls, so both arrive looking the same.
+    if (app.placeFirstCanvas && app.viewport.w > 1.0f && app.viewport.h > 1.0f) {
+        app.placeFirstCanvas = false;
+        fitToViewport(app.cur().view, app.cur().doc, app.viewport);
+        if (app.cur().view.zoom > 1.0f)
+            zoomToActualSize(app.cur().view, app.cur().doc, app.viewport);
     }
     // Every overlay below draws canvas-space geometry into the shared
     // foreground list, and canvas space is unbounded: a ruler guide runs a
@@ -3656,6 +3861,7 @@ void renderFrame(App& app, bool present = true) {
     overlay->PushClipRect(ImVec2(app.viewport.x, app.viewport.y),
                           ImVec2(app.viewport.x + app.viewport.w,
                                  app.viewport.y + app.viewport.h), true);
+    drawEmptyCanvasHint(app, overlay);
     drawRulerGuides(app);
     drawSelectionOutline(app);
     drawLassoInProgress(app);
@@ -3787,6 +3993,10 @@ int main(int argc, char** argv) {
         app.showTestPad     = true;
         app.showCalibration = true;
         app.showShortcuts   = true;
+        // Every step of the walkthrough drawn at least once: it is the first
+        // thing a new artist sees, and the only check it can get here is that
+        // it renders at all.
+        app.showTutorial    = true;
         beginPaint(app);
         for (double t = 0.0; t <= 1.0; t += 0.02) {
             const double cx = 100.0 + t * 400.0;
@@ -4465,45 +4675,94 @@ int main(int argc, char** argv) {
             SDL_Log("selftest: a gradient drag is one undo step (midpoint %d)", half);
         }
 
-        // The fill family refuses to run while the artist is painting a mask,
-        // rather than silently writing the layer instead (#58). Checked here
-        // because the whole point is what does NOT happen, and a tool that
-        // quietly paints the wrong target is invisible to every other check.
+        // The fill family writes the MASK while the artist is painting one
+        // (#58), and leaves the artwork alone. Checked through the app's own
+        // entry points, because what the engine can do and what the tool asks
+        // it for are two different things — and paint landing on the layer
+        // instead is invisible until the mask is switched off.
         {
             sbl::Layer* layer = app.cur().doc.active();
-            layer->mask.emplace();
+            layer->mask.emplace();                   // reveal-all, no tiles yet
             app.cur().paintOnMask = true;
+            const sbl::StraightRgba8 wasForeground = app.foreground;
+            const sbl::StraightRgba8 wasBackground = app.background;
+            const bool wasToTransparent = app.gradientToTransparent;
+            app.foreground = sbl::StraightRgba8{0, 0, 0, 255};   // black hides
+
+            // The layer's own pixels, read with the mask switched off so that
+            // hiding them is not mistaken for erasing them.
+            const auto artworkAt = [&](std::int32_t x, std::int32_t y) {
+                layer->mask->enabled = false;
+                const sbl::StraightRgba8 seen = sbl::pickColour(app.cur().doc, x, y);
+                layer->mask->enabled = true;
+                return seen;
+            };
             const std::size_t before = app.cur().doc.undo.size();
-            const std::size_t tiles  = layer->tiles.size();
-            const sbl::StraightRgba8 spot = sbl::pickColour(app.cur().doc, 500, 20);
+            const sbl::StraightRgba8 spot = artworkAt(500, 20);
 
             doFill(app, toScreenX(app.cur().view, 500.0, 20.0),
                         toScreenY(app.cur().view, 500.0, 20.0));
-            doClear(app);
-            beginGradient(app, toScreenX(app.cur().view, 10.0, 10.0),
-                               toScreenY(app.cur().view, 10.0, 10.0));
+            if (sbl::maskCoverage(*layer->mask, 500, 20) != 0) {
+                SDL_Log("selftest FAILED: filling with Paint on mask on left the "
+                        "mask reading %d, not the 0 that black hides with",
+                        sbl::maskCoverage(*layer->mask, 500, 20));
+                return 1;
+            }
+            if (!(artworkAt(500, 20) == spot)) {
+                SDL_Log("selftest FAILED: a mask fill changed the artwork underneath");
+                return 1;
+            }
+            if (app.cur().doc.undo.size() != before + 1) {
+                SDL_Log("selftest FAILED: a mask fill pushed %zu undo steps",
+                        app.cur().doc.undo.size() - before);
+                return 1;
+            }
+            doUndo(app);
+            if (sbl::maskCoverage(*layer->mask, 500, 20) != 255) {
+                SDL_Log("selftest FAILED: undoing a mask fill left the mask at %d",
+                        sbl::maskCoverage(*layer->mask, 500, 20));
+                return 1;
+            }
+            doRedo(app);
 
-            if (app.cur().doc.undo.size() != before || layer->tiles.size() != tiles ||
-                !(sbl::pickColour(app.cur().doc, 500, 20) == spot)) {
-                SDL_Log("selftest FAILED: a fill tool wrote the layer while Paint "
-                        "on mask was on");
+            // A gradient down the mask: the reason to want one at all, since
+            // fading a layer out is this and nothing else.
+            beginGradient(app, toScreenX(app.cur().view, 0.0, 0.0),
+                               toScreenY(app.cur().view, 0.0, 0.0));
+            if (!app.gradientDragging) {
+                SDL_Log("selftest FAILED: the gradient would not start on a mask");
                 return 1;
             }
-            if (app.gradientDragging) {
-                SDL_Log("selftest FAILED: the gradient started a drag it cannot "
-                        "commit to a mask");
+            app.gradientToTransparent = false;
+            app.background = sbl::StraightRgba8{255, 255, 255, 255};
+            endGradient(app, toScreenX(app.cur().view, 1000.0, 0.0),
+                             toScreenY(app.cur().view, 1000.0, 0.0));
+            const int nearEnd = sbl::maskCoverage(*layer->mask, 990, 4);
+            const int nearStart = sbl::maskCoverage(*layer->mask, 4, 4);
+            if (nearEnd - nearStart < 128) {
+                SDL_Log("selftest FAILED: a gradient in the mask ramps %d to %d, "
+                        "which is no ramp at all", nearStart, nearEnd);
                 return 1;
             }
-            if (app.notices.empty()) {
-                SDL_Log("selftest FAILED: the fill tools refused silently, which is "
-                        "the failure this check exists to prevent");
+
+            doClear(app);
+            if (!layer->mask->tiles.empty()) {
+                SDL_Log("selftest FAILED: clearing left %zu mask tiles",
+                        layer->mask->tiles.size());
                 return 1;
             }
+            if (!(artworkAt(500, 20) == spot)) {
+                SDL_Log("selftest FAILED: clearing the mask took the artwork with it");
+                return 1;
+            }
+
             app.cur().paintOnMask = false;
             layer->mask.reset();
-            app.notices.clear();
-            SDL_Log("selftest: the fill tools refuse a mask out loud rather than "
-                    "painting the layer");
+            app.foreground = wasForeground;
+            app.background = wasBackground;
+            app.gradientToTransparent = wasToTransparent;
+            SDL_Log("selftest: bucket, gradient and clear write the mask and "
+                    "leave the artwork alone");
         }
 
         // Drive one background recovery to completion. This is the only path
@@ -4544,7 +4803,9 @@ int main(int argc, char** argv) {
         // and the re-shape — which need no font and so are not conditional.
         // Plus the gradient's layer and its ONE step: three previews and a
         // release, and the whole drag is a single entry (D-030).
-        const std::size_t expectedUndo   = (textTested ? 6u : 4u) + 3u + 1u;
+        // Plus three from the mask block above — a bucket, a gradient and a
+        // clear, each landing in the mask and each one step (#58).
+        const std::size_t expectedUndo   = (textTested ? 6u : 4u) + 3u + 1u + 3u;
         const std::size_t expectedLayers = (textTested ? 3u : 2u) + 1u + 1u;
         if (!result.has_value() || app.cur().doc.undo.size() != expectedUndo ||
             app.cur().doc.layers.size() != expectedLayers ||
@@ -4915,6 +5176,15 @@ int main(int argc, char** argv) {
             SDL_Log("selftest: a dirty tab prompts and a clean one does not; the "
                     "last tab closed leaves a fresh canvas");
         }
+
+        // Every step of the walkthrough, drawn. A step whose text takes an
+        // argument it does not have crashes on the frame it appears, which is
+        // the first frame of somebody's first run.
+        for (app.tutorialStep = 0; app.tutorialStep < 7; ++app.tutorialStep)
+            renderFrame(app, false);
+        app.tutorialStep = 0;
+        app.showTutorial = false;
+        SDL_Log("selftest: the getting-started walkthrough draws all 7 steps");
 
         // A pen frame, in the order SDL really sends one: position first, axes
         // behind it (#16). The dab must be painted with the pressure of its own

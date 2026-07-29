@@ -32,16 +32,18 @@ void applyDab(PaintTarget& t, const Dab& dab) {
 }
 
 UndoRecord bucketFill(Document& doc, LayerId target, std::int32_t x, std::int32_t y,
-                      StraightRgba8 colour, int tolerance) {
-    return paintBackend().bucketFill(doc, target, x, y, colour, tolerance);
+                      StraightRgba8 colour, int tolerance, bool toMask) {
+    return paintBackend().bucketFill(doc, target, x, y, colour, tolerance, toMask);
 }
 
-UndoRecord fillSelection(Document& doc, LayerId target, StraightRgba8 colour) {
-    return paintBackend().fillSelection(doc, target, colour);
+UndoRecord fillSelection(Document& doc, LayerId target, StraightRgba8 colour,
+                         bool toMask) {
+    return paintBackend().fillSelection(doc, target, colour, toMask);
 }
 
-UndoRecord gradientFill(Document& doc, LayerId target, const Gradient& gradient) {
-    return paintBackend().gradientFill(doc, target, gradient);
+UndoRecord gradientFill(Document& doc, LayerId target, const Gradient& gradient,
+                        bool toMask) {
+    return paintBackend().gradientFill(doc, target, gradient, toMask);
 }
 
 UndoRecord transformRegion(Document& doc, LayerId target, const Selection& source,
@@ -49,7 +51,9 @@ UndoRecord transformRegion(Document& doc, LayerId target, const Selection& sourc
     return paintBackend().transformRegion(doc, target, source, transform);
 }
 
-UndoRecord clearLayer(Layer& layer) { return paintBackend().clearLayer(layer); }
+UndoRecord clearLayer(Layer& layer, bool toMask) {
+    return paintBackend().clearLayer(layer, toMask);
+}
 
 UndoRecord mergeLayerDown(Document& doc, LayerId id) {
     return paintBackend().mergeLayerDown(doc, id);

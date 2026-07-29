@@ -713,15 +713,28 @@ namespace {
 
 /// Writes one pixel into a layer, snapshotting its tile on first touch.
 /// Shared by both fills so the undo bookkeeping exists in exactly one place.
+///
+/// With `toMask` set it writes the layer's MASK instead (#58), through the same
+/// `find`/`tileFor` pair `applyDab` uses — a mask tile is an ordinary 8-bit
+/// tile (D-031), so every fill reaches one without a second implementation of
+/// anything. Absent tiles differ, and that is the whole of the difference: an
+/// absent PIXEL tile is transparent, an absent MASK tile reads as the mask's
+/// `outside`, so a fill blending into one has to mix against the grey that is
+/// actually there rather than against nothing.
 struct PixelWriter {
     Layer&        layer;
     UndoRecord&   undo;
     TouchedTiles& touched;
+    bool          toMask = false;
 
     [[nodiscard]] PremulRgba16 get(std::int32_t x, std::int32_t y) {
         const TileKey key{tileIndex(x), tileIndex(y)};
-        const Tile* tile = layer.find(key);
-        if (tile == nullptr) return PremulRgba16{};
+        const Tile* tile = toMask ? layer.mask->find(key) : layer.find(key);
+        if (tile == nullptr) {
+            if (!toMask) return PremulRgba16{};
+            const std::uint16_t g = widenChannel(layer.mask->outside);
+            return PremulRgba16{g, g, g, 65535};
+        }
         return tile->pixel(x - key.first * TILE_SIZE, y - key.second * TILE_SIZE);
     }
 
@@ -735,11 +748,14 @@ struct PixelWriter {
     /// document produces the byte it always produced. Fills take an 8-bit
     /// colour either way — it came from the colour picker — so nothing is lost
     /// by widening it on the way in.
+    ///
+    /// A mask is always 8 bits whatever the document is, so it takes the narrow
+    /// path however deep the layer under it runs.
     void blendIn(std::int32_t x, std::int32_t y, PremulRgba8 colour,
                  std::uint8_t cov) {
         if (cov == 255) { set(x, y, colour); return; }
         const float t = static_cast<float>(cov) / 255.0f;
-        if (layer.depth == ColourDepth::Bits16)
+        if (!toMask && layer.depth == ColourDepth::Bits16)
             set(x, y, lerpPremul(get(x, y), widen(colour), t));
         else
             set(x, y, lerpPremul(narrow(get(x, y)), colour, t));
@@ -747,15 +763,17 @@ struct PixelWriter {
 
     void set(std::int32_t x, std::int32_t y, PremulRgba16 colour) {
         const TileKey key{tileIndex(x), tileIndex(y)};
-        Tile* tile = layer.find(key);
+        Tile* tile = toMask ? layer.mask->find(key) : layer.find(key);
         if (touched.insert(key).second) {
             TileSnapshot snap;
             snap.layer = layer.id;
             snap.key   = key;
+            snap.mask  = toMask;
             if (tile != nullptr) snap.before.emplace(tile->clone());
             undo.tiles.push_back(std::move(snap));
         }
-        if (tile == nullptr) tile = &layer.tileFor(key);
+        if (tile == nullptr)
+            tile = toMask ? &layer.mask->tileFor(key) : &layer.tileFor(key);
         tile->setPixel(x - key.first * TILE_SIZE, y - key.second * TILE_SIZE, colour);
     }
 
@@ -831,15 +849,22 @@ std::vector<bool> floodRegion(const std::vector<StraightRgba8>& composite,
 }
 
 UndoRecord CpuBackend::bucketFill(Document& doc, LayerId target, std::int32_t x,
-                                  std::int32_t y, StraightRgba8 colour, int tolerance) {
-    return floodFill(doc, target, x, y, colour, tolerance);
+                                  std::int32_t y, StraightRgba8 colour, int tolerance,
+                                  bool toMask) {
+    return floodFill(doc, target, x, y, colour, tolerance, toMask);
 }
 
 UndoRecord PaintBackend::floodFill(Document& doc, LayerId target, std::int32_t x,
-                                   std::int32_t y, StraightRgba8 colour, int tolerance) {
+                                   std::int32_t y, StraightRgba8 colour, int tolerance,
+                                   bool toMask) {
     UndoRecord rec;
     Layer* layer = doc.layerById(target);
-    if (layer == nullptr || layer->locked || layer->kind != LayerKind::Raster) return rec;
+    // The same three guards `applyDab` opens with, in the same order: a mask
+    // write needs a mask, a pixel write needs pixels it is allowed to have,
+    // and locked means locked either way (#48, #58).
+    if (layer == nullptr || layer->locked) return rec;
+    if (toMask && !layer->mask.has_value()) return rec;
+    if (!toMask && layer->kind != LayerKind::Raster) return rec;
     if (x < 0 || y < 0 || x >= doc.width || y >= doc.height) return rec;
 
     const Selection* selection =
@@ -850,6 +875,10 @@ UndoRecord PaintBackend::floodFill(Document& doc, LayerId target, std::int32_t x
     // layer works. One flatten per fill is affordable; per pixel would not be.
     // *this, not the process default: whichever backend was asked for the fill
     // is the one whose compositing the artist is looking at.
+    //
+    // This holds for a mask fill too (D-036): the region comes off the
+    // composite either way. The artist clicked a shape they can see, and which
+    // channel the paint lands in does not move where that shape ends.
     const std::vector<StraightRgba8> composite = flatten(doc, *this);
     if (composite.empty()) return rec;
 
@@ -864,16 +893,23 @@ UndoRecord PaintBackend::floodFill(Document& doc, LayerId target, std::int32_t x
 
     // Already the target colour and nothing to spread into: filling would be a
     // no-op that still costs an undo step.
-    if (withinTolerance(seed, colour, 0) && std::clamp(tolerance, 0, 255) == 0)
+    //
+    // Only when the paint is going where the seed was read from. A mask fill
+    // compares the colour the artist clicked against the grey it is about to
+    // write into a different channel entirely, which is not the same question
+    // — filling a mask black inside a black shape is a perfectly ordinary
+    // thing to want.
+    if (!toMask && withinTolerance(seed, colour, 0) &&
+        std::clamp(tolerance, 0, 255) == 0)
         return rec;
 
     // The shared flood — the magic wand runs this same call (#18).
     const std::vector<bool> region =
         floodRegion(composite, w, h, x, y, tolerance, selection);
 
-    rec.label = "Fill";
+    rec.label = toMask ? "Fill mask" : "Fill";
     TouchedTiles touched;
-    PixelWriter writer{*layer, rec, touched};
+    PixelWriter writer{*layer, rec, touched, toMask};
     for (std::int32_t py = 0; py < h; ++py) {
         for (std::int32_t px = 0; px < w; ++px) {
             if (!region[index(px, py)]) continue;
@@ -887,10 +923,12 @@ UndoRecord PaintBackend::floodFill(Document& doc, LayerId target, std::int32_t x
 }
 
 UndoRecord CpuBackend::fillSelection(Document& doc, LayerId target,
-                                     StraightRgba8 colour) {
+                                     StraightRgba8 colour, bool toMask) {
     UndoRecord rec;
     Layer* layer = doc.layerById(target);
-    if (layer == nullptr || layer->locked || layer->kind != LayerKind::Raster) return rec;
+    if (layer == nullptr || layer->locked) return rec;
+    if (toMask && !layer->mask.has_value()) return rec;
+    if (!toMask && layer->kind != LayerKind::Raster) return rec;
 
     // Referenced, not copied: a mask is up to a byte per canvas pixel, and
     // "fill what is selected" has no business duplicating it.
@@ -904,9 +942,9 @@ UndoRecord CpuBackend::fillSelection(Document& doc, LayerId target,
     const std::int32_t y1 = std::min(doc.height, area.y + area.h);
     if (x0 >= x1 || y0 >= y1) return rec;
 
-    rec.label = "Fill selection";
+    rec.label = toMask ? "Fill mask selection" : "Fill selection";
     TouchedTiles touched;
-    PixelWriter writer{*layer, rec, touched};
+    PixelWriter writer{*layer, rec, touched, toMask};
     const PremulRgba8 fill = colour.premultiply();
     for (std::int32_t y = y0; y < y1; ++y) {
         for (std::int32_t x = x0; x < x1; ++x) {
@@ -970,7 +1008,7 @@ constexpr std::array<std::uint8_t, 64> kBayer8{
 }  // namespace
 
 UndoRecord PaintBackend::gradientFill(Document& doc, LayerId target,
-                                      const Gradient& gradient) {
+                                      const Gradient& gradient, bool toMask) {
     // The host tiles have to be the truth before this walks them; a backend
     // holding a newer copy on a device answers here and nowhere else.
     if (const auto ready = readback(doc); !ready.has_value()) {
@@ -980,7 +1018,9 @@ UndoRecord PaintBackend::gradientFill(Document& doc, LayerId target,
 
     UndoRecord rec;
     Layer* layer = doc.layerById(target);
-    if (layer == nullptr || layer->locked || layer->kind != LayerKind::Raster) return rec;
+    if (layer == nullptr || layer->locked) return rec;
+    if (toMask && !layer->mask.has_value()) return rec;
+    if (!toMask && layer->kind != LayerKind::Raster) return rec;
 
     const double dx   = gradient.x1 - gradient.x0;
     const double dy   = gradient.y1 - gradient.y0;
@@ -1003,11 +1043,14 @@ UndoRecord PaintBackend::gradientFill(Document& doc, LayerId target,
     const PremulRgba16 from = widen(gradient.from).premultiply();
     const PremulRgba16 to   = widen(gradient.to).premultiply();
     const double radius = std::sqrt(len2);
-    const bool dither = gradient.dither && layer->depth == ColourDepth::Bits8;
+    // A mask is 8-bit however deep the layer is, so it is exactly the case the
+    // dither exists for — a long grey ramp is where banding shows worst.
+    const bool dither =
+        gradient.dither && (toMask || layer->depth == ColourDepth::Bits8);
 
-    rec.label = "Gradient";
+    rec.label = toMask ? "Gradient in mask" : "Gradient";
     TouchedTiles touched;
-    PixelWriter writer{*layer, rec, touched};
+    PixelWriter writer{*layer, rec, touched, toMask};
 
     for (std::int32_t y = y0; y < y1; ++y) {
         for (std::int32_t x = x0; x < x1; ++x) {
@@ -1027,7 +1070,11 @@ UndoRecord PaintBackend::gradientFill(Document& doc, LayerId target,
             // fades; and by the destination's alpha when the layer asks to keep
             // its own shape, which is the same rule applyDab follows.
             float strength = static_cast<float>(cov) * (1.0f / 255.0f);
-            if (layer->preserveOpacity)
+            // "Keep alpha" is about the layer's own silhouette and says nothing
+            // about a mask — the same exception `applyDab` makes, and for the
+            // same reason: a mask tile is opaque grey, so honouring it here
+            // would mean every mask gradient at full strength or none.
+            if (layer->preserveOpacity && !toMask)
                 strength *= static_cast<float>(dst.a) / 65535.0f;
 
             const auto ramp = [&](std::uint16_t a, std::uint16_t b) {
@@ -1192,18 +1239,27 @@ UndoRecord CpuBackend::transformRegion(Document& doc, LayerId target,
     return rec;
 }
 
-UndoRecord CpuBackend::clearLayer(Layer& layer) {
+UndoRecord CpuBackend::clearLayer(Layer& layer, bool toMask) {
     UndoRecord rec;
-    rec.label = "Clear";
-    rec.tiles.reserve(layer.tiles.size());
-    for (auto& [key, tile] : layer.tiles) {
+    if (layer.locked) return rec;
+    if (toMask && !layer.mask.has_value()) return rec;
+
+    // The mask's tiles or the layer's, taken the same way. Emptying a mask
+    // leaves the mask itself in place, reading as its `outside` everywhere;
+    // removing one is `removeLayerMask` and takes the pixels with it.
+    TileMap& tiles = toMask ? layer.mask->tiles : layer.tiles;
+    rec.label = toMask ? "Clear mask" : "Clear";
+    rec.tiles.reserve(tiles.size());
+    for (auto& [key, tile] : tiles) {
         TileSnapshot snap;
         snap.layer = layer.id;
         snap.key   = key;
+        snap.mask  = toMask;
         snap.before.emplace(std::move(tile));
         rec.tiles.push_back(std::move(snap));
     }
-    layer.tiles.clear();
+    tiles.clear();
+    if (rec.tiles.empty()) rec.label.clear();
     return rec;
 }
 

@@ -213,11 +213,10 @@ with this codebase instead of guessing at it.
 
 ### Good places to start
 
-Browse the [open issues](https://github.com/RizkyChandra/sable/issues). Two in
+Browse the [open issues](https://github.com/RizkyChandra/sable/issues). One in
 particular:
 
 - **[#16 — run the stylus spike](https://github.com/RizkyChandra/sable/issues/16).** If you own a graphics tablet you can close the single largest unknown in this project in an afternoon. `docs/USER-STORIES.md` US-00 spells out what to check, and the tablet test pad already displays most of it. Brush shape now follows the pen's tilt (D-032) and has been tuned against nothing but synthetic input, so this is more valuable than it was.
-- **[#58 — teach the fill tools to write a mask](https://github.com/RizkyChandra/sable/issues/58).** Bucket, fill, gradient and clear all write layer pixels, so they refuse to run while you are painting a mask rather than quietly hitting the artwork. The route through is mapped out in the issue, and the hard part is already done: all four share one `PixelWriter`, and a mask tile is an ordinary tile.
 - **A brush editor.** #47 gave the engine stamp shapes and paper grain, and the interface can still only move a strength slider. Choosing a mask, or loading one from an image, is a self-contained piece of work with a visible result.
 
 Reports are as valuable as code. If a `.psd` opens wrong or your tablet behaves

@@ -31,6 +31,7 @@ enum class Action {
     ToolTransform, ToolText, ToolLinework, ToolGradient,
     SizeDown, SizeUp, SwapColours, ResetColours,
     ToggleSymmetry, TogglePerspective,
+    GettingStarted,
     Count,
 };
 

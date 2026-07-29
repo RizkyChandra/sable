@@ -2054,6 +2054,168 @@ TEST_CASE("a locked layer refuses paint and fill") {
     CHECK(doc.active()->tiles.empty());
 }
 
+// ------------------------------------------------- the fills on a mask (#58)
+//
+// The brush has painted masks since #48. These four take the same `toMask`
+// flag, and what every case below is really asking is the same question: did
+// the paint land in the channel the artist was looking at, or in the artwork
+// underneath it where they will not find it until the mask comes off.
+
+namespace {
+
+/// A red layer with a reveal-all mask over it, which is what an artist has the
+/// moment they add one.
+Document maskedRedLayer() {
+    Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{200, 40, 40, 255}));
+    doc.active()->mask.emplace();
+    return doc;
+}
+
+/// The layer's own pixels, read with the mask switched off: a mask that hides
+/// them and a fill that destroyed them look identical through the composite,
+/// and telling those two apart is the whole point of these tests.
+[[nodiscard]] StraightRgba8 artworkAt(Document& doc, std::int32_t x, std::int32_t y) {
+    Layer* layer = doc.active();
+    layer->mask->enabled = false;
+    const StraightRgba8 seen = pickColour(doc, x, y);
+    layer->mask->enabled = true;
+    return seen;
+}
+
+}  // namespace
+
+TEST_CASE("fill selection writes the mask and leaves the artwork alone") {
+    Document doc = maskedRedLayer();
+    doc.selection = Selection{16, 16, 32, 32};
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{0, 0, 0, 255}, true));
+
+    CHECK(maskCoverage(*doc.active()->mask, 32, 32) == 0);       // hidden
+    CHECK(maskCoverage(*doc.active()->mask, 4, 4) == 255);       // outside it
+    CHECK(artworkAt(doc, 32, 32) == StraightRgba8{200, 40, 40, 255});
+    // Hidden, therefore the backdrop shows through where the mask is black.
+    CHECK(pickColour(doc, 32, 32) == StraightRgba8{255, 255, 255, 255});
+    CHECK(pickColour(doc, 4, 4)   == StraightRgba8{200, 40, 40, 255});
+}
+
+TEST_CASE("a mask fill is one undo step, and undo puts the mask back") {
+    Document doc = maskedRedLayer();
+    const std::size_t steps = doc.undo.size();
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{0, 0, 0, 255}, true));
+    REQUIRE(doc.undo.size() == steps + 1);
+    REQUIRE(maskCoverage(*doc.active()->mask, 20, 20) == 0);
+
+    doc.undo.undo(doc);
+    CHECK(maskCoverage(*doc.active()->mask, 20, 20) == 255);
+    CHECK(artworkAt(doc, 20, 20) == StraightRgba8{200, 40, 40, 255});
+    doc.undo.redo(doc);
+    CHECK(maskCoverage(*doc.active()->mask, 20, 20) == 0);
+}
+
+TEST_CASE("the bucket floods on the composite and writes the mask") {
+    Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{255, 255, 255, 255}));
+    // A red square on the layer, so the flood has a shape to find.
+    doc.selection = Selection{16, 16, 32, 32};
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{200, 40, 40, 255}));
+    doc.selection.reset();
+    doc.active()->mask.emplace();
+
+    doc.undo.push(bucketFill(doc, doc.activeLayer, 32, 32,
+                             StraightRgba8{0, 0, 0, 255}, 0, true));
+    // The region is the red square the artist clicked, and the paint went into
+    // the mask: inside is hidden, outside is untouched.
+    CHECK(maskCoverage(*doc.active()->mask, 32, 32) == 0);
+    CHECK(maskCoverage(*doc.active()->mask, 4, 4) == 255);
+    CHECK(artworkAt(doc, 32, 32) == StraightRgba8{200, 40, 40, 255});
+}
+
+TEST_CASE("a mask fill is not skipped just because the click was already that colour") {
+    // The shortcut that makes a pointless pixel fill free must not fire here:
+    // the seed comes off the composite and the paint goes somewhere else, so
+    // filling a mask black inside a black shape is a real edit.
+    Document doc = makeDocument(32, 32, StraightRgba8{255, 255, 255, 255});
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{0, 0, 0, 255}));
+    doc.active()->mask.emplace();
+    CHECK_FALSE(bucketFill(doc, doc.activeLayer, 16, 16,
+                           StraightRgba8{0, 0, 0, 255}, 0, true).empty());
+}
+
+TEST_CASE("a gradient ramps down the mask, which is what fading a layer out is") {
+    Document doc = maskedRedLayer();
+    Gradient g;
+    g.x0 = 0.0; g.y0 = 0.0; g.x1 = 64.0; g.y1 = 0.0;
+    g.from   = StraightRgba8{255, 255, 255, 255};   // reveal
+    g.to     = StraightRgba8{0, 0, 0, 255};         // hide
+    g.dither = false;                               // the exact ramp, to pin
+    doc.undo.push(gradientFill(doc, doc.activeLayer, g, true));
+
+    const int left  = maskCoverage(*doc.active()->mask, 1, 16);
+    const int mid   = maskCoverage(*doc.active()->mask, 32, 16);
+    const int right = maskCoverage(*doc.active()->mask, 62, 16);
+    CHECK(left > 240);
+    CHECK(mid > 100);
+    CHECK(mid < 155);
+    CHECK(right < 15);
+    CHECK(artworkAt(doc, 32, 16) == StraightRgba8{200, 40, 40, 255});
+}
+
+TEST_CASE("preserveOpacity does not hold a gradient out of a mask") {
+    // "Keep alpha" is about the layer's silhouette. A mask tile is opaque grey,
+    // so honouring it here would mean full strength or nothing at all.
+    Document doc = maskedRedLayer();
+    doc.active()->preserveOpacity = true;
+    Gradient g;
+    g.x0 = 0.0; g.y0 = 0.0; g.x1 = 64.0; g.y1 = 0.0;
+    g.from = StraightRgba8{0, 0, 0, 255};
+    g.to   = StraightRgba8{0, 0, 0, 255};
+    doc.undo.push(gradientFill(doc, doc.activeLayer, g, true));
+    CHECK(maskCoverage(*doc.active()->mask, 32, 16) == 0);
+}
+
+TEST_CASE("clearing the mask empties it without touching the pixels") {
+    Document doc = maskedRedLayer();
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{0, 0, 0, 255}, true));
+    REQUIRE_FALSE(doc.active()->mask->tiles.empty());
+    const std::size_t pixels = doc.active()->tiles.size();
+
+    doc.undo.push(clearLayer(*doc.active(), true));
+    CHECK(doc.active()->mask->tiles.empty());
+    CHECK(doc.active()->mask.has_value());        // emptied, not deleted
+    CHECK(doc.active()->tiles.size() == pixels);
+    CHECK(maskCoverage(*doc.active()->mask, 32, 32) == 255);   // back to `outside`
+    CHECK(artworkAt(doc, 32, 32) == StraightRgba8{200, 40, 40, 255});
+
+    doc.undo.undo(doc);
+    CHECK(maskCoverage(*doc.active()->mask, 32, 32) == 0);
+}
+
+TEST_CASE("a mask write needs a mask, and a pixel write still needs a raster layer") {
+    Document doc = makeDocument(32, 32, StraightRgba8{255, 255, 255, 255});
+    // No mask: every one of the four refuses rather than falling through to the
+    // pixels, which is the destructive answer.
+    CHECK(fillSelection(doc, doc.activeLayer, StraightRgba8{0, 0, 0, 255}, true).empty());
+    CHECK(bucketFill(doc, doc.activeLayer, 16, 16,
+                     StraightRgba8{0, 0, 0, 255}, 0, true).empty());
+    CHECK(clearLayer(*doc.active(), true).empty());
+    CHECK(doc.active()->tiles.empty());
+
+    // A mask is legal on a kind whose pixels are generated (D-031), and the
+    // pixels of that kind stay out of reach.
+    doc.active()->kind = LayerKind::Text;
+    doc.active()->mask.emplace();
+    CHECK(fillSelection(doc, doc.activeLayer, StraightRgba8{0, 0, 0, 255}).empty());
+    CHECK_FALSE(fillSelection(doc, doc.activeLayer,
+                              StraightRgba8{0, 0, 0, 255}, true).empty());
+    CHECK(maskCoverage(*doc.active()->mask, 16, 16) == 0);
+
+    // Locked means locked, on the mask as much as on the pixels.
+    doc.active()->locked = true;
+    CHECK(fillSelection(doc, doc.activeLayer, StraightRgba8{255, 255, 255, 255},
+                        true).empty());
+    CHECK(clearLayer(*doc.active(), true).empty());
+}
+
 // ------------------------------------------------------ gradient (#49)
 
 namespace {
@@ -4141,22 +4303,23 @@ public:
         cpuBackend().applyDab(t, dab);
     }
     UndoRecord bucketFill(Document& doc, LayerId target, std::int32_t x, std::int32_t y,
-                          StraightRgba8 colour, int tolerance) override {
+                          StraightRgba8 colour, int tolerance, bool toMask) override {
         ++writes;
-        return cpuBackend().bucketFill(doc, target, x, y, colour, tolerance);
+        return cpuBackend().bucketFill(doc, target, x, y, colour, tolerance, toMask);
     }
-    UndoRecord fillSelection(Document& doc, LayerId target, StraightRgba8 c) override {
+    UndoRecord fillSelection(Document& doc, LayerId target, StraightRgba8 c,
+                             bool toMask) override {
         ++writes;
-        return cpuBackend().fillSelection(doc, target, c);
+        return cpuBackend().fillSelection(doc, target, c, toMask);
     }
     UndoRecord transformRegion(Document& doc, LayerId target, const Selection& source,
                                const Transform& transform) override {
         ++writes;
         return cpuBackend().transformRegion(doc, target, source, transform);
     }
-    UndoRecord clearLayer(Layer& layer) override {
+    UndoRecord clearLayer(Layer& layer, bool toMask) override {
         ++writes;
-        return cpuBackend().clearLayer(layer);
+        return cpuBackend().clearLayer(layer, toMask);
     }
     UndoRecord mergeLayerDown(Document& doc, LayerId id) override {
         ++writes;
@@ -4887,7 +5050,7 @@ TEST_CASE("a bucket fill in GPU mode fills the region the GPU composited") {
         doc.undo.push(std::move(s.pending));
 
         UndoRecord rec = backend->bucketFill(doc, layer->id, 20, 20,
-                                             StraightRgba8{0, 200, 0, 255}, 16);
+                                             StraightRgba8{0, 200, 0, 255}, 16, false);
         doc.undo.push(std::move(rec));
         return doc;
     };
@@ -4970,7 +5133,7 @@ TEST_CASE("GPU against CPU on a large canvas with many layers"
             << clock([&] { (void)gpu->readback(doc); }) << " ms");
     MESSAGE("bucketFill: " << clock([&] {
         UndoRecord rec = gpu->bucketFill(doc, doc.layers.back().id, 5, 5,
-                                         StraightRgba8{0, 0, 0, 255}, 200);
+                                         StraightRgba8{0, 0, 0, 255}, 200, false);
         (void)rec;
     }) << " ms");
 
@@ -4980,7 +5143,7 @@ TEST_CASE("GPU against CPU on a large canvas with many layers"
     MESSAGE("bucketFill on the CPU: " << clock([&] {
         Document plain = layeredDocument(2048, 8);
         UndoRecord rec = cpuBackend().bucketFill(plain, plain.layers.back().id, 5, 5,
-                                                 StraightRgba8{0, 0, 0, 255}, 200);
+                                                 StraightRgba8{0, 0, 0, 255}, 200, false);
         (void)rec;
     }) << " ms");
 

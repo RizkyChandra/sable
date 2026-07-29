@@ -84,6 +84,9 @@ constexpr std::array<Entry, static_cast<std::size_t>(Action::Count)> kDefaults{{
     // mid-drawing often enough that a modifier would be in the way.
     {Action::ToggleSymmetry,    "Symmetry ruler",    SDLK_S, SDL_KMOD_NONE},
     {Action::TogglePerspective, "Perspective ruler", SDLK_P, SDL_KMOD_NONE},
+    // F1 rather than a letter: the walkthrough is what someone reaches for
+    // when they do not yet know the letters.
+    {Action::GettingStarted,    "Getting started",   SDLK_F1, SDL_KMOD_NONE},
 }};
 
 std::string settingKey(Action action) {

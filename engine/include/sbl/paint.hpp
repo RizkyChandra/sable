@@ -255,7 +255,9 @@ std::size_t paintSample(Stroke& s, PaintTarget& t, const InputSample& sample,
 /// Removes every tile from the layer, recording the removal as one undoable
 /// step (US-06). The background colour lives in the Document and is composited
 /// underneath, so clearing pixels is what "fill with the background" means.
-[[nodiscard]] UndoRecord clearLayer(Layer& layer);
+///
+/// `toMask` empties the layer's mask instead (#58); see `PaintBackend`.
+[[nodiscard]] UndoRecord clearLayer(Layer& layer, bool toMask = false);
 
 /// Flood-fills the region of similar colour containing (x, y).
 ///
@@ -265,9 +267,14 @@ std::size_t paintSample(Stroke& s, PaintTarget& t, const InputSample& sample,
 /// separate layer impossible, which is the single most common use of the tool.
 ///
 /// `tolerance` is 0..255 per channel. Honours the document's selection.
+///
+/// `toMask` fills the layer's mask rather than its pixels (#58). The region is
+/// still found on the composite: the artist clicked a shape they can see, and
+/// which channel the paint lands in does not change where the shape ends.
 [[nodiscard]] UndoRecord bucketFill(Document& doc, LayerId target,
                                     std::int32_t x, std::int32_t y,
-                                    StraightRgba8 colour, int tolerance);
+                                    StraightRgba8 colour, int tolerance,
+                                    bool toMask = false);
 
 /// Every pixel of the contiguous region of similar colour containing (x, y),
 /// as a width * height flag buffer over `composite` (which must be that size).
@@ -283,8 +290,9 @@ std::size_t paintSample(Stroke& s, PaintTarget& t, const InputSample& sample,
     const Selection* clip);
 
 /// Fills the selection, or the whole layer when there is none.
+/// `toMask` fills the layer's mask rather than its pixels (#58).
 [[nodiscard]] UndoRecord fillSelection(Document& doc, LayerId target,
-                                       StraightRgba8 colour);
+                                       StraightRgba8 colour, bool toMask = false);
 
 // ------------------------------------------------------------------ gradient
 
@@ -330,8 +338,13 @@ struct Gradient {
 /// A zero-length axis does nothing and costs no undo step — a click that missed
 /// is not an edit, and which end of a ramp with no length to fill would be a
 /// coin toss.
+///
+/// `toMask` ramps the layer's mask rather than its pixels (#58) — fading a
+/// layer out is a gradient in a mask and nothing else, which is most of the
+/// reason to want one.
 [[nodiscard]] UndoRecord gradientFill(Document& doc, LayerId target,
-                                      const Gradient& gradient);
+                                      const Gradient& gradient,
+                                      bool toMask = false);
 
 /// Move, scale and rotate, as one undoable action.
 struct Transform {
