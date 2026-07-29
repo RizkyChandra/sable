@@ -422,6 +422,14 @@ Two things to get right:
   twice. Find the relevant SDL hint and set it at startup — confirm the exact
   name against the version you build with, and assert in the spike (US-00) that
   a single pen stroke produces no mouse-motion events.
+- **Then hand the interface the pen yourself.** Dear ImGui's SDL3 backend has
+  no pen handling, so with those events off it only ever learns where the
+  *mouse* is — and on a backend with no global cursor to poll, which is
+  Wayland's, that is wherever the artist last left it. Pen motion feeds
+  `AddMousePosEvent` and the tip feeds `AddMouseButtonEvent`, so hovering and
+  clicking a panel work with a stylus and nothing reaches the canvas twice.
+  Fed at the interface rather than re-enabled at the source, which is the whole
+  difference: the synthetic events would reach both.
 
 ### InputSample
 

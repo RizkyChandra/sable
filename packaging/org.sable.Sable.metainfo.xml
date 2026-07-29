@@ -57,6 +57,18 @@
 
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.3.0" date="2026-07-30">
+      <description>
+        <p>
+          A stylus can now work the interface. Sable turns SDL's synthetic
+          mouse events off so that a stroke is never painted twice, which also
+          left the interface unable to see a pen at all: hovering a panel did
+          nothing and buttons needed a mouse. The pen's position and tip are
+          now handed to the interface directly, and still reach the canvas
+          only once.
+        </p>
+      </description>
+    </release>
     <release version="3.2.0" date="2026-07-30">
       <description>
         <p>

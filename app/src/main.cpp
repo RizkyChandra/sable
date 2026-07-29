@@ -1968,6 +1968,13 @@ void handleEvent(App& app, const SDL_Event& e) {
         case SDL_EVENT_PEN_DOWN:
             app.penSeen = true;
             app.activePen = e.ptouch.which;
+            // Before the guard below, which is what this makes truthful: the
+            // tip IS ImGui's left button, or a menu can only be opened with a
+            // mouse. Fed rather than left to SDL's synthetic mouse events,
+            // which stay off — those would also reach the canvas, and every
+            // stroke would be painted twice.
+            ImGui::GetIO().AddMousePosEvent(e.ptouch.x, e.ptouch.y);
+            ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, true);
             if (io.WantCaptureMouse || !overCanvas(app, e.ptouch.x, e.ptouch.y)) break;
             // The eraser end is a different tool, not a modifier (US-08.6).
             if (e.ptouch.eraser) app.tool = Tool::Eraser;
@@ -2027,6 +2034,10 @@ void handleEvent(App& app, const SDL_Event& e) {
             break;
 
         case SDL_EVENT_PEN_UP:
+            // Released whatever it landed on, always: a button whose press
+            // ImGui saw and whose release it did not stays held for the rest
+            // of the session.
+            ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, false);
             app.draggingGuide = kNoGuide;
             endSelectDrag(app, e.ptouch.x, e.ptouch.y);
             lineworkRelease(app);
@@ -5246,6 +5257,67 @@ int main(int argc, char** argv) {
             }
             SDL_Log("selftest: a pen frame paints at its own pressure, not the "
                     "one before it");
+        }
+
+        // The pen reaches the interface, and only the interface. Without this
+        // the stylus can draw but cannot press a single button — the synthetic
+        // mouse events that would have carried it are off, and ImGui's SDL3
+        // backend has no pen handling of its own.
+        if (app.viewport.x > 8.0f) {
+            const SDL_PenID pen = 2;
+            // Left of the canvas is the docked Tools panel, whatever the
+            // layout did with the rest.
+            const float px = app.viewport.x * 0.5f;
+            const float py = app.viewport.y + app.viewport.h * 0.5f;
+
+            SDL_Event motion{};
+            motion.type = SDL_EVENT_PEN_MOTION;
+            motion.pmotion.which = pen;
+            motion.pmotion.x = px;
+            motion.pmotion.y = py;
+            handleEvent(app, motion);
+            renderFrame(app, false);        // ImGui reads its queue at NewFrame
+
+            const std::size_t before = app.cur().doc.undo.size();
+            SDL_Event down{};
+            down.type = SDL_EVENT_PEN_DOWN;
+            down.ptouch.which = pen;
+            down.ptouch.x = px;
+            down.ptouch.y = py;
+            handleEvent(app, down);
+            if (app.painting || app.cur().doc.undo.size() != before) {
+                SDL_Log("selftest FAILED: a pen tap on a panel painted the canvas "
+                        "underneath it");
+                return 1;
+            }
+            // ImGui trickles its input queue: a position and a button change
+            // arriving together are handed to two consecutive frames, so that
+            // "moved, then clicked" cannot read as "clicked where it used to
+            // be". The tip lands within a frame or two of that, and an artist
+            // holding a pen down covers dozens.
+            for (int frame = 0; frame < 4 &&
+                                !ImGui::GetIO().MouseDown[ImGuiMouseButton_Left]; ++frame)
+                renderFrame(app, false);
+            if (!ImGui::GetIO().MouseDown[ImGuiMouseButton_Left]) {
+                SDL_Log("selftest FAILED: the pen tip did not reach the interface, "
+                        "so a stylus cannot press a button");
+                return 1;
+            }
+
+            SDL_Event up{};
+            up.type = SDL_EVENT_PEN_UP;
+            up.ptouch.which = pen;
+            up.ptouch.x = px;
+            up.ptouch.y = py;
+            handleEvent(app, up);
+            renderFrame(app, false);
+            if (ImGui::GetIO().MouseDown[ImGuiMouseButton_Left]) {
+                SDL_Log("selftest FAILED: lifting the pen left the interface's "
+                        "button held down");
+                return 1;
+            }
+            SDL_Log("selftest: the pen presses the interface and paints nothing "
+                    "through it");
         }
 
         SDL_Log("selftest OK");
