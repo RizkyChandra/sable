@@ -59,7 +59,8 @@ constexpr float kDegToRad      = 3.14159265358979323846f / 180.0f;
 /// What to do once the artist answers the "discard unsaved work?" prompt.
 enum class Pending { None, NewCanvas, Quit, Open, Import };
 
-enum class Tool { Brush, Eraser, Fill, Select, Lasso, Wand, Transform, Text, Linework };
+enum class Tool { Brush, Eraser, Fill, Select, Lasso, Wand, Transform, Text, Linework,
+                  Gradient };
 
 /// True for the three tools that build a selection, which share the modifier
 /// keys, the mode setting, and the rule that a click with no drag deselects.
@@ -149,6 +150,18 @@ struct App {
     sbl::Stroke           stroke;
     std::vector<sbl::Dab> scratch;
     bool painting = false;
+
+    // --- gradient (#49). The drag anchor is in canvas coordinates, so the
+    // preview follows the art rather than the screen when the view is rotated
+    // or zoomed mid-drag.
+    sbl::GradientShape gradientShape = sbl::GradientShape::Linear;
+    bool   gradientToTransparent = false;
+    bool   gradientDither = true;
+    bool   gradientDragging = false;
+    /// Whether the record on top of the undo stack is this drag's preview, and
+    /// therefore ours to take back off before drawing the next one.
+    bool   gradientPreviewed = false;
+    double gradientAnchorX = 0.0, gradientAnchorY = 0.0;
 
     TextTool text;
     LineworkTool linework;
@@ -279,6 +292,7 @@ struct App {
         case Tool::Transform: return "transform";
         case Tool::Text:   return "text";
         case Tool::Linework: return "linework";
+        case Tool::Gradient: return "gradient";
     }
     return "brush";
 }
@@ -834,6 +848,66 @@ void doFill(App& app, double sx, double sy) {
     app.doc.dirty = true;
 }
 
+void beginGradient(App& app, double sx, double sy) {
+    app.gradientDragging  = true;
+    app.gradientPreviewed = false;
+    app.gradientAnchorX   = toCanvasX(app.view, sx, sy);
+    app.gradientAnchorY   = toCanvasY(app.view, sx, sy);
+}
+
+/// Draws the gradient the drag currently describes, replacing the one the
+/// previous motion event drew.
+///
+/// The preview goes THROUGH the undo stack rather than beside it: taking the
+/// last preview back restores exactly the pixels the next one has to be
+/// computed from, and pushing clears the redo entry that just made. So what the
+/// artist is looking at is always a real, finished edit — there is nothing to
+/// commit on release, and nothing to lose if the app dies mid-drag. The
+/// alternative, a second copy of the layer held beside the document, is a
+/// second thing that has to be kept in step with undo, autosave and the
+/// texture cache.
+///
+/// ponytail: every motion event re-draws the whole selection and re-uploads
+/// every tile it touched. A 1024 x 1024 canvas is a millisecond or two, which
+/// is what the self-test drives; if a very large canvas ever drags heavily,
+/// throttle this to one preview per frame before reaching for anything cleverer.
+void previewGradient(App& app, double sx, double sy) {
+    if (!app.gradientDragging) return;
+    if (app.gradientPreviewed) {
+        syncTextures(app, app.doc.undo.undo(app.doc));
+        app.gradientPreviewed = false;
+    }
+
+    sbl::Gradient g;
+    g.shape  = app.gradientShape;
+    g.x0     = app.gradientAnchorX;
+    g.y0     = app.gradientAnchorY;
+    g.x1     = toCanvasX(app.view, sx, sy);
+    g.y1     = toCanvasY(app.view, sx, sy);
+    g.from   = app.foreground;
+    g.to     = app.gradientToTransparent
+                   ? sbl::StraightRgba8{0, 0, 0, 0} : app.background;
+    g.dither = app.gradientDither;
+
+    sbl::UndoRecord rec = sbl::gradientFill(app.doc, app.doc.activeLayer, g);
+    if (rec.empty()) return;                  // a drag too short to have an axis
+
+    for (const auto& snap : rec.tiles) app.canvas->markDirty(snap.key);
+    app.doc.undo.push(std::move(rec));
+    app.gradientPreviewed = true;
+    app.doc.dirty = true;
+
+    if (const auto failed = sbl::paintBackend().takeError(); failed.has_value())
+        showError(app, *failed);
+}
+
+void endGradient(App& app, double sx, double sy) {
+    if (!app.gradientDragging) return;
+    previewGradient(app, sx, sy);
+    app.gradientDragging  = false;
+    app.gradientPreviewed = false;
+}
+
 /// Shift adds, Alt subtracts, both intersect — the modifiers every other
 /// painting application uses, over whatever the panel is set to. Read once, at
 /// pen-down, so a drag means one thing from start to finish.
@@ -1306,6 +1380,10 @@ void handleKey(App& app, const SDL_KeyboardEvent& key) {
             app.text.finish(app.window, app.doc);
             app.tool = Tool::Linework;
             break;
+        case Action::ToolGradient:
+            app.text.finish(app.window, app.doc);
+            app.tool = Tool::Gradient;
+            break;
 
         case Action::SizeDown: stepSizePreset(app, -1); break;
         case Action::SizeUp:   stepSizePreset(app, +1); break;
@@ -1430,6 +1508,10 @@ void handleEvent(App& app, const SDL_Event& e) {
                 wandAt(app, e.ptouch.x, e.ptouch.y);
                 break;
             }
+            if (app.tool == Tool::Gradient) {
+                beginGradient(app, e.ptouch.x, e.ptouch.y);
+                break;
+            }
             if (selectsRegion(app.tool)) {
                 beginSelectDrag(app, e.ptouch.x, e.ptouch.y);
                 break;
@@ -1451,6 +1533,8 @@ void handleEvent(App& app, const SDL_Event& e) {
                 lineworkDrag(app, e.pmotion.x, e.pmotion.y,
                              penSample(app, e.pmotion.which,
                                        e.pmotion.x, e.pmotion.y).pressure);
+            else if (app.gradientDragging)
+                previewGradient(app, e.pmotion.x, e.pmotion.y);
             else if (app.painting)
                 paintWith(app, penSample(app, e.pmotion.which, e.pmotion.x, e.pmotion.y));
             break;
@@ -1459,6 +1543,7 @@ void handleEvent(App& app, const SDL_Event& e) {
             app.draggingGuide = kNoGuide;
             endSelectDrag(app, e.ptouch.x, e.ptouch.y);
             lineworkRelease(app);
+            endGradient(app, e.ptouch.x, e.ptouch.y);
             endPaint(app);
             break;
 
@@ -1494,6 +1579,8 @@ void handleEvent(App& app, const SDL_Event& e) {
                     lineworkPress(app, e.button.x, e.button.y, 1.0f);
                 } else if (app.tool == Tool::Wand) {
                     wandAt(app, e.button.x, e.button.y);
+                } else if (app.tool == Tool::Gradient) {
+                    beginGradient(app, e.button.x, e.button.y);
                 } else if (selectsRegion(app.tool)) {
                     beginSelectDrag(app, e.button.x, e.button.y);
                 } else {
@@ -1516,6 +1603,8 @@ void handleEvent(App& app, const SDL_Event& e) {
                 dragSelection(app, e.motion.x, e.motion.y);
             } else if (app.linework.busy()) {
                 lineworkDrag(app, e.motion.x, e.motion.y, 1.0f);
+            } else if (app.gradientDragging) {
+                previewGradient(app, e.motion.x, e.motion.y);
             } else if (app.painting) {
                 paintWith(app, mouseSample(app, e.motion.x, e.motion.y));
             }
@@ -1529,6 +1618,7 @@ void handleEvent(App& app, const SDL_Event& e) {
                 app.draggingGuide = kNoGuide;
                 endSelectDrag(app, e.button.x, e.button.y);
                 lineworkRelease(app);
+                endGradient(app, e.button.x, e.button.y);
                 endPaint(app);
             }
             break;
@@ -1701,6 +1791,7 @@ void drawToolPanel(App& app) {
         toolRow(Icon::Brush,     "Brush",     Tool::Brush,     Action::ToolBrush);
         toolRow(Icon::Eraser,    "Eraser",    Tool::Eraser,    Action::ToolEraser);
         toolRow(Icon::Fill,      "Fill",      Tool::Fill,      Action::ToolFill);
+        toolRow(Icon::Gradient,  "Gradient",  Tool::Gradient,  Action::ToolGradient);
         toolRow(Icon::Select,    "Select",    Tool::Select,    Action::ToolSelect);
         toolRow(Icon::Lasso,     "Lasso",     Tool::Lasso,     Action::ToolLasso);
         toolRow(Icon::Wand,      "Magic wand", Tool::Wand,     Action::ToolWand);
@@ -1760,6 +1851,23 @@ void drawToolPanel(App& app) {
         if (app.tool == Tool::Fill) {
             ImGui::SetNextItemWidth(-1.0f);
             ImGui::SliderInt("##tol", &app.fillTolerance, 0, 128, "tolerance %d");
+        }
+        if (app.tool == Tool::Gradient) {
+            if (ImGui::RadioButton("Linear", app.gradientShape == sbl::GradientShape::Linear))
+                app.gradientShape = sbl::GradientShape::Linear;
+            if (ImGui::RadioButton("Radial", app.gradientShape == sbl::GradientShape::Radial))
+                app.gradientShape = sbl::GradientShape::Radial;
+            ImGui::Checkbox("To transparent", &app.gradientToTransparent);
+            if (app.doc.depth == sbl::ColourDepth::Bits8) {
+                ImGui::Checkbox("Dither", &app.gradientDither);
+                ImGui::TextDisabled("breaks up 8-bit banding");
+            } else {
+                // Said rather than hidden: the checkbox vanishing without a
+                // word reads as a missing feature, not as one that has nothing
+                // left to do.
+                ImGui::TextDisabled("16-bit: no dither needed");
+            }
+            ImGui::TextDisabled("drag to set the axis");
         }
         if (selectsRegion(app.tool)) {
             if (app.tool == Tool::Wand) {
@@ -3591,6 +3699,64 @@ int main(int argc, char** argv) {
             SDL_Log("selftest: a whole linework stroke selects, moves and undoes");
         }
 
+        // --- gradient (#49). The engine's ramp has its own tests; what is only
+        // testable here is the drag: several previews must collapse into ONE
+        // undo step, and the last one must be the one left on the canvas.
+        {
+            sbl::Layer& onto = app.doc.addLayer("gradient");
+            app.doc.activeLayer = onto.id;
+            // The lasso check above left a selection, and clipping to it is the
+            // engine's job and already tested there. This is about the drag.
+            app.doc.selection.reset();
+            app.tool = Tool::Gradient;
+            app.gradientShape = sbl::GradientShape::Linear;
+            app.gradientToTransparent = false;
+            app.foreground = sbl::StraightRgba8{0, 0, 0, 255};
+            app.background = sbl::StraightRgba8{255, 255, 255, 255};
+
+            const std::size_t undoBefore = app.doc.undo.size();
+            const auto screen = [&](double cx, double cy) {
+                return std::pair{toScreenX(app.view, cx, cy), toScreenY(app.view, cx, cy)};
+            };
+            const auto [ax, ay] = screen(0.0, 0.0);
+            beginGradient(app, ax, ay);
+            // Three previews, the last of which is the drag the artist meant.
+            for (const double end : {200.0, 600.0, 1000.0}) {
+                const auto [ex, ey] = screen(end, 0.0);
+                previewGradient(app, ex, ey);
+            }
+            const auto [fx, fy] = screen(1000.0, 0.0);
+            endGradient(app, fx, fy);
+
+            const auto redAt = [&](std::int32_t x, std::int32_t y) {
+                const sbl::TileKey key{sbl::tileIndex(x), sbl::tileIndex(y)};
+                const sbl::Tile* tile = onto.find(key);
+                if (tile == nullptr) return -1;
+                return static_cast<int>(sbl::narrowChannel(
+                    tile->pixel(x - key.first * sbl::TILE_SIZE,
+                                y - key.second * sbl::TILE_SIZE).r));
+            };
+            if (app.doc.undo.size() != undoBefore + 1) {
+                SDL_Log("selftest FAILED: a gradient drag left %zu undo steps",
+                        app.doc.undo.size() - undoBefore);
+                return 1;
+            }
+            // Halfway along the LAST axis, not the first: a preview that was
+            // not taken back would have left the 200 px ramp under this one.
+            const int half = redAt(500, 20);
+            if (half < 100 || half > 155) {
+                SDL_Log("selftest FAILED: gradient midpoint reads %d, not mid-ramp", half);
+                return 1;
+            }
+            doUndo(app);
+            if (redAt(500, 20) != -1) {
+                SDL_Log("selftest FAILED: undoing the gradient left pixels behind");
+                return 1;
+            }
+            doRedo(app);
+            SDL_Log("selftest: a gradient drag is one undo step (midpoint %d)", half);
+        }
+
         // Drive one background recovery to completion. This is the only path
         // that hands document data to another thread, so it is the only thing
         // ThreadSanitizer has to look at — and it is worth nothing to CI unless
@@ -3627,8 +3793,10 @@ int main(int argc, char** argv) {
         // one text step, on a machine that has a font to draw them with.
         // Plus the linework layer and its three steps — the layer, the stroke,
         // and the re-shape — which need no font and so are not conditional.
-        const std::size_t expectedUndo   = (textTested ? 6u : 4u) + 3u;
-        const std::size_t expectedLayers = (textTested ? 3u : 2u) + 1u;
+        // Plus the gradient's layer and its ONE step: three previews and a
+        // release, and the whole drag is a single entry (D-030).
+        const std::size_t expectedUndo   = (textTested ? 6u : 4u) + 3u + 1u;
+        const std::size_t expectedLayers = (textTested ? 3u : 2u) + 1u + 1u;
         if (!result.has_value() || app.doc.undo.size() != expectedUndo ||
             app.doc.layers.size() != expectedLayers ||
             app.doc.active()->tiles.empty()) {

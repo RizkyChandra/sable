@@ -1174,6 +1174,75 @@ machinery is built around a pixel selection and reusing it is its own change.
 There is no marquee for selecting several strokes at once; Shift-click adds one
 at a time. And nothing auto-closes a curve whose ends meet: closing is an
 explicit toggle on a selected stroke.
+---
+
+## D-030 — Gradients: premultiplied interpolation, ordered dither at 8 bits, preview through the undo stack
+
+**Status:** Decided
+**Affects:** `sbl::Gradient` and `gradientFill` in `engine/include/sbl/paint.hpp`,
+`engine/src/paint.cpp`, the gradient tool in `app/src/main.cpp` (#49)
+
+**Interpolated PREMULTIPLIED, and this is the whole feature.** The two ends are
+widened, premultiplied once, and every pixel between them is a lerp of those
+premultiplied values. Straight alpha is the version that looks right until
+somebody drags a foreground-to-transparent gradient: the far end is transparent
+*black*, so a straight-alpha ramp pulls the colour channels toward zero
+alongside the alpha and the whole fade comes out with a grey haze down it.
+D-004 keeps the two spaces apart as types, and `transformRegion` already made
+this same argument for bilinear sampling. Two tests hold it — one on a
+transparent document checking the colour stays the foreground's exactly, one
+over white checking the red channel never dips.
+
+**Composited `over`, not written through.** A gradient fades into the art
+beneath it rather than punching a hole through it, which is what makes
+foreground-to-transparent the useful half of the feature and not just a slow
+eraser. Filling the layer instead would make the faded end erase.
+
+**Dithered on 8-bit documents, not on 16-bit ones.** A ramp across a wide canvas
+has far more pixels than it has levels: 256 levels over 2000 px is a visible
+band every eight pixels, and the artist's next move is to blur it. An 8 x 8
+ordered (Bayer) matrix, amplitude under half of one 8-bit step, breaks the band
+edges into a texture that disappears at any zoom an artist works at.
+
+- *Under half a step* is the correctness condition, and the reason it is safe to
+  apply to every pixel including the flat ends: a value already exactly
+  representable at 8 bits rounds back to itself from every cell of the matrix.
+  A dither that reached a whole step would speckle solid colour, which is noise
+  added where there was no banding to remove. Tested both ways.
+- *One offset for all four channels*, never four independent ones: nudging a
+  colour channel up while its alpha goes down produces a premultiplied value
+  with colour outside its own alpha, which is not a colour.
+- *Ordered rather than error diffusion.* Diffusion makes each pixel depend on
+  the one before it — serial, and impossible to compute for one tile without its
+  neighbours, which is exactly what a GPU implementation of this would need.
+- *16-bit does not get it* by default: 65536 levels over the same span is under
+  a level of error per pixel, and the artist who paid double the memory for
+  smooth ramps should not have noise added to them.
+- The artist can turn it off. Tests pin the exact ramp with it off.
+
+**A non-pure `PaintBackend::gradientFill`.** Every other writer on that
+interface is pure virtual; this one has a body — `readback`, then the host
+implementation. That body is what `GpuBackend` writes by hand for `fillSelection`
+and `transformRegion` anyway, so making it pure would buy one more copy of a
+delegation in three files (the GPU backend and two test fakes) and nothing else.
+A GPU override stays a pure optimisation, and forgetting to write one is a slow
+gradient rather than a missing tool.
+
+**The live preview goes through the undo stack, not beside it.** Each motion
+event takes the previous preview back off the stack — which restores exactly the
+pixels the next one must be computed from — and pushes the new one, which clears
+the redo entry the undo just made. The drag therefore ends with the finished
+gradient already on the stack as one step, and there is nothing to commit on
+release. **Alternative rejected:** a copy of the layer held beside the document
+for the duration of the drag. That is a second copy of the pixels that has to be
+kept in step with undo, with autosave and with the texture cache, and it is
+wrong in a way that survives a crash — the stack version is a real finished edit
+at every instant.
+
+**Not done, and deliberately:** angle/reflected/diamond shapes, multi-stop
+ramps, and an editable gradient that can be re-dragged after the fact. A
+gradient here is pixels once it lands, the same bargain every fill in Sable
+makes. The issue asked for what covers the overwhelming majority of use.
 
 ---
 
