@@ -200,6 +200,12 @@ Rect boundsOf(const Layer& layer, std::int32_t canvasW, std::int32_t canvasH) {
 
 /// The layer's pixels over `r` as straight-alpha RGBA8, which is what a PNG
 /// holds and what every other application expects (D-004).
+///
+/// A layer mask is MULTIPLIED INTO the alpha here (#48), because OpenRaster has
+/// no mask element to write one into — its layer is a PNG and nothing else. So
+/// the choice is between an .ora that looks like the painting and an .ora that
+/// shows what the artist masked away, and D-027 already answered that one: the
+/// drawing is what matters, and the `.sable` file keeps the editable mask.
 std::vector<unsigned char> encodeRegion(const Layer& layer, Rect r) {
     std::vector<unsigned char> straight(
         static_cast<std::size_t>(r.w) * static_cast<std::size_t>(r.h) * 4, 0);
@@ -226,6 +232,13 @@ std::vector<unsigned char> encodeRegion(const Layer& layer, Rect r) {
                 straight[at + 1] = c.g;
                 straight[at + 2] = c.b;
                 straight[at + 3] = c.a;
+                // Straight alpha, so the colour channels stay as they are and
+                // only the coverage moves — the same multiply the compositor
+                // does, at the one boundary that cannot carry the mask itself.
+                if (layer.mask.has_value() && layer.mask->enabled)
+                    straight[at + 3] = static_cast<unsigned char>(
+                        (static_cast<unsigned>(c.a) * maskCoverage(*layer.mask, x, y) +
+                         127u) / 255u);
             }
         }
     }

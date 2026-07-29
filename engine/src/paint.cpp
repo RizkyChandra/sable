@@ -1,6 +1,7 @@
 #include "sbl/paint.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <utility>
@@ -37,7 +38,7 @@ constexpr float lerpf(float a, float b, float t) noexcept { return a + (b - a) *
 /// doubles to measure it with, so nearly every partially covered pixel came
 /// out a fraction apart and whichever ones landed near a rounding boundary
 /// tipped. D-025 accepted that as one fringe pixel per stroke; a textured dab
-/// (D-029) multiplies coverage by a mask and so has far more values sitting
+/// (D-032) multiplies coverage by a mask and so has far more values sitting
 /// near a boundary, which turned it into a whole edge of them. Nothing is lost
 /// by measuring in float: the result is quantised to eight bits either way.
 [[nodiscard]] float coverage(float d, float radius, float hardness) noexcept {
@@ -487,7 +488,16 @@ void appendSample(Stroke& s, const InputSample& sample, std::vector<Dab>& out) {
 // --------------------------------------------------------------- dab -> tiles
 
 void CpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
-    if (t.layer.locked || t.layer.kind != LayerKind::Raster) return;
+    // A mask is not generated from words or curves, so painting one is allowed
+    // on the layer kinds whose pixels are protected (#48). `locked` still
+    // means locked: it is the artist saying "leave this layer alone".
+    const bool toMask = t.toMask;
+    if (t.layer.locked) return;
+    // Asked for the mask and the layer has none: paint NOTHING. Falling through
+    // to the pixels would put a stroke somewhere the artist was not looking,
+    // which is the one outcome here they cannot see coming.
+    if (toMask && !t.layer.mask.has_value()) return;
+    if (!toMask && t.layer.kind != LayerKind::Raster) return;
     if (dab.colour.a == 0 || dab.radius <= 0.0f) return;
 
     const double r = dab.radius;
@@ -516,17 +526,21 @@ void CpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
 
             // D-006: copy on FIRST touch only. Later dabs on this tile within
             // the same stroke cost nothing.
-            Tile* tile = t.layer.find(key);
+            Tile* tile = toMask ? t.layer.mask->find(key) : t.layer.find(key);
             if (t.touched.insert(key).second) {
                 TileSnapshot snap;
                 snap.layer = t.layer.id;
                 snap.key   = key;
+                snap.mask  = toMask;
                 if (tile != nullptr) snap.before.emplace(tile->clone());
                 t.undo.tiles.push_back(std::move(snap));
             }
             if (tile == nullptr) {
-                if (dab.erase) continue;          // nothing to erase from an empty tile
-                tile = &t.layer.tileFor(key);
+                // An absent MASK tile is not empty: it reads as the mask's
+                // `outside`, so an eraser has something to take away and the
+                // tile has to be allocated for it to land in.
+                if (dab.erase && !toMask) continue;
+                tile = toMask ? &t.layer.mask->tileFor(key) : &t.layer.tileFor(key);
             }
 
             const std::int32_t ox = tx * TILE_SIZE;
@@ -541,6 +555,11 @@ void CpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
             // they are the two blocks below. D-023 asks for the second
             // implementation written out rather than a template over the
             // channel type, and this is as much of it as actually differs.
+            // "Keep alpha" is about the layer's own silhouette and says nothing
+            // about a mask. Left on, it would refuse to paint back into a part
+            // of the mask the artist had erased — which is the one thing an
+            // eraser on a mask is for.
+            const bool preserve = t.layer.preserveOpacity && !toMask;
             const bool wide = tile->depth() == ColourDepth::Bits16;
             PremulRgba8*  px8  = wide ? nullptr : tile->pixels8();
             PremulRgba16* px16 = wide ? tile->pixels16() : nullptr;
@@ -581,7 +600,7 @@ void CpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
 
                     if (wide) {
                         PremulRgba16& dst = px16[rowAt + static_cast<std::size_t>(x - ox)];
-                        if (t.layer.preserveOpacity)
+                        if (preserve)
                             cov *= static_cast<float>(dst.a) / 65535.0f;
 
                         if (dab.erase) {
@@ -599,7 +618,7 @@ void CpuBackend::applyDab(PaintTarget& t, const Dab& dab) {
                     }
 
                     PremulRgba8& dst = px8[rowAt + static_cast<std::size_t>(x - ox)];
-                    if (t.layer.preserveOpacity)
+                    if (preserve)
                         cov *= static_cast<float>(dst.a) / 255.0f;
 
                     if (dab.erase) {
@@ -895,6 +914,140 @@ UndoRecord CpuBackend::fillSelection(Document& doc, LayerId target,
             if (cov != 0) writer.blendIn(x, y, fill, cov);
         }
     }
+    if (rec.tiles.empty()) rec.label.clear();
+    return rec;
+}
+
+namespace {
+
+/// The 8 x 8 ordered dither threshold matrix, as 0..63 (D-030).
+///
+/// Ordered rather than error diffusion: a diffusion pass makes each pixel
+/// depend on the one before it, which is both serial and impossible to compute
+/// for one tile without its neighbours — and a gradient is exactly the
+/// operation a GPU backend will later want to run per pixel with no history.
+constexpr std::array<std::uint8_t, 64> kBayer8{
+     0, 32,  8, 40,  2, 34, 10, 42,
+    48, 16, 56, 24, 50, 18, 58, 26,
+    12, 44,  4, 36, 14, 46,  6, 38,
+    60, 28, 52, 20, 62, 30, 54, 22,
+     3, 35, 11, 43,  1, 33,  9, 41,
+    51, 19, 59, 27, 49, 17, 57, 25,
+    15, 47,  7, 39, 13, 45,  5, 37,
+    63, 31, 55, 23, 61, 29, 53, 21,
+};
+
+/// Nudges a value by UNDER HALF an 8-bit step, so that the rounding the store
+/// is about to do lands on different neighbours in neighbouring pixels.
+///
+/// Under half a step is the whole of the correctness argument: a value already
+/// exactly representable at 8 bits then rounds back to itself from every cell
+/// of the matrix, so the flat ends of a ramp — and every solid colour a
+/// gradient is laid over — stay flat. Widen the amplitude and the dither starts
+/// speckling pixels that had no banding to break up, which is noise, not
+/// smoothing. The threshold is cell-centred so the noise is zero-mean and the
+/// ramp does not slide half a level along its whole length.
+///
+/// One offset for all four channels, not four independent ones: nudging a
+/// colour channel up while its alpha goes down produces a premultiplied value
+/// with colour outside its own alpha, which is not a colour at all.
+[[nodiscard]] PremulRgba16 ditherTo8(PremulRgba16 c, std::int32_t x,
+                                     std::int32_t y) noexcept {
+    // & 7 rather than % 8: tile coordinates can be negative once the canvas can
+    // grow leftward, and % would answer with a negative index.
+    const std::size_t cell = static_cast<std::size_t>(y & 7) * 8 +
+                             static_cast<std::size_t>(x & 7);
+    // 257 is one 8-bit level at 16-bit scale, exactly (widenChannel's factor).
+    const float offset =
+        ((static_cast<float>(kBayer8[cell]) + 0.5f) / 64.0f - 0.5f) * 257.0f;
+    const auto nudge = [offset](std::uint16_t v) {
+        return static_cast<std::uint16_t>(std::clamp<long>(
+            std::lround(static_cast<float>(v) + offset), 0L, 65535L));
+    };
+    return PremulRgba16{nudge(c.r), nudge(c.g), nudge(c.b), nudge(c.a)};
+}
+
+}  // namespace
+
+UndoRecord PaintBackend::gradientFill(Document& doc, LayerId target,
+                                      const Gradient& gradient) {
+    // The host tiles have to be the truth before this walks them; a backend
+    // holding a newer copy on a device answers here and nowhere else.
+    if (const auto ready = readback(doc); !ready.has_value()) {
+        recordFailure(ready.error());
+        return {};
+    }
+
+    UndoRecord rec;
+    Layer* layer = doc.layerById(target);
+    if (layer == nullptr || layer->locked || layer->kind != LayerKind::Raster) return rec;
+
+    const double dx   = gradient.x1 - gradient.x0;
+    const double dy   = gradient.y1 - gradient.y0;
+    const double len2 = dx * dx + dy * dy;
+    if (len2 <= 0.0) return rec;                  // a click, not a drag
+
+    // Referenced, not copied, for the reason fillSelection gives.
+    const Selection whole{0, 0, doc.width, doc.height};
+    const Selection& area = doc.selection.has_value() && !doc.selection->empty()
+                                ? *doc.selection : whole;
+    const std::int32_t x0 = std::max(0, area.x);
+    const std::int32_t y0 = std::max(0, area.y);
+    const std::int32_t x1 = std::min(doc.width,  area.x + area.w);
+    const std::int32_t y1 = std::min(doc.height, area.y + area.h);
+    if (x0 >= x1 || y0 >= y1) return rec;
+
+    // Premultiplied ends, and the interpolation below is premultiplied with
+    // them. See the header for the haze this is avoiding. Widened first, so a
+    // 16-bit document gets the whole ramp rather than 256 steps of it.
+    const PremulRgba16 from = widen(gradient.from).premultiply();
+    const PremulRgba16 to   = widen(gradient.to).premultiply();
+    const double radius = std::sqrt(len2);
+    const bool dither = gradient.dither && layer->depth == ColourDepth::Bits8;
+
+    rec.label = "Gradient";
+    TouchedTiles touched;
+    PixelWriter writer{*layer, rec, touched};
+
+    for (std::int32_t y = y0; y < y1; ++y) {
+        for (std::int32_t x = x0; x < x1; ++x) {
+            const std::uint8_t cov = area.coverage(x, y);
+            if (cov == 0) continue;
+
+            // Pixel centres, like every other sampler in the engine.
+            const double px = static_cast<double>(x) + 0.5 - gradient.x0;
+            const double py = static_cast<double>(y) + 0.5 - gradient.y0;
+            const double along = gradient.shape == GradientShape::Radial
+                                     ? std::sqrt(px * px + py * py) / radius
+                                     : (px * dx + py * dy) / len2;
+            const auto t = static_cast<float>(std::clamp(along, 0.0, 1.0));
+
+            const PremulRgba16 dst = writer.get(x, y);
+            // Scaled by the selection rather than gated on it, so a lasso edge
+            // fades; and by the destination's alpha when the layer asks to keep
+            // its own shape, which is the same rule applyDab follows.
+            float strength = static_cast<float>(cov) * (1.0f / 255.0f);
+            if (layer->preserveOpacity)
+                strength *= static_cast<float>(dst.a) / 65535.0f;
+
+            const auto ramp = [&](std::uint16_t a, std::uint16_t b) {
+                return static_cast<std::uint16_t>(std::clamp<long>(
+                    std::lround(lerpf(static_cast<float>(a), static_cast<float>(b), t) *
+                                strength),
+                    0L, 65535L));
+            };
+            const PremulRgba16 src{ramp(from.r, to.r), ramp(from.g, to.g),
+                                   ramp(from.b, to.b), ramp(from.a, to.a)};
+            // `over` leaves the destination alone here, so skipping keeps the
+            // faded-out end of a gradient from allocating a tile per empty
+            // region only to write back what was already in it.
+            if (src == PremulRgba16{}) continue;
+
+            const PremulRgba16 out = over(src, dst);
+            writer.set(x, y, dither ? ditherTo8(out, x, y) : out);
+        }
+    }
+
     if (rec.tiles.empty()) rec.label.clear();
     return rec;
 }

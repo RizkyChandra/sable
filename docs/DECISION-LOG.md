@@ -1026,7 +1026,8 @@ transform mode of their own.
 
 ## D-027 — PSD layer masks are multiplied into the pixels on import
 
-**Status:** Decided
+**Status:** **Superseded by D-031** — `Layer` grows a mask, which is the
+alternative this entry rejected and named; the import no longer bakes
 **Affects:** `engine/src/psd.cpp`, `tests/data/make_psd_fixtures.py`, #35
 
 A PSD layer mask is read and multiplied into the layer's alpha as the pixels are
@@ -1124,7 +1125,231 @@ the format version is the hook — the same one this used.
 
 ---
 
-## D-029 — Brush shape and texture are masks: one registry, two sampling spaces
+## D-029 — Linework editing: one selection model, one transform, one flag
+
+**Status:** Decided
+**Affects:** `engine/include/sbl/linework.hpp`, `engine/src/linework.cpp`,
+`app/src/linework_tool.cpp`, `LineStroke`, #51
+
+D-028 stands unchanged; this is what was built on top of it, and the four
+choices it needed.
+
+**The stabiliser sits in the same place it does for paint.** `Stabilizer` is a
+pure sample-to-sample function, so a freehand curve runs its samples through one
+before deciding where to put a control point — the same class, the same 0..3
+levels, the same `finish()` at pen-up so the line ends where the pen lifted. A
+level of its own rather than the brush's: a line wants more smoothing than a
+sketch, and one shared number would have the artist resetting it on every
+switch.
+
+**`appendFreehand` is in the engine, not the tool.** Smoothing and point spacing
+only mean anything together — the stabiliser removes the wobble and the spacing
+decides how many handles the artist is left holding — and the pair is the thing
+worth a test. Split across a header and a window, it could only be tested by a
+window.
+
+**Whole-stroke editing reuses `Transform` from sbl/paint.hpp.** A second
+transform type would be a second definition of what an angle means, and the day
+they drift the artist finds out by turning a selection the wrong way. The
+selection itself is a list of stroke indices held by the TOOL, not the document:
+it is not part of the drawing, it does not survive a save, and it must not cost
+an undo step. `transformStrokes` scales the stroke width with the geometry —
+a curve blown up to twice the size that kept its 4 px line is a different
+drawing, not the same one enlarged.
+
+**`closed` is a flag, not a repeated end point.** A duplicate would give the
+artist two handles on one corner and leave the join the one place the spline is
+not smooth. The rasteriser needed nothing: coverage is already accumulated with
+max and composited once per stroke (D-028), which is exactly the artefact a
+closed curve would otherwise show as a dark dot where the ends meet.
+
+**No format version bump for `closed`.** It is one optional key in the manifest,
+and an older reader that ignores it still sees the closed shape, because the
+tiles are what renders. Bumping would lock every ordinary painting out of an
+older Sable for a flag it is not using — the same reasoning that keeps an 8-bit
+document declaring version 5.
+
+**What was left undone, stated plainly:** scale and rotate are panel controls
+with an Apply button, not on-canvas handles — the transform tool's handle
+machinery is built around a pixel selection and reusing it is its own change.
+There is no marquee for selecting several strokes at once; Shift-click adds one
+at a time. And nothing auto-closes a curve whose ends meet: closing is an
+explicit toggle on a selected stroke.
+---
+
+## D-030 — Gradients: premultiplied interpolation, ordered dither at 8 bits, preview through the undo stack
+
+**Status:** Decided
+**Affects:** `sbl::Gradient` and `gradientFill` in `engine/include/sbl/paint.hpp`,
+`engine/src/paint.cpp`, the gradient tool in `app/src/main.cpp` (#49)
+
+**Interpolated PREMULTIPLIED, and this is the whole feature.** The two ends are
+widened, premultiplied once, and every pixel between them is a lerp of those
+premultiplied values. Straight alpha is the version that looks right until
+somebody drags a foreground-to-transparent gradient: the far end is transparent
+*black*, so a straight-alpha ramp pulls the colour channels toward zero
+alongside the alpha and the whole fade comes out with a grey haze down it.
+D-004 keeps the two spaces apart as types, and `transformRegion` already made
+this same argument for bilinear sampling. Two tests hold it — one on a
+transparent document checking the colour stays the foreground's exactly, one
+over white checking the red channel never dips.
+
+**Composited `over`, not written through.** A gradient fades into the art
+beneath it rather than punching a hole through it, which is what makes
+foreground-to-transparent the useful half of the feature and not just a slow
+eraser. Filling the layer instead would make the faded end erase.
+
+**Dithered on 8-bit documents, not on 16-bit ones.** A ramp across a wide canvas
+has far more pixels than it has levels: 256 levels over 2000 px is a visible
+band every eight pixels, and the artist's next move is to blur it. An 8 x 8
+ordered (Bayer) matrix, amplitude under half of one 8-bit step, breaks the band
+edges into a texture that disappears at any zoom an artist works at.
+
+- *Under half a step* is the correctness condition, and the reason it is safe to
+  apply to every pixel including the flat ends: a value already exactly
+  representable at 8 bits rounds back to itself from every cell of the matrix.
+  A dither that reached a whole step would speckle solid colour, which is noise
+  added where there was no banding to remove. Tested both ways.
+- *One offset for all four channels*, never four independent ones: nudging a
+  colour channel up while its alpha goes down produces a premultiplied value
+  with colour outside its own alpha, which is not a colour.
+- *Ordered rather than error diffusion.* Diffusion makes each pixel depend on
+  the one before it — serial, and impossible to compute for one tile without its
+  neighbours, which is exactly what a GPU implementation of this would need.
+- *16-bit does not get it* by default: 65536 levels over the same span is under
+  a level of error per pixel, and the artist who paid double the memory for
+  smooth ramps should not have noise added to them.
+- The artist can turn it off. Tests pin the exact ramp with it off.
+
+**A non-pure `PaintBackend::gradientFill`.** Every other writer on that
+interface is pure virtual; this one has a body — `readback`, then the host
+implementation. That body is what `GpuBackend` writes by hand for `fillSelection`
+and `transformRegion` anyway, so making it pure would buy one more copy of a
+delegation in three files (the GPU backend and two test fakes) and nothing else.
+A GPU override stays a pure optimisation, and forgetting to write one is a slow
+gradient rather than a missing tool.
+
+**The live preview goes through the undo stack, not beside it.** Each motion
+event takes the previous preview back off the stack — which restores exactly the
+pixels the next one must be computed from — and pushes the new one, which clears
+the redo entry the undo just made. The drag therefore ends with the finished
+gradient already on the stack as one step, and there is nothing to commit on
+release. **Alternative rejected:** a copy of the layer held beside the document
+for the duration of the drag. That is a second copy of the pixels that has to be
+kept in step with undo, with autosave and with the texture cache, and it is
+wrong in a way that survives a crash — the stack version is a real finished edit
+at every instant.
+
+**Not done, and deliberately:** angle/reflected/diamond shapes, multi-stop
+ramps, and an editable gradient that can be re-dragged after the fact. A
+gradient here is pixels once it lands, the same bargain every fill in Sable
+makes. The issue asked for what covers the overwhelming majority of use.
+---
+
+## D-031 — Layer masks: sparse tiles of ordinary grey, coverage in the red channel
+
+**Status:** Decided
+**Affects:** `Layer`, `LayerProps`, `TileSnapshot`, `compositeLevel` and
+`pickLevel` in `engine/src/io.cpp`, `engine/src/gpu.cpp`,
+`engine/src/shaders/composite.comp`, `engine/src/psd.cpp`,
+`engine/src/openraster.cpp`, `.sable` format version 7
+**Supersedes:** D-027
+
+A `Layer` grows `std::optional<LayerMask>`: a `TileMap` of ordinary 8-bit tiles,
+a `bool enabled`, and a `uint8_t outside` giving the coverage where no tile has
+been allocated. Coverage is the RED channel of an opaque grey pixel.
+
+D-027 baked PSD masks into the alpha because there was nowhere to put them, and
+named this as the alternative: "the substantial fix, and the one that unblocks
+masks as a Sable feature… worth doing on its own terms, as a feature". #48 is
+that feature, so the bake goes.
+
+**Why a mask tile is an ordinary `Tile` and not a byte plane.** A byte plane is
+four times smaller and needs its own everything: its own paint path, its own
+undo snapshot, its own PNG codec, its own GPU upload, its own byte accounting.
+Reusing `Tile` makes "paint into the mask with the ordinary brush tools" one
+flag on `PaintTarget` — every preset, every pressure curve, the stabilizer, the
+rulers and the whole `UndoRecord` work on a mask because they cannot tell. The
+cost is stated plainly: **a mask tile is 256 KiB where 64 would do**, and it is
+paid only for tiles the artist has actually painted into. If mask memory ever
+shows up in a profile, a narrow tile type is the change, and it is confined to
+`LayerMask` and `maskCoverage`.
+
+**Why the red channel and not the alpha.** The brush paints premultiplied
+colour, so black at half pressure over white gives grey — which is the value an
+artist expects a mask to hold. Reading alpha instead would make every colour
+reveal and only the eraser hide. As a bonus the eraser still hides, because
+erasing takes every channel to zero, so the two obvious ways to make a hole
+agree.
+
+**Why `outside` rather than "absent means hidden".** The first mask an artist
+adds is the one that hides nothing, and a reveal-all mask made of stored tiles
+costs 64 MiB on a 4000 x 4000 canvas to say "no change yet". `outside` also is
+PSD's mask default colour, so an imported mask needs no expansion. The price is
+one line in `LayerMask::tileFor`: a new tile is filled with `outside`, because a
+tile that arrived at zero would turn 256 pixels black the moment a brush touched
+the corner of it.
+
+**Masks are always 8-bit, at both document depths.** Coverage is eight bits
+everywhere it is stored, read or exported, and a 16-bit mask would double the
+undo cost of a mask stroke to record shades nothing can show. This is D-023's
+own argument, applied to the one channel that does not need the width.
+
+**Coverage folds into the same `scale` as opacity and the clip mask** — one
+rounding, not three — and the alpha a masked layer publishes to the clip mask is
+the MASKED one, so a clipped layer cannot show through a hole its base does not
+have. The GPU shader is that arithmetic line for line, in the same order.
+
+**A folder may carry a mask.** It costs nothing extra: a folder's op already has
+a `src` in both compositors, so the mask applies to the group's composited
+result — the one thing a mask on each child could never express, and what D-027
+had to drop with a warning. That warning is gone.
+
+**The GPU composites masks; it does not paint them.** A mask dab is handed to
+`cpuBackend()`, exactly as a 16-bit document already is (D-023). The batch in
+`gpu.cpp` is keyed on a layer id alone, so a mask stroke and a pixel stroke on
+one layer would land in a single dispatch on the wrong slot; a second key is a
+change to every dab path, and the CPU finishes a mask stroke in milliseconds.
+Compositing is the half that had to be on the device, because that is what runs
+on every frame of every stroke — and `tests/differential.cpp` gained a masked
+scenario without either tolerance being touched (colour ≤ 1, alpha exactly 0).
+
+**A mask slot rides in the op list's spare bits.** `ops[i].y` becomes two
+sixteen-bit slots and `ops[i].z` gains a flag and the default colour, so the
+uniform block keeps its 192-op ceiling. Doubling the op width would have halved
+how much of a document the GPU can composite before falling back, in exchange
+for nothing an arena of 512 slots can use.
+
+**Format version 7, written only by a document that has a mask.** Same deal as
+`SABLE_FORMAT_VERSION_8BIT` (D-023), and masks need it more than depth did: an
+older Sable would open a masked document, show every layer unmasked, and write
+the masks away on the next save.
+
+**What this costs, stated plainly:**
+
+- **ORA export bakes the mask into the alpha.** OpenRaster has no mask element
+  — a layer is a PNG and nothing else — so the choice is between a file that
+  looks like the painting and one that shows what the artist masked away, and
+  D-027 already answered that. The `.sable` keeps the editable version. KRA
+  export does not exist, so there is nothing to bake there.
+- **Merging down bakes the upper layer's mask** into the pixels it contributes,
+  because the layer it belonged to stops existing. The LOWER layer keeps its own
+  mask, which therefore also applies to what was merged into it.
+- **Mask tiles are not selections and selections are not masks yet.**
+  `maskCoverage()` and `Selection::coverage()` deliberately answer in the same
+  units, with the same convention — 0 hides, 255 shows, in between is the soft
+  edge — so #52 can convert either way without a new definition of coverage. The
+  conversion itself is not written; writing it before #52 knows what it needs is
+  guessing.
+
+**Alternative rejected — a mask as a hidden `Layer`.** It would have made the
+paint path free (`PaintTarget` already takes a `Layer&`) but every layer walk in
+the program — `levelOf`, the layer panel, `layerById`, the PSD and ORA writers —
+would have had to learn to skip it, and the day one forgot, the mask would
+composite as a grey rectangle over the artist's drawing.
+---
+
+## D-032 — Brush shape and texture are masks: one registry, two sampling spaces
 
 **Status:** Decided
 **Affects:** `engine/include/sbl/paint.hpp`, `engine/src/paint.cpp`,

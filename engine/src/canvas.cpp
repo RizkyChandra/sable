@@ -38,6 +38,18 @@ void ensureHostTiles(const Document& doc) {
     }
 }
 
+/// The only way to copy a mask (#48). Its tiles are move-only like every other
+/// tile, so every copy is somebody typing this on purpose.
+std::optional<LayerMask> cloneMask(const std::optional<LayerMask>& source) {
+    if (!source.has_value()) return std::nullopt;
+    LayerMask copy;
+    copy.outside = source->outside;
+    copy.enabled = source->enabled;
+    copy.tiles.reserve(source->tiles.size());
+    for (const auto& [key, tile] : source->tiles) copy.tiles.emplace(key, tile.clone());
+    return copy;
+}
+
 }  // namespace
 
 // ------------------------------------------------------------------- colour
@@ -290,6 +302,42 @@ Tile& Layer::tileFor(TileKey k) {
     return tiles.try_emplace(k, depth).first->second;
 }
 
+Tile* LayerMask::find(TileKey k) noexcept {
+    const auto it = tiles.find(k);
+    return it == tiles.end() ? nullptr : &it->second;
+}
+
+const Tile* LayerMask::find(TileKey k) const noexcept {
+    const auto it = tiles.find(k);
+    return it == tiles.end() ? nullptr : &it->second;
+}
+
+Tile& LayerMask::tileFor(TileKey k) {
+    const auto [it, made] = tiles.try_emplace(k, ColourDepth::Bits8);
+    // Filled with the coverage the rest of the mask already has. A tile that
+    // arrived at zero would turn a whole 256-pixel square of a reveal-all mask
+    // black the moment the brush crossed into it.
+    if (made) it->second.fill(PremulRgba8{outside, outside, outside, 255});
+    return it->second;
+}
+
+std::uint8_t maskCoverage(const LayerMask& mask, std::int32_t px,
+                          std::int32_t py) noexcept {
+    const TileKey key{tileIndex(px), tileIndex(py)};
+    const Tile* tile = mask.find(key);
+    if (tile == nullptr) return mask.outside;
+
+    const int tx = px - key.first  * TILE_SIZE;
+    const int ty = py - key.second * TILE_SIZE;
+    // Mask tiles are made 8-bit and only ever made here, but a file some other
+    // writer produced could hand us a wide one, and reading a null pointer is
+    // the one failure this could have that costs the artist the whole session.
+    const PremulRgba8* px8 = tile->pixels8();
+    return px8 != nullptr
+        ? px8[static_cast<std::size_t>(ty) * TILE_SIZE + static_cast<std::size_t>(tx)].r
+        : narrowChannel(tile->pixel(tx, ty).r);
+}
+
 // ---------------------------------------------------------------------- undo
 
 std::size_t UndoRecord::memoryBytes() const noexcept {
@@ -300,8 +348,14 @@ std::size_t UndoRecord::memoryBytes() const noexcept {
     std::size_t n = label.capacity();
     for (const auto& s : tiles)
         if (s.before.has_value()) n += s.before->byteSize();
-    if (structure && structure->state)
+    if (structure && structure->state) {
         for (const auto& [key, tile] : structure->state->tiles) n += tile.byteSize();
+        // A deleted layer takes its mask into the record with it, and a mask
+        // tile is a quarter of a megabyte like any other (#48).
+        if (structure->state->mask.has_value())
+            for (const auto& [key, tile] : structure->state->mask->tiles)
+                n += tile.byteSize();
+    }
     return n;
 }
 
@@ -320,17 +374,37 @@ std::vector<std::pair<LayerId, TileKey>> swapRecord(Document& doc, UndoRecord& r
     std::vector<std::pair<LayerId, TileKey>> changed;
     changed.reserve(rec.tiles.size());
 
+    // Read BEFORE the tiles move. One record can carry both halves — deleting a
+    // mask does — and the tile half below may recreate the very mask the
+    // property half is about to describe. Reading the properties afterwards
+    // captures the state this call is halfway through building, and the redo
+    // then restores a mask the artist deleted (#48).
+    std::optional<LayerProps> propsBefore;
+    if (rec.structure.has_value() && rec.structure->kind == LayerChange::Properties)
+        if (const Layer* layer = doc.layerById(rec.structure->layer); layer != nullptr)
+            propsBefore = propsOf(*layer);
+
     for (auto& snap : rec.tiles) {
         Layer* layer = doc.layerById(snap.layer);
         if (layer == nullptr) continue;   // layer went away; nothing to restore onto
 
+        // Undoing "delete mask" runs this loop before the structural half that
+        // recreates the mask, so the tiles have to be able to bring it back
+        // themselves — otherwise the pixels the record is holding would be
+        // dropped on the floor and the redo would restore an empty mask.
+        if (snap.mask && !layer->mask.has_value()) {
+            if (!snap.before.has_value()) continue;
+            layer->mask.emplace();
+        }
+        TileMap& tiles = snap.mask ? layer->mask->tiles : layer->tiles;
+
         std::optional<Tile> current;
-        if (const auto it = layer->tiles.find(snap.key); it != layer->tiles.end()) {
+        if (const auto it = tiles.find(snap.key); it != tiles.end()) {
             current.emplace(std::move(it->second));
-            layer->tiles.erase(it);
+            tiles.erase(it);
         }
         if (snap.before.has_value())
-            layer->tiles.emplace(snap.key, std::move(*snap.before));
+            tiles.emplace(snap.key, std::move(*snap.before));
 
         snap.before = std::move(current);
         changed.emplace_back(snap.layer, snap.key);
@@ -345,10 +419,9 @@ std::vector<std::pair<LayerId, TileKey>> swapRecord(Document& doc, UndoRecord& r
                 // Layer here would drag every tile with it, which is why an
                 // opacity slider does not cost megabytes of history.
                 Layer* layer = doc.layerById(d.layer);
-                if (layer != nullptr) {
-                    LayerProps current = propsOf(*layer);
+                if (layer != nullptr && propsBefore.has_value()) {
                     applyProps(*layer, d.props.value_or(LayerProps{}));
-                    d.props = std::move(current);
+                    d.props = std::move(*propsBefore);
                 }
                 break;
             }
@@ -402,9 +475,12 @@ const std::string kNoLabel{};
 
 void mergeTileRecord(UndoRecord& into, UndoRecord&& next) {
     for (TileSnapshot& snap : next.tiles) {
+        // The mask flag is part of the identity: one session can touch a tile
+        // and the mask tile beside it, and they are different pixels.
         const bool known = std::any_of(
-            into.tiles.begin(), into.tiles.end(),
-            [&](const TileSnapshot& s) { return s.key == snap.key; });
+            into.tiles.begin(), into.tiles.end(), [&](const TileSnapshot& s) {
+                return s.key == snap.key && s.mask == snap.mask;
+            });
         // Already recorded means `into` holds the state from BEFORE the session,
         // and that is the one undo has to put back.
         if (!known) into.tiles.push_back(std::move(snap));
@@ -549,6 +625,10 @@ Document cloneDocument(const Document& doc) {
         out.kind  = layer.kind;
         out.depth = layer.depth;
         applyProps(out, propsOf(layer));
+        // After applyProps, which creates an empty mask from the flags: this
+        // is what puts the pixels in it. Without it the autosave worker writes
+        // a recovery file whose masks hide nothing.
+        out.mask = cloneMask(layer.mask);
         out.tiles.reserve(layer.tiles.size());
         for (const auto& [key, tile] : layer.tiles) out.tiles.emplace(key, tile.clone());
         copy.layers.push_back(std::move(out));
@@ -559,9 +639,11 @@ Document cloneDocument(const Document& doc) {
 // ----------------------------------------------------------- layer operations
 
 LayerProps propsOf(const Layer& layer) {
+    std::optional<MaskProps> mask;
+    if (layer.mask.has_value()) mask = MaskProps{layer.mask->outside, layer.mask->enabled};
     return LayerProps{layer.name, layer.opacity, layer.blend, layer.visible,
                       layer.locked, layer.preserveOpacity, layer.clipToBelow,
-                      layer.parent, layer.text, layer.linework};
+                      layer.parent, layer.text, layer.linework, mask};
 }
 
 void applyProps(Layer& layer, const LayerProps& props) {
@@ -575,6 +657,18 @@ void applyProps(Layer& layer, const LayerProps& props) {
     layer.parent          = props.parent;
     layer.text            = props.text;
     layer.linework        = props.linework;
+    // The flags move; the tiles stay where they are. An absent `mask` is the
+    // one case that destroys pixels — it is how "delete mask" is expressed —
+    // so `deleteLayerMask` snapshots them into the record first, and every
+    // other caller gets `propsOf`'s copy of the current flags and changes
+    // nothing.
+    if (props.mask.has_value()) {
+        if (!layer.mask.has_value()) layer.mask.emplace();
+        layer.mask->outside = props.mask->outside;
+        layer.mask->enabled = props.mask->enabled;
+    } else {
+        layer.mask.reset();
+    }
     // Kind follows the source, in one place, so the two can never disagree: a
     // layer with words or curves in it is a text or linework layer and refuses
     // paint, and undoing a "rasterise" gives back that protection along with
@@ -659,6 +753,9 @@ UndoRecord duplicateLayer(Document& doc, LayerId id) {
     copy.depth = source->depth;
     // Tiles are move-only, so the copy is explicit — which is the point.
     for (const auto& [key, tile] : source->tiles) copy.tiles.emplace(key, tile.clone());
+    copy.mask = cloneMask(source->mask);   // a duplicate that ignored the mask
+                                           // would arrive showing what the
+                                           // original hides
 
     const std::size_t at = std::min(indexOf(doc, id) + 1, doc.layers.size());
     const LayerId newId = copy.id;
@@ -708,6 +805,15 @@ UndoRecord CpuBackend::mergeLayerDown(Document& doc, LayerId id) {
     const LayerId lowerId = doc.layers[lower].id;
     const BlendMode mode  = doc.layers[upper].blend;
     const float opacity   = std::clamp(doc.layers[upper].opacity, 0.0f, 1.0f);
+    // The upper layer's mask is baked in here, because the layer it belonged to
+    // is about to stop existing and a merge that ignored it would put back on
+    // screen exactly what the artist masked away (#48). The LOWER layer keeps
+    // its own mask, which therefore also applies to what has just been merged
+    // into it — the same answer Photoshop gives, and the only one that leaves
+    // the mask editable at all.
+    const LayerMask* srcMask =
+        doc.layers[upper].mask.has_value() && doc.layers[upper].mask->enabled
+            ? &*doc.layers[upper].mask : nullptr;
 
     // Snapshot every tile of the lower layer that the merge will touch, then
     // composite. One record carries both halves.
@@ -720,6 +826,23 @@ UndoRecord CpuBackend::mergeLayerDown(Document& doc, LayerId id) {
             snap.before.emplace(existing->clone());
         rec.tiles.push_back(std::move(snap));
 
+        // One lookup per tile, not per pixel: the mask is keyed the same way the
+        // pixels are, so the tile that covers these 65'536 pixels is the tile at
+        // the same key — and when there is none, `outside` covers all of them.
+        const Tile* maskTile = srcMask != nullptr ? srcMask->find(key) : nullptr;
+        const auto coverageAt = [&](int x, int y) -> float {
+            if (srcMask == nullptr) return 1.0f;
+            const std::uint8_t cov = [&] {
+                if (maskTile == nullptr) return srcMask->outside;
+                const PremulRgba8* mp = maskTile->pixels8();
+                return mp != nullptr
+                    ? mp[static_cast<std::size_t>(y) * TILE_SIZE +
+                        static_cast<std::size_t>(x)].r
+                    : narrowChannel(maskTile->pixel(x, y).r);
+            }();
+            return static_cast<float>(cov) / 255.0f;
+        };
+
         Tile& dstTile = dstLayer.tileFor(key);
         if (srcTile.depth() == ColourDepth::Bits8 &&
             dstTile.depth() == ColourDepth::Bits8) {
@@ -731,10 +854,16 @@ UndoRecord CpuBackend::mergeLayerDown(Document& doc, LayerId id) {
             for (int i = 0; i < TILE_PIXELS; ++i) {
                 PremulRgba8 s = src[i];
                 if (s.a == 0) continue;
-                if (opacity < 1.0f) {
+                // Opacity and coverage fold into ONE factor before rounding,
+                // which is what `compositeLevel` does — two roundings here
+                // would make a merged masked layer a level off the composite
+                // it is supposed to have replaced exactly.
+                const float factor = opacity * coverageAt(i % TILE_SIZE, i / TILE_SIZE);
+                if (factor <= 0.0f) continue;
+                if (factor < 1.0f) {
                     const auto scale = [&](std::uint8_t c) {
                         return static_cast<std::uint8_t>(
-                            std::lround(static_cast<float>(c) * opacity));
+                            std::lround(static_cast<float>(c) * factor));
                     };
                     s = PremulRgba8{scale(s.r), scale(s.g), scale(s.b), scale(s.a)};
                 }
@@ -745,10 +874,12 @@ UndoRecord CpuBackend::mergeLayerDown(Document& doc, LayerId id) {
                 for (int x = 0; x < TILE_SIZE; ++x) {
                     PremulRgba16 s = srcTile.pixel(x, y);
                     if (s.a == 0) continue;
-                    if (opacity < 1.0f) {
+                    const float factor = opacity * coverageAt(x, y);
+                    if (factor <= 0.0f) continue;
+                    if (factor < 1.0f) {
                         const auto scale = [&](std::uint16_t c) {
                             return static_cast<std::uint16_t>(
-                                std::lround(static_cast<float>(c) * opacity));
+                                std::lround(static_cast<float>(c) * factor));
                         };
                         s = PremulRgba16{scale(s.r), scale(s.g), scale(s.b), scale(s.a)};
                     }
@@ -775,6 +906,30 @@ UndoRecord setLayerProps(Document& doc, LayerId id, const LayerProps& props) {
     applyProps(*layer, props);
 
     rec.label = "Layer settings";
+    rec.structure = LayerStructureDelta{LayerChange::Properties, id, indexOf(doc, id),
+                                        std::nullopt, std::move(before)};
+    return rec;
+}
+
+UndoRecord deleteLayerMask(Document& doc, LayerId id) {
+    UndoRecord rec;
+    Layer* layer = doc.layerById(id);
+    if (layer == nullptr || !layer->mask.has_value()) return rec;
+
+    LayerProps before = propsOf(*layer);
+    // Moved, not cloned: the mask is being destroyed either way, so the record
+    // can simply take the tiles — a delete that copied them would double the
+    // memory of the one action most likely to involve a lot of them.
+    rec.tiles.reserve(layer->mask->tiles.size());
+    for (auto& [key, tile] : layer->mask->tiles)
+        rec.tiles.push_back(TileSnapshot{id, key, std::move(tile), true});
+    layer->mask.reset();
+
+    rec.label = "Delete mask";
+    // The property half is what says the mask existed at all; the tile half
+    // above is what puts the pixels back into it. Undo runs the tiles first and
+    // they recreate an empty mask to land in, so the two halves compose in
+    // either direction (see `swapRecord`).
     rec.structure = LayerStructureDelta{LayerChange::Properties, id, indexOf(doc, id),
                                         std::nullopt, std::move(before)};
     return rec;

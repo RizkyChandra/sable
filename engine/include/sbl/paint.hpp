@@ -24,7 +24,7 @@ class PaintBackend;
 /// shape of a mask from the registry, turned by `Dab::angle` — so hardness
 /// still owns the dab's edge and the mask owns its outline. A stamp brush
 /// therefore wants a high hardness: at 0.5 the round feather eats the mask's
-/// extremities and a chisel comes out a lens (D-029).
+/// extremities and a chisel comes out a lens (D-032).
 enum class ShapeId : std::uint8_t { Round, Stamp };
 
 /// Index into the texture registry. Not a pointer — presets are serialised,
@@ -36,7 +36,7 @@ using TextureId = std::uint32_t;
 /// 64 because both jobs a mask does have a floor and a ceiling here: grain is
 /// tiled across the CANVAS, so a smaller square reads as a repeating pattern
 /// on a wide flat fill, and the pair in use travels to the GPU on every change
-/// of brush, which a larger one makes a heavier upload (D-029). A power of
+/// of brush, which a larger one makes a heavier upload (D-032). A power of
 /// two, because tiling grain over the canvas is a bitmask.
 inline constexpr std::int32_t MASK_SIZE = 64;
 
@@ -211,6 +211,17 @@ struct PaintTarget {
     /// process default. Per-stroke rather than only global so that a test can
     /// drive two backends over one document and compare (D-021, #14).
     PaintBackend* backend = nullptr;
+    /// Dabs land in the layer's MASK rather than its pixels (#48). Ignored on a
+    /// layer with no mask, so a stray true cannot paint into something that
+    /// does not exist.
+    ///
+    /// A flag here rather than a second dab path: a mask tile is an ordinary
+    /// tile, so every brush, every pressure curve and the whole undo record
+    /// already work on it — which is the point of storing a mask that way. It
+    /// is also why painting a mask is allowed on a Text, Linework or Folder
+    /// layer, whose PIXELS the paint tools refuse: the mask is not generated
+    /// from anything, so nothing will overwrite it.
+    bool toMask = false;
 };
 
 void beginStroke(Stroke& s, const BrushPreset& preset, StraightRgba8 colour,
@@ -274,6 +285,53 @@ std::size_t paintSample(Stroke& s, PaintTarget& t, const InputSample& sample,
 /// Fills the selection, or the whole layer when there is none.
 [[nodiscard]] UndoRecord fillSelection(Document& doc, LayerId target,
                                        StraightRgba8 colour);
+
+// ------------------------------------------------------------------ gradient
+
+/// Linear and radial cover the overwhelming majority of use (#49). Anything
+/// further — angle, reflected, a multi-stop ramp — is a new member here and a
+/// new branch in one loop, so the enum is where it lands.
+enum class GradientShape : std::uint8_t { Linear, Radial };
+
+/// The axis the artist dragged, and what to ramp along it.
+struct Gradient {
+    GradientShape shape = GradientShape::Linear;
+
+    /// Canvas pixels. Linear ramps `from` to `to` along the axis and holds each
+    /// end's colour beyond it; radial takes (x0, y0) as the centre and the
+    /// axis's length as the radius.
+    double x0 = 0.0, y0 = 0.0, x1 = 0.0, y1 = 0.0;
+
+    /// Straight alpha because that is what a colour picker deals in; the
+    /// interpolation between them is not (see `gradientFill`). `to.a == 0` is
+    /// the foreground-to-transparent case and needs no separate flag.
+    StraightRgba8 from{};
+    StraightRgba8 to{};
+
+    /// Ordered dither, applied only on an 8-bit document — see D-030. Off is
+    /// the exact ramp, which is what a test can pin and what a 16-bit document
+    /// gets anyway.
+    bool dither = true;
+};
+
+/// Lays a gradient over `target`, as one undoable step.
+///
+/// Composited `over` what is already there rather than replacing it, which is
+/// what makes a foreground-to-transparent gradient fade into the art beneath
+/// instead of erasing a hole through it. Honours the selection, `locked` and
+/// `preserveOpacity` exactly as `fillSelection` and `applyDab` do.
+///
+/// **The ends are interpolated PREMULTIPLIED**, for the reason `transformRegion`
+/// gives below: it is the only space where colour and alpha blend together
+/// correctly. Ramping straight-alpha values toward a transparent end drags the
+/// colour channels to zero alongside the alpha, and the fade comes out with a
+/// grey haze down it.
+///
+/// A zero-length axis does nothing and costs no undo step — a click that missed
+/// is not an edit, and which end of a ramp with no length to fill would be a
+/// coin toss.
+[[nodiscard]] UndoRecord gradientFill(Document& doc, LayerId target,
+                                      const Gradient& gradient);
 
 /// Move, scale and rotate, as one undoable action.
 struct Transform {

@@ -19,6 +19,7 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <numbers>
 #ifdef _WIN32
 #include <malloc.h>   // _aligned_malloc / _aligned_free
 #endif
@@ -145,7 +146,7 @@ double gap(const Dab& a, const Dab& b) {
 /// The pencil with its paper taken off and pressure held flat: a mark of
 /// exactly one colour.
 ///
-/// The built-in pencil carries paper grain (D-029), which is the point of it —
+/// The built-in pencil carries paper grain (D-032), which is the point of it —
 /// but a test that asserts a pixel is exactly the colour the artist picked is
 /// testing layers, clipping or selections, and would otherwise be testing the
 /// brush's tooth by accident. The tooth has its own tests.
@@ -2052,6 +2053,240 @@ TEST_CASE("a locked layer refuses paint and fill") {
     CHECK(doc.active()->tiles.empty());
 }
 
+// ------------------------------------------------------ gradient (#49)
+
+namespace {
+
+/// A horizontal linear gradient with the exact ramp — dithering off, so the
+/// values a test reads are the ones the interpolation produced and not the
+/// ones a threshold matrix nudged. D-030.
+Gradient horizontalRamp(double x0, double x1, StraightRgba8 from, StraightRgba8 to) {
+    Gradient g;
+    g.x0 = x0;
+    g.x1 = x1;
+    g.from = from;
+    g.to = to;
+    g.dither = false;
+    return g;
+}
+
+}  // namespace
+
+TEST_CASE("a linear gradient ramps monotonically and holds both ends") {
+    Document doc = makeDocument(256, 4, StraightRgba8{255, 255, 255, 255});
+    const Gradient g = horizontalRamp(64.0, 192.0, StraightRgba8{0, 0, 0, 255},
+                                      StraightRgba8{255, 255, 255, 255});
+    doc.undo.push(gradientFill(doc, doc.activeLayer, g));
+
+    // Beyond either end of the axis the ramp holds that end's colour exactly:
+    // no overshoot past black or past white, which is what an unclamped
+    // projection would produce off the ends of a short drag.
+    CHECK(pickColour(doc, 0, 2)   == StraightRgba8{0, 0, 0, 255});
+    CHECK(pickColour(doc, 63, 2)  == StraightRgba8{0, 0, 0, 255});
+    CHECK(pickColour(doc, 192, 2) == StraightRgba8{255, 255, 255, 255});
+    CHECK(pickColour(doc, 255, 2) == StraightRgba8{255, 255, 255, 255});
+
+    int previous = -1;
+    bool monotonic = true;
+    for (std::int32_t x = 0; x < 256; ++x) {
+        const StraightRgba8 c = pickColour(doc, x, 2);
+        if (c.r < previous) monotonic = false;
+        previous = c.r;
+        CHECK(c.g == c.r);          // a grey ramp stays grey
+        CHECK(c.b == c.r);
+    }
+    CHECK(monotonic);
+    CHECK(pickColour(doc, 128, 2).r == doctest::Approx(128).epsilon(0.02));
+}
+
+TEST_CASE("a gradient to transparent fades without a grey haze") {
+    // THE failure this feature exists to get right. Interpolating the two ends
+    // on straight alpha drags the colour channels toward the transparent end's
+    // zero alongside the alpha, and every pixel of the fade comes out darker
+    // than the colour the artist picked. Premultiplied, the red stays red and
+    // only the alpha moves.
+    //
+    // A transparent BLACK far end on purpose: that is what "fade to nothing"
+    // means to the app, and a `to` that carried the foreground's own RGB would
+    // hide the bug rather than test it.
+    Document doc = makeDocument(256, 4, StraightRgba8{0, 0, 0, 0});
+    doc.undo.push(gradientFill(
+        doc, doc.activeLayer,
+        horizontalRamp(0.0, 256.0, StraightRgba8{255, 0, 0, 255},
+                       StraightRgba8{0, 0, 0, 0})));
+
+    int previousAlpha = 256;
+    for (std::int32_t x = 0; x < 256; ++x) {
+        const StraightRgba8 c = pickColour(doc, x, 2);
+        if (c.a == 0) continue;              // the far end, fully faded out
+        CHECK(c.r == 255);                   // still the foreground, not a dulled one
+        CHECK(c.g == 0);
+        CHECK(c.b == 0);
+        CHECK(c.a <= previousAlpha);         // and the fade only ever thins
+        previousAlpha = c.a;
+    }
+    CHECK(previousAlpha < 8);                // it does reach the far end
+}
+
+TEST_CASE("a gradient to transparent does not darken the art beneath it") {
+    // The same failure seen from the other side: composited over white, a
+    // half-faded pure red must stay at full red. Straight-alpha interpolation
+    // reads as a grey wash lying over the fade.
+    Document doc = makeDocument(256, 4, StraightRgba8{255, 255, 255, 255});
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{255, 255, 255, 255}));
+    doc.undo.push(gradientFill(
+        doc, doc.activeLayer,
+        horizontalRamp(0.0, 256.0, StraightRgba8{255, 0, 0, 255},
+                       StraightRgba8{0, 0, 0, 0})));
+
+    for (std::int32_t x = 0; x < 256; ++x) {
+        const StraightRgba8 c = pickColour(doc, x, 2);
+        CHECK(c.r == 255);
+        CHECK(c.g == c.b);                   // no colour cast either way
+    }
+}
+
+TEST_CASE("a radial gradient runs outward from its centre") {
+    Document doc = makeDocument(200, 200, StraightRgba8{255, 255, 255, 255});
+    Gradient g;
+    g.shape = GradientShape::Radial;
+    // The centre of pixel (100, 100), not its corner: distances are measured
+    // from pixel centres, so a centre on a corner is half a pixel nearer one
+    // side than the other and the symmetry checks below would be off by one.
+    g.x0 = 100.5;
+    g.y0 = 100.5;
+    g.x1 = 150.5;                            // radius 50
+    g.y1 = 100.5;
+    g.from = StraightRgba8{0, 0, 0, 255};
+    g.to   = StraightRgba8{255, 255, 255, 255};
+    g.dither = false;
+    doc.undo.push(gradientFill(doc, doc.activeLayer, g));
+
+    CHECK(pickColour(doc, 100, 100).r == 0);            // the centre
+    // Equal distances in any direction give equal colour — the thing a linear
+    // gradient with the same endpoints would get wrong.
+    const int right = pickColour(doc, 125, 100).r;
+    CHECK(pickColour(doc, 75, 100).r  == right);
+    CHECK(pickColour(doc, 100, 125).r == right);
+    CHECK(right == doctest::Approx(128).epsilon(0.03));
+    CHECK(pickColour(doc, 0, 0)     == StraightRgba8{255, 255, 255, 255});  // past it
+    CHECK(pickColour(doc, 100, 160) == StraightRgba8{255, 255, 255, 255});
+}
+
+TEST_CASE("a gradient lands only inside the selection") {
+    Document doc = makeDocument(128, 128, StraightRgba8{255, 255, 255, 255});
+    doc.selection = Selection{32, 32, 64, 64};
+    doc.undo.push(gradientFill(
+        doc, doc.activeLayer,
+        horizontalRamp(0.0, 128.0, StraightRgba8{0, 0, 0, 255},
+                       StraightRgba8{0, 0, 255, 255})));
+
+    CHECK(pickColour(doc, 31, 64) == StraightRgba8{255, 255, 255, 255});
+    CHECK(pickColour(doc, 96, 64) == StraightRgba8{255, 255, 255, 255});
+    CHECK(pickColour(doc, 64, 31) == StraightRgba8{255, 255, 255, 255});
+    CHECK(pickColour(doc, 64, 96) == StraightRgba8{255, 255, 255, 255});
+    CHECK(pickColour(doc, 64, 64).b > 0);
+    CHECK(pickColour(doc, 64, 64).r == 0);
+}
+
+TEST_CASE("a gradient is one undo step and restores exactly") {
+    Document doc = makeDocument(160, 160, StraightRgba8{255, 255, 255, 255});
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{0, 90, 200, 255}));
+    const std::uint64_t before = hashCanvas(doc);
+
+    doc.undo.push(gradientFill(
+        doc, doc.activeLayer,
+        horizontalRamp(20.0, 140.0, StraightRgba8{255, 255, 0, 255},
+                       StraightRgba8{0, 0, 0, 0})));
+    CHECK(doc.undo.size() == 2);
+    const std::uint64_t after = hashCanvas(doc);
+    CHECK(after != before);
+
+    doc.undo.undo(doc);
+    CHECK(hashCanvas(doc) == before);
+    doc.undo.redo(doc);
+    CHECK(hashCanvas(doc) == after);
+}
+
+TEST_CASE("a gradient obeys locked, preserveOpacity and a zero-length axis") {
+    Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+    const Gradient g = horizontalRamp(0.0, 64.0, StraightRgba8{255, 0, 0, 255},
+                                      StraightRgba8{0, 0, 255, 255});
+
+    doc.active()->locked = true;
+    CHECK(gradientFill(doc, doc.activeLayer, g).empty());
+    CHECK(doc.active()->tiles.empty());
+    doc.active()->locked = false;
+
+    // No drag, no axis, no undo step to clear up afterwards.
+    CHECK(gradientFill(doc, doc.activeLayer,
+                       horizontalRamp(10.0, 10.0, g.from, g.to)).empty());
+
+    // preserveOpacity: paint only where there is already paint.
+    doc.selection = Selection{0, 0, 32, 64};
+    doc.undo.push(fillSelection(doc, doc.activeLayer, StraightRgba8{255, 255, 255, 255}));
+    doc.selection.reset();
+    doc.active()->preserveOpacity = true;
+    doc.undo.push(gradientFill(doc, doc.activeLayer, g));
+
+    CHECK(pickColour(doc, 16, 32).r < 255);                 // painted half: gradient
+    const Tile* tile = doc.active()->find(TileKey{0, 0});
+    REQUIRE(tile != nullptr);
+    CHECK(tile->pixel(40, 32) == PremulRgba16{});           // empty half: still empty
+}
+
+TEST_CASE("dithering breaks the bands of a shallow 8-bit ramp") {
+    // 256 pixels across five levels: without dither the row is five flat bands
+    // with four steps in it, and on a real canvas those edges are visible.
+    // Counting the steps is the blunt way to say "the bands were broken up".
+    const auto stepsAlongRow = [](bool dither) {
+        Document doc = makeDocument(256, 8, StraightRgba8{0, 0, 0, 0});
+        Gradient g = horizontalRamp(0.0, 256.0, StraightRgba8{0, 0, 0, 255},
+                                    StraightRgba8{4, 4, 4, 255});
+        g.dither = dither;
+        doc.undo.push(gradientFill(doc, doc.activeLayer, g));
+
+        int steps = 0;
+        for (std::int32_t x = 1; x < 256; ++x)
+            if (pickColour(doc, x, 3).r != pickColour(doc, x - 1, 3).r) ++steps;
+        return steps;
+    };
+    CHECK(stepsAlongRow(false) == 4);
+    CHECK(stepsAlongRow(true) > 20);
+}
+
+TEST_CASE("dither leaves a colour that needs no dithering alone") {
+    // The other half of D-030: a dither that reaches a whole 8-bit step rather
+    // than half of one also wobbles values that were exactly representable,
+    // speckling the flat ends of every ramp and every solid colour under one.
+    Document doc = makeDocument(64, 64, StraightRgba8{0, 0, 0, 0});
+    Gradient g = horizontalRamp(0.0, 64.0, StraightRgba8{200, 30, 40, 255},
+                                StraightRgba8{200, 30, 40, 255});
+    g.dither = true;
+    doc.undo.push(gradientFill(doc, doc.activeLayer, g));
+
+    for (std::int32_t y = 0; y < 8; ++y)
+        for (std::int32_t x = 0; x < 8; ++x)
+            CHECK(pickColour(doc, x, y) == StraightRgba8{200, 30, 40, 255});
+}
+
+TEST_CASE("a gradient on a 16-bit document keeps the levels between 8-bit ones") {
+    Document doc = makeDocument(256, 4, StraightRgba8{0, 0, 0, 0}, ColourDepth::Bits16);
+    doc.undo.push(gradientFill(
+        doc, doc.activeLayer,
+        horizontalRamp(0.0, 256.0, StraightRgba8{0, 0, 0, 255},
+                       StraightRgba8{4, 4, 4, 255})));
+
+    // 4 levels at 8 bits, 1028 at 16: the ramp must not have been quantised on
+    // its way through, which is what makes the extra storage worth its memory.
+    const Tile* tile = doc.active()->find(TileKey{0, 0});
+    REQUIRE(tile != nullptr);
+    int distinct = 1;
+    for (std::int32_t x = 1; x < 256; ++x)
+        if (tile->pixel(x, 2).r != tile->pixel(x - 1, 2).r) ++distinct;
+    CHECK(distinct > 200);
+}
+
 // ----------------------------------------------------- transform (M3)
 
 TEST_CASE("moving a selection carries the pixels and leaves the source empty") {
@@ -2968,11 +3203,12 @@ TEST_CASE("a PSD flattens to the composite the file itself carries") {
     CHECK(worst <= 2);
 }
 
-TEST_CASE("a PSD's layer masks reach the canvas (#35)") {
+TEST_CASE("a PSD's layer masks reach the canvas (#35) and stay masks (#48)") {
     // The bug was silence: the pixels arrived and the mask that hid half of
-    // them did not, so the import showed content the file does not. Sable has
-    // no mask of its own, so the importer multiplies it into the alpha — what
-    // is lost is the ability to edit the mask, not the artist's picture.
+    // them did not, so the import showed content the file does not. #35 fixed
+    // the picture by multiplying the mask into the alpha; #48 gives the mask
+    // somewhere to live, so the import is now faithful in BOTH — the drawing
+    // matches the file and the mask is still a mask afterwards.
     //
     // masked_flat.psd carries the same artwork composited in floating point by
     // the fixture script, so this compares against another implementation of
@@ -2996,9 +3232,13 @@ TEST_CASE("a PSD's layer masks reach the canvas (#35)") {
     CHECK(worst <= 2);
 
     // The layer whose mask rectangle is smaller than the layer: everything
-    // outside it takes the mask's default colour, which is zero here.
+    // outside it takes the mask's default colour, which is zero here. The
+    // PIXELS survive untouched — that is the whole of #48 in one assertion,
+    // because this is exactly what D-027 destroyed.
     const Layer* patch = layerNamed(*masked, "Patch");
     REQUIRE(patch != nullptr);
+    REQUIRE(patch->mask.has_value());
+    CHECK(patch->mask->outside == 0);
     CHECK(pickColour(*masked, 10, 10).a == 255);      // inside the mask rectangle
     CHECK(patch->find(TileKey{0, 0}) != nullptr);
     for (const auto& [key, tile] : patch->tiles)
@@ -3007,22 +3247,74 @@ TEST_CASE("a PSD's layer masks reach the canvas (#35)") {
                 const std::int32_t cx = key.first  * TILE_SIZE + x;
                 const std::int32_t cy = key.second * TILE_SIZE + y;
                 const bool masked_off = cx >= 32 || cy >= 24 || cx < 8 || cy < 8;
-                if (masked_off) REQUIRE(tile.pixel(x, y).a == 0);
+                // Painted, and hidden by the mask rather than by its own alpha.
+                if (masked_off && cx >= 8 && cy >= 8 && cx < 56 && cy < 40) {
+                    REQUIRE(tile.pixel(x, y).a == 65535);
+                    REQUIRE(maskCoverage(*patch->mask, cx, cy) == 0);
+                }
             }
 
+    // Partial coverage, which is what a mask is for and what an alpha of zero
+    // could never have carried back out to a PSD.
+    const Layer* bands = layerNamed(*masked, "Bands");
+    REQUIRE(bands != nullptr);
+    REQUIRE(bands->mask.has_value());
+    CHECK(maskCoverage(*bands->mask, 10, 10) == 255);
+    CHECK(maskCoverage(*bands->mask, 30, 10) == 128);
+    CHECK(maskCoverage(*bands->mask, 50, 10) == 0);
+
     // A disabled mask is not a mask. This one is all zeroes, so applying it
-    // anyway would delete the layer outright.
+    // anyway would delete the layer outright — and it is KEPT, switched off,
+    // because that is what the file says and the artist may want it back.
     const Layer* unmasked = layerNamed(*masked, "Unmasked");
     REQUIRE(unmasked != nullptr);
     CHECK(!unmasked->tiles.empty());
+    REQUIRE(unmasked->mask.has_value());
+    CHECK(!unmasked->mask->enabled);
     CHECK(pickColour(*masked, 50, 40) == StraightRgba8{255, 255, 0, 255});
 
-    // The drawing is right, so the warning (#40) is not about the picture — it
-    // is that the masks are no longer editable. Once for the file: a PSD from
-    // real work can carry forty of them, and forty lines of the same sentence
-    // is a channel nobody reads.
-    REQUIRE(masked->warnings.size() == 1);
-    CHECK(masked->warnings[0].find("2 layer masks") != std::string::npos);
+    // Nothing was given up, so there is nothing to warn about. #35's notice —
+    // "the masks can no longer be edited" — is not true of this reader, and a
+    // warning that is not true is worse than none.
+    CHECK(masked->warnings.empty());
+}
+
+TEST_CASE("a PSD's layer masks survive a round trip through PSD (#48)") {
+    // The other half of the acceptance criterion: imported with the mask
+    // intact, and re-exported WITH it. Baking made this impossible by
+    // construction — a baked mask leaves nothing to write to channel -2.
+    const auto masked = importDocument(testData("masked.psd"));
+    REQUIRE(masked.has_value());
+
+    const auto path = scratchFile("mask_roundtrip.psd");
+    REQUIRE(exportDocument(*masked, path).has_value());
+    const auto back = importDocument(path);
+    REQUIRE(back.has_value());
+
+    const Layer* bands = layerNamed(*back, "Bands");
+    REQUIRE(bands != nullptr);
+    REQUIRE(bands->mask.has_value());
+    CHECK(maskCoverage(*bands->mask, 10, 10) == 255);
+    CHECK(maskCoverage(*bands->mask, 30, 10) == 128);
+    CHECK(maskCoverage(*bands->mask, 50, 10) == 0);
+
+    const Layer* unmasked = layerNamed(*back, "Unmasked");
+    REQUIRE(unmasked != nullptr);
+    REQUIRE(unmasked->mask.has_value());
+    CHECK(!unmasked->mask->enabled);        // the disabled flag travels too
+
+    // And the picture is the same one, which is what says the mask went out
+    // as a mask rather than as a differently-shaped alpha.
+    const std::vector<StraightRgba8> before = flatten(*masked);
+    const std::vector<StraightRgba8> after  = flatten(*back);
+    REQUIRE(before.size() == after.size());
+    int worst = 0;
+    for (std::size_t i = 0; i < before.size(); ++i)
+        worst = std::max({worst, std::abs(before[i].r - after[i].r),
+                          std::abs(before[i].g - after[i].g),
+                          std::abs(before[i].b - after[i].b),
+                          std::abs(before[i].a - after[i].a)});
+    CHECK(worst <= 2);
 }
 
 TEST_CASE("an imported PSD round-trips through .sable") {
@@ -5463,15 +5755,27 @@ TEST_CASE("only a 16-bit file claims the newer format version") {
 
     CHECK(narrowManifest["format_version"] == SABLE_FORMAT_VERSION_8BIT);
     CHECK(narrowManifest["colour"]["depth"] == 8);
-    CHECK(wideManifest["format_version"] == SABLE_FORMAT_VERSION);
+    CHECK(wideManifest["format_version"] == SABLE_FORMAT_VERSION_16BIT);
     CHECK(wideManifest["colour"]["depth"] == 16);
     // Which is only worth anything if the two differ — otherwise the gate on
     // load has nothing to catch.
-    CHECK(SABLE_FORMAT_VERSION > SABLE_FORMAT_VERSION_8BIT);
+    CHECK(SABLE_FORMAT_VERSION_16BIT > SABLE_FORMAT_VERSION_8BIT);
+
+    // #48 takes the same deal, and needs it more: an older Sable would open a
+    // masked document, show every layer unmasked, and write the masks away on
+    // the next save. An 8-bit document with no mask is unaffected by either.
+    const auto maskedPath = dir / "sable_masked.sable";
+    Document maskedDoc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+    maskedDoc.layers[0].mask.emplace();
+    REQUIRE(saveProject(maskedDoc, maskedPath).has_value());
+    CHECK(manifestOf(maskedPath)["format_version"] == SABLE_FORMAT_VERSION_MASK);
+    CHECK(SABLE_FORMAT_VERSION_MASK > SABLE_FORMAT_VERSION_16BIT);
+    CHECK(SABLE_FORMAT_VERSION == SABLE_FORMAT_VERSION_MASK);   // the newest known
 
     std::error_code ec;
     std::filesystem::remove(narrowPath, ec);
     std::filesystem::remove(widePath, ec);
+    std::filesystem::remove(maskedPath, ec);
 }
 
 TEST_CASE("a 16-bit document composites, picks and exports") {
@@ -5692,6 +5996,179 @@ TEST_CASE("a control point is added on the curve and deleted off it") {
     CHECK(!erasePoint(content, PointRef{0, 0}));      // and asking again is safe
 }
 
+TEST_CASE("the stabiliser leaves a shaky freehand line fewer, straighter points") {
+    // #51.1. The stabiliser is a pure sample-to-sample function, so a linework
+    // curve gets it in the same place the brush does — and the two halves that
+    // decide what a freehand curve looks like, the smoothing and the point
+    // spacing, are only meaningful together. A hand that shakes 5 px either
+    // side of a straight line must not leave a control point on every wobble.
+    const auto drawShaky = [](std::uint8_t level) {
+        Stabilizer stabilizer;
+        stabilizer.setLevel(level);
+        LineStroke stroke;
+        stroke.points.push_back(LinePoint{0.0, 0.0, 1.0f});
+        for (int i = 1; i < 400; ++i) {
+            const InputSample s = stabilizer.apply(at(i * 1.0, (i % 2 == 0) ? 5.0 : -5.0));
+            (void)appendFreehand(stroke, LinePoint{s.x, s.y, 1.0f}, 14.0);
+        }
+        return stroke;
+    };
+    /// How far the control points wander off the line the artist meant, past
+    /// the transient at the start where the string is still being pulled taut.
+    const auto worstOffset = [](const LineStroke& stroke) {
+        double worst = 0.0;
+        for (const LinePoint& p : stroke.points)
+            if (p.x > 100.0) worst = std::max(worst, std::abs(p.y));
+        return worst;
+    };
+
+    const LineStroke raw      = drawShaky(0);
+    const LineStroke smoothed = drawShaky(3);
+
+    CHECK(worstOffset(raw) == doctest::Approx(5.0));
+    CHECK(worstOffset(smoothed) < 1.0);
+    // Fewer, as well as straighter: a wobble that is not smoothed out is extra
+    // travel, and extra travel is extra handles to drag afterwards.
+    CHECK(smoothed.points.size() < raw.points.size());
+    // And it still gets to the end of the line — a stabilised curve that stops
+    // short is the pulled-string bug the brush already had to fix (US-11.4).
+    CHECK(smoothed.points.back().x > 300.0);
+}
+
+TEST_CASE("a closed curve joins with no seam and no double-darkened join") {
+    // #51.3. The join is exactly the artefact `drawLineworkLayer` accumulates
+    // coverage to avoid: the last segment ends where the first begins, so a
+    // rasteriser that composited per stamp would put two layers of a
+    // semi-transparent line on the one pixel and leave a dark dot there.
+    LineStroke ring;
+    ring.width         = 6.0f;
+    ring.minWidthRatio = 1.0f;                      // even width, so alpha is comparable
+    ring.colour        = StraightRgba8{0, 0, 0, 128};
+    ring.points.push_back(LinePoint{32.0, 32.0, 1.0f});
+    ring.points.push_back(LinePoint{96.0, 32.0, 1.0f});
+    ring.points.push_back(LinePoint{96.0, 96.0, 1.0f});
+    ring.points.push_back(LinePoint{32.0, 96.0, 1.0f});
+
+    LineworkContent open;
+    open.strokes.push_back(ring);
+    Document unclosed = lineworkDocument(open);
+    (void)drawLineworkLayer(unclosed.layers[0], open, unclosed.width, unclosed.height);
+
+    LineworkContent shut;
+    shut.strokes.push_back(ring);
+    shut.strokes[0].closed = true;
+    Document closed = lineworkDocument(shut);
+    (void)drawLineworkLayer(closed.layers[0], shut, closed.width, closed.height);
+
+    // No seam: a point well inside the closing segment — asked of the same
+    // `samplePoints` the rasteriser walks, rather than guessed from the control
+    // points, because the spline bulges past a corner it turns — is inked when
+    // the stroke is closed and bare when it is not.
+    const std::vector<LinePoint> walk = samplePoints(shut.strokes[0], 1.0);
+    const LinePoint& onClosing = walk[walk.size() * 7 / 8];
+    const auto cx = static_cast<std::int32_t>(std::lround(onClosing.x));
+    const auto cy = static_cast<std::int32_t>(std::lround(onClosing.y));
+    CHECK(pickColour(closed, cx, cy).a > 0);
+    CHECK(pickColour(unclosed, cx, cy).a == 0);
+
+    // No double-darkening. The ring ends on the pixel it started on, so if
+    // coverage were composited per stamp rather than accumulated first, the
+    // join would carry two passes of a half-transparent line and show as a dark
+    // dot. Asked of every pixel, because the join is not the only place the
+    // closed walk visits twice.
+    std::uint8_t worst = 0;
+    for (std::int32_t y = 0; y < closed.height; ++y)
+        for (std::int32_t x = 0; x < closed.width; ++x)
+            worst = std::max(worst, pickColour(closed, x, y).a);
+    CHECK(worst == ring.colour.a);
+    CHECK(pickColour(closed, 32, 32).a == ring.colour.a);
+}
+
+TEST_CASE("a whole stroke is grabbed by its line and moved as a unit") {
+    // #51.2. `nearestPoint` answers "which handle", which is no use to an
+    // artist who wants the line itself; this is the whole-stroke answer.
+    LineworkContent content;
+    content.strokes.push_back(horizontalStroke());
+
+    // The line, not a handle: the middle of the curve is 48 px from either end.
+    const std::optional<std::size_t> grabbed = nearestStroke(content, 64.0, 66.0, 8.0);
+    REQUIRE(grabbed.has_value());
+    CHECK(*grabbed == 0);
+    CHECK(!nearestStroke(content, 64.0, 20.0, 8.0).has_value());
+
+    const LineStroke before = content.strokes[0];
+    transformStrokes(content, {0}, Transform{10.0, 20.0, 1.0, 1.0, 0.0});
+    for (std::size_t i = 0; i < before.points.size(); ++i) {
+        CHECK(content.strokes[0].points[i].x == doctest::Approx(before.points[i].x + 10.0));
+        CHECK(content.strokes[0].points[i].y == doctest::Approx(before.points[i].y + 20.0));
+    }
+    // A move is not a scale, so the line does not change thickness on the way.
+    CHECK(content.strokes[0].width == doctest::Approx(before.width));
+
+    // Indices that name nothing are ignored rather than fatal: a selection can
+    // outlive an undo that removed the stroke it pointed at.
+    transformStrokes(content, {7}, Transform{100.0, 0.0, 1.0, 1.0, 0.0});
+    CHECK(content.strokes[0].points[0].x == doctest::Approx(before.points[0].x + 10.0));
+}
+
+TEST_CASE("a stroke turns and scales about its own centre") {
+    // A diagonal, so a sign slip in the rotation shows: a horizontal line
+    // turned a quarter turn either way lands on the same two points.
+    LineworkContent content;
+    LineStroke diagonal;
+    diagonal.width = 12.0f;
+    diagonal.points.push_back(LinePoint{32.0, 32.0, 1.0f});
+    diagonal.points.push_back(LinePoint{96.0, 96.0, 1.0f});
+    content.strokes.push_back(diagonal);
+
+    // Clockwise about the centre of its own bounding box, which is the mapping
+    // `transformRegion` applies to a region of pixels — one meaning of an angle
+    // in the program, whether what is turning is a curve or a rectangle.
+    transformStrokes(content, {0}, Transform{0.0, 0.0, 1.0, 1.0, std::numbers::pi / 2.0});
+    CHECK(content.strokes[0].points[0].x == doctest::Approx(96.0));
+    CHECK(content.strokes[0].points[0].y == doctest::Approx(32.0));
+    CHECK(content.strokes[0].points[1].x == doctest::Approx(32.0));
+    CHECK(content.strokes[0].points[1].y == doctest::Approx(96.0));
+
+    // The width scales with the geometry: a curve blown up to twice the size
+    // that kept a 12 px line is not the same drawing enlarged.
+    transformStrokes(content, {0}, Transform{0.0, 0.0, 2.0, 2.0, 0.0});
+    CHECK(content.strokes[0].width == doctest::Approx(24.0f));
+    CHECK(content.strokes[0].points[0].x == doctest::Approx(128.0));
+    CHECK(content.strokes[0].points[0].y == doctest::Approx(0.0));
+}
+
+TEST_CASE("recolouring a finished stroke is one undo step, curves and pixels") {
+    // #51.4, and the reason `LayerProps::linework` exists: the colour is stored
+    // per stroke and editable, so changing it is a property change that carries
+    // the re-rasterised pixels with it. Undo has to put back both, or the next
+    // edit starts from a colour that is not what is on the canvas.
+    LineworkContent content;
+    content.strokes.push_back(horizontalStroke());
+    Document doc = lineworkDocument(content);
+    (void)drawLineworkLayer(doc.layers[0], content, doc.width, doc.height);
+    const std::uint64_t asBlack = hashCanvas(doc);
+    CHECK(pickColour(doc, 64, 64) == StraightRgba8{0, 0, 0, 255});
+
+    // Exactly what the tool does: snapshot the properties, edit the curves,
+    // re-rasterise, and push the two as one record.
+    const LayerProps before = propsOf(doc.layers[0]);
+    doc.layers[0].linework->strokes[0].colour = StraightRgba8{200, 30, 40, 255};
+    UndoRecord rec = drawLineworkLayer(doc.layers[0], *doc.layers[0].linework,
+                                       doc.width, doc.height);
+    rec.structure = LayerStructureDelta{LayerChange::Properties, doc.layers[0].id, 0,
+                                        std::nullopt, before};
+    const std::size_t steps = doc.undo.size();
+    doc.undo.push(std::move(rec));
+    CHECK(doc.undo.size() == steps + 1);
+    CHECK(pickColour(doc, 64, 64) == StraightRgba8{200, 30, 40, 255});
+
+    doc.undo.undo(doc);
+    REQUIRE(doc.layers[0].linework.has_value());
+    CHECK(doc.layers[0].linework->strokes[0].colour == StraightRgba8{0, 0, 0, 255});
+    CHECK(hashCanvas(doc) == asBlack);
+}
+
 TEST_CASE("linework composites for the screen exactly as it does for the export") {
     // #1 again. The proof is that turning the layer into a plain raster one
     // changes nothing: the compositor never knew the difference.
@@ -5768,6 +6245,7 @@ TEST_CASE("a linework layer round-trips through .sable") {
     curve.width         = 9.25f;
     curve.minWidthRatio = 0.35f;
     curve.colour        = StraightRgba8{12, 34, 56, 210};
+    curve.closed        = true;
     curve.points.push_back(LinePoint{10.5, 20.25, 0.25f});
     curve.points.push_back(LinePoint{60.0, 90.0, 1.0f});
     curve.points.push_back(LinePoint{100.75, 30.5, 0.5f});
@@ -5793,6 +6271,9 @@ TEST_CASE("a linework layer round-trips through .sable") {
     CHECK(out.colour == curve.colour);
     CHECK(out.width == doctest::Approx(curve.width));
     CHECK(out.minWidthRatio == doctest::Approx(curve.minWidthRatio));
+    // A shape that comes back open is a shape the artist has to close again by
+    // hand, and the pixels would no longer be what the curves rasterise to.
+    CHECK(out.closed == curve.closed);
     REQUIRE(out.points.size() == curve.points.size());
     for (std::size_t i = 0; i < out.points.size(); ++i) {
         CHECK(out.points[i].x == doctest::Approx(curve.points[i].x));
@@ -5866,4 +6347,307 @@ TEST_CASE("a curve through unevenly spaced points does not loop") {
         CHECK(at.x <= 201.5);
         CHECK(at.y == doctest::Approx(100.0).epsilon(0.001));
     }
+}
+
+// ----------------------------------------------------------- layer masks (#48)
+
+namespace {
+
+/// Paints into a layer's MASK with the ordinary brush, which is the whole
+/// bargain #48 struck: a mask tile is a tile, so this is `paintSquare` with one
+/// flag flipped and no second paint path anywhere behind it.
+void paintMaskSquare(Document& doc, LayerId id, StraightRgba8 grey, double x,
+                     double y, float size = 40.0f) {
+    Layer* layer = doc.layerById(id);
+    REQUIRE(layer != nullptr);
+    REQUIRE(layer->mask.has_value());
+    BrushPreset p = defaultPencil();
+    p.size     = size;
+    p.hardness = 1.0f;
+    p.pressure = PressureMapping{};
+    p.pressure.toSize = false;
+
+    Stroke s;
+    std::vector<Dab> scratch;
+    beginStroke(s, p, grey, id);
+    PaintTarget target{*layer,     s.pending, s.touched, doc.width,
+                       doc.height, nullptr,   nullptr,   true};
+    paintSample(s, target, at(x, y), scratch);
+    doc.undo.push(std::move(s.pending));
+}
+
+}  // namespace
+
+TEST_CASE("a mask hides the layer's pixels without destroying them") {
+    Document doc = makeDocument(120, 80, StraightRgba8{255, 255, 255, 255});
+    const LayerId id = doc.activeLayer;
+    paintSquare(doc, id, StraightRgba8{255, 0, 0, 255}, 40.0, 40.0);
+    const std::size_t painted = doc.layerById(id)->tiles.size();
+
+    // A new mask hides nothing: `outside` is 255 and it has no tiles at all,
+    // which is what stops "add a mask" costing a megabyte on a big canvas.
+    doc.layerById(id)->mask.emplace();
+    CHECK(doc.layerById(id)->mask->tiles.empty());
+    CHECK(pickColour(doc, 40, 40) == StraightRgba8{255, 0, 0, 255});
+
+    // Black hides. The pixels are untouched — that is the difference between a
+    // mask and the alpha D-027 folded one into.
+    paintMaskSquare(doc, id, StraightRgba8{0, 0, 0, 255}, 40.0, 40.0);
+    CHECK(pickColour(doc, 40, 40) == StraightRgba8{255, 255, 255, 255});
+    CHECK(doc.layerById(id)->tiles.size() == painted);
+    CHECK(doc.layerById(id)->find(TileKey{0, 0})->pixel(40, 40).a == 65535);
+
+    // And switching the mask off brings the layer straight back, which is the
+    // capability the baked version could not offer at any price.
+    doc.layerById(id)->mask->enabled = false;
+    CHECK(pickColour(doc, 40, 40) == StraightRgba8{255, 0, 0, 255});
+}
+
+TEST_CASE("a mask stroke on a layer with no mask paints nothing at all") {
+    // The tool stays switched on when the artist selects another layer, so the
+    // alternative is a stroke landing in the pixels of a layer they were not
+    // looking at — undoable, and invisible until much later.
+    Document doc = makeDocument(60, 60, StraightRgba8{255, 255, 255, 255});
+    Layer& layer = *doc.active();
+    const std::uint64_t before = hashCanvas(doc);
+
+    Stroke s;
+    std::vector<Dab> scratch;
+    beginStroke(s, defaultPencil(), StraightRgba8{0, 0, 0, 255}, layer.id);
+    PaintTarget target{layer,      s.pending, s.touched, doc.width,
+                       doc.height, nullptr,   nullptr,   true};
+    paintSample(s, target, at(30.0, 30.0), scratch);
+
+    CHECK(s.pending.empty());
+    CHECK(layer.tiles.empty());
+    CHECK(hashCanvas(doc) == before);
+}
+
+TEST_CASE("mask coverage scales the layer rather than switching it") {
+    // Half coverage is half the layer, not half of it rounded to on or off —
+    // this is what a soft-edged mask is made of, and what `clipToBelow` (a
+    // boolean borrowing another layer's alpha) has never been able to express.
+    Document doc = makeDocument(64, 64, StraightRgba8{0, 0, 0, 255});
+    const LayerId id = doc.activeLayer;
+    paintSquare(doc, id, StraightRgba8{255, 255, 255, 255}, 32.0, 32.0);
+    doc.layerById(id)->mask.emplace();
+    paintMaskSquare(doc, id, StraightRgba8{128, 128, 128, 255}, 32.0, 32.0);
+
+    CHECK(maskCoverage(*doc.layerById(id)->mask, 32, 32) == 128);
+    const StraightRgba8 seen = pickColour(doc, 32, 32);
+    CHECK(seen.r == 128);
+    CHECK(seen.g == 128);
+    CHECK(seen.b == 128);
+}
+
+TEST_CASE("pickColour and flatten agree with masks in play") {
+    // The agreement `compositeLevel` and `pickLevel` are pinned to, with every
+    // shape of mask the compositor has a separate branch for: a masked raster
+    // layer, a clipped layer over a masked base — whose clip has to come from
+    // the MASKED alpha — and a mask on a folder, which applies to what the
+    // group composited to and to nothing else.
+    Document doc = makeDocument(90, 70, StraightRgba8{200, 210, 220, 255});
+    const LayerId base = doc.activeLayer;
+    paintSquare(doc, base, StraightRgba8{255, 0, 0, 255}, 30.0, 30.0);
+    doc.layerById(base)->mask.emplace();
+    paintMaskSquare(doc, base, StraightRgba8{90, 90, 90, 255}, 36.0, 30.0, 30.0f);
+
+    doc.undo.push(addLayerAbove(doc, base, "Clipped"));
+    const LayerId clip = doc.activeLayer;
+    paintSquare(doc, clip, StraightRgba8{0, 255, 0, 255}, 40.0, 30.0);
+    doc.layerById(clip)->clipToBelow = true;
+
+    doc.undo.push(addLayerAbove(doc, clip, "Group"));
+    const LayerId group = doc.activeLayer;
+    doc.layerById(group)->kind = LayerKind::Folder;
+    doc.layerById(group)->mask.emplace();
+    doc.layerById(group)->mask->outside = 200;
+    doc.undo.push(addLayerAbove(doc, group, "In group"));
+    doc.layerById(doc.activeLayer)->parent = group;
+    paintSquare(doc, doc.activeLayer, StraightRgba8{0, 0, 255, 255}, 55.0, 40.0);
+    paintMaskSquare(doc, group, StraightRgba8{40, 40, 40, 255}, 60.0, 40.0, 24.0f);
+
+    const std::vector<StraightRgba8> full = flatten(doc);
+    for (std::int32_t y = 0; y < doc.height; ++y)
+        for (std::int32_t x = 0; x < doc.width; ++x)
+            REQUIRE(pickColour(doc, x, y) ==
+                    full[static_cast<std::size_t>(y) * doc.width + x]);
+}
+
+TEST_CASE("a mask stroke is one undo step, and undoing it is exact") {
+    Document doc = makeDocument(80, 80, StraightRgba8{255, 255, 255, 255});
+    const LayerId id = doc.activeLayer;
+    paintSquare(doc, id, StraightRgba8{0, 0, 255, 255}, 40.0, 40.0);
+    doc.layerById(id)->mask.emplace();
+    const std::uint64_t shown = hashCanvas(doc);
+
+    paintMaskSquare(doc, id, StraightRgba8{0, 0, 0, 255}, 40.0, 40.0);
+    const std::uint64_t hidden = hashCanvas(doc);
+    CHECK(hidden != shown);
+
+    doc.undo.undo(doc);
+    CHECK(hashCanvas(doc) == shown);
+    // Undoing the first mask stroke on a tile REMOVES it, or the mask stops
+    // being sparse in exactly the way D-005 exists to prevent.
+    CHECK(doc.layerById(id)->mask->tiles.empty());
+    doc.undo.redo(doc);
+    CHECK(hashCanvas(doc) == hidden);
+
+    // A second stroke snapshots the tile that is now there, and it costs the
+    // budget a whole tile — because a mask tile IS one, which is the entire
+    // reason `UndoRecord::memoryBytes` needed no case for it.
+    const std::size_t history = doc.undo.memoryBytes();
+    paintMaskSquare(doc, id, StraightRgba8{255, 255, 255, 255}, 20.0, 20.0);
+    CHECK(doc.undo.memoryBytes() >= history + tileBytes(ColourDepth::Bits8));
+}
+
+TEST_CASE("deleting a mask is one undoable step, pixels and all") {
+    Document doc = makeDocument(80, 80, StraightRgba8{255, 255, 255, 255});
+    const LayerId id = doc.activeLayer;
+    paintSquare(doc, id, StraightRgba8{0, 128, 0, 255}, 40.0, 40.0);
+    doc.layerById(id)->mask.emplace();
+    doc.layerById(id)->mask->outside = 90;
+    paintMaskSquare(doc, id, StraightRgba8{0, 0, 0, 255}, 40.0, 40.0);
+    const std::uint64_t masked = hashCanvas(doc);
+
+    doc.undo.push(deleteLayerMask(doc, id));
+    CHECK(!doc.layerById(id)->mask.has_value());
+    const std::uint64_t bare = hashCanvas(doc);
+    CHECK(bare != masked);
+
+    doc.undo.undo(doc);
+    REQUIRE(doc.layerById(id)->mask.has_value());
+    CHECK(doc.layerById(id)->mask->outside == 90);      // the flags came back
+    CHECK(hashCanvas(doc) == masked);                   // and so did the pixels
+
+    doc.undo.redo(doc);
+    CHECK(!doc.layerById(id)->mask.has_value());
+    CHECK(hashCanvas(doc) == bare);
+}
+
+TEST_CASE("an ordinary property change leaves the mask alone") {
+    // `applyProps` is what deletes a mask, so every OTHER caller has to carry
+    // the current flags through it. If `propsOf` ever stops doing that, renaming
+    // a layer silently throws its mask away.
+    Document doc = makeDocument(60, 60, StraightRgba8{255, 255, 255, 255});
+    const LayerId id = doc.activeLayer;
+    paintSquare(doc, id, StraightRgba8{0, 0, 0, 255}, 30.0, 30.0);
+    doc.layerById(id)->mask.emplace();
+    paintMaskSquare(doc, id, StraightRgba8{0, 0, 0, 255}, 30.0, 30.0);
+    const std::size_t tiles = doc.layerById(id)->mask->tiles.size();
+    REQUIRE(tiles > 0);
+
+    LayerProps renamed = propsOf(*doc.layerById(id));
+    renamed.name = "Renamed";
+    doc.undo.push(setLayerProps(doc, id, renamed));
+    REQUIRE(doc.layerById(id)->mask.has_value());
+    CHECK(doc.layerById(id)->mask->tiles.size() == tiles);
+}
+
+TEST_CASE("a mask survives a .sable round trip") {
+    // #48's first acceptance criterion: paint, mask, save, reload, same canvas.
+    Document doc = makeDocument(300, 200, StraightRgba8{250, 250, 250, 255});
+    const LayerId id = doc.activeLayer;
+    paintSquare(doc, id, StraightRgba8{200, 40, 90, 255}, 140.0, 100.0);
+    doc.layerById(id)->mask.emplace();
+    doc.layerById(id)->mask->outside = 210;
+    paintMaskSquare(doc, id, StraightRgba8{30, 30, 30, 255}, 150.0, 100.0);
+    const std::uint64_t before = hashCanvas(doc);
+
+    const auto path = scratchFile("mask_roundtrip.sable");
+    REQUIRE(saveProject(doc, path).has_value());
+    const auto back = loadProject(path);
+    REQUIRE(back.has_value());
+    REQUIRE(back->layers.size() == 1);
+    REQUIRE(back->layers[0].mask.has_value());
+    CHECK(back->layers[0].mask->outside == 210);
+    CHECK(back->layers[0].mask->enabled);
+    CHECK(hashCanvas(*back) == before);
+}
+
+TEST_CASE("cloning and duplicating carry the mask") {
+    // cloneDocument is the autosave hand-off (D-013). Without the mask the
+    // recovery file opens showing everything the artist masked away, which is
+    // a different painting from the one that was lost.
+    Document doc = makeDocument(80, 80, StraightRgba8{255, 255, 255, 255});
+    const LayerId id = doc.activeLayer;
+    paintSquare(doc, id, StraightRgba8{10, 20, 200, 255}, 40.0, 40.0);
+    doc.layerById(id)->mask.emplace();
+    paintMaskSquare(doc, id, StraightRgba8{0, 0, 0, 255}, 40.0, 40.0);
+
+    const Document copy = cloneDocument(doc);
+    REQUIRE(copy.layers[0].mask.has_value());
+    CHECK(hashCanvas(copy) == hashCanvas(doc));
+
+    const UndoRecord duplicated = duplicateLayer(doc, id);
+    CHECK(!duplicated.empty());
+    REQUIRE(doc.layers.size() == 2);
+    CHECK(doc.layers[1].mask.has_value());
+}
+
+TEST_CASE("merging down bakes the upper layer's mask into the pixels") {
+    // The upper layer stops existing, so its mask has to go somewhere or the
+    // merge puts back on screen exactly what the artist masked away.
+    Document doc = makeDocument(80, 80, StraightRgba8{255, 255, 255, 255});
+    const LayerId base = doc.activeLayer;
+    paintSquare(doc, base, StraightRgba8{255, 255, 255, 255}, 40.0, 40.0);
+    doc.undo.push(addLayerAbove(doc, base, "Top"));
+    const LayerId top = doc.activeLayer;
+    paintSquare(doc, top, StraightRgba8{0, 0, 0, 255}, 40.0, 40.0);
+    doc.layerById(top)->mask.emplace();
+    paintMaskSquare(doc, top, StraightRgba8{128, 128, 128, 255}, 40.0, 40.0);
+
+    const std::uint64_t before = hashCanvas(doc);
+    doc.undo.push(mergeLayerDown(doc, top));
+    REQUIRE(doc.layers.size() == 1);
+    CHECK(hashCanvas(doc) == before);          // not one pixel moved
+}
+
+TEST_CASE("a mask on a 16-bit document is still an 8-bit mask") {
+    // Coverage is eight bits everywhere it is stored, read or exported, so a
+    // 16-bit document must not pay double the undo budget for shades of grey
+    // nothing can show (D-023's own argument, applied to the mask).
+    Document doc = makeDocument(80, 80, StraightRgba8{255, 255, 255, 255},
+                                ColourDepth::Bits16);
+    const LayerId id = doc.activeLayer;
+    paintSquare(doc, id, StraightRgba8{200, 0, 0, 255}, 40.0, 40.0);
+    doc.layerById(id)->mask.emplace();
+    paintMaskSquare(doc, id, StraightRgba8{0, 0, 0, 255}, 40.0, 40.0);
+
+    const Tile* maskTile = doc.layerById(id)->mask->find(TileKey{0, 0});
+    REQUIRE(maskTile != nullptr);
+    CHECK(maskTile->depth() == ColourDepth::Bits8);
+    CHECK(doc.layerById(id)->find(TileKey{0, 0})->depth() == ColourDepth::Bits16);
+    CHECK(pickColour(doc, 40, 40) == StraightRgba8{255, 255, 255, 255});
+}
+
+TEST_CASE("an ORA export bakes the mask into the alpha it writes") {
+    // OpenRaster has no mask element — a layer is a PNG and nothing else — so
+    // the choice is between a file that looks like the painting and one that
+    // shows what the artist masked away. The .sable keeps the editable version.
+    Document doc = makeDocument(80, 80, StraightRgba8{255, 255, 255, 255});
+    const LayerId id = doc.activeLayer;
+    paintSquare(doc, id, StraightRgba8{200, 30, 30, 255}, 40.0, 40.0);
+    doc.layerById(id)->mask.emplace();
+    paintMaskSquare(doc, id, StraightRgba8{0, 0, 0, 255}, 40.0, 40.0);
+
+    const auto path = scratchFile("mask_export.ora");
+    REQUIRE(exportDocument(doc, path).has_value());
+    const auto back = importDocument(path);
+    REQUIRE(back.has_value());
+    CHECK(!back->layers[0].mask.has_value());     // nowhere to put one
+
+    // Within a step, not identical: baking multiplies straight alpha once and
+    // the compositor scales a premultiplied colour, so the soft edge of the
+    // brush rounds the other way on a handful of pixels.
+    const std::vector<StraightRgba8> ours   = flatten(doc);
+    const std::vector<StraightRgba8> theirs = flatten(*back);
+    REQUIRE(ours.size() == theirs.size());
+    int worst = 0;
+    for (std::size_t i = 0; i < ours.size(); ++i)
+        worst = std::max({worst, std::abs(ours[i].r - theirs[i].r),
+                          std::abs(ours[i].g - theirs[i].g),
+                          std::abs(ours[i].b - theirs[i].b),
+                          std::abs(ours[i].a - theirs[i].a)});
+    CHECK(worst <= 2);
 }

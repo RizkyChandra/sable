@@ -18,7 +18,7 @@ layout(local_size_x = 16, local_size_y = 16) in;
 // The two brush masks, packed four texels to a uint: the stamp first, then the
 // grain. A storage buffer and not the uniform block, because SDL_gpu.h says in
 // as many words not to put more than "a matrix or so" in a uniform — 8 KiB of
-// mask there paints the wrong picture on radv rather than failing (D-029).
+// mask there paints the wrong picture on radv rather than failing (D-032).
 layout(std430, set = 0, binding = 0) readonly buffer Masks { uint mask[]; };
 layout(std430, set = 1, binding = 0) buffer Arena { uint arena[]; };
 

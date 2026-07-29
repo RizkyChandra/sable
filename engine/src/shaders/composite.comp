@@ -20,6 +20,9 @@ layout(std430, set = 0, binding = 0) readonly buffer Arena  { uint arena[]; };
 layout(std430, set = 1, binding = 0) writeonly buffer Dest { uint dest[]; };
 
 const uint kNoSlot = 0xFFFFFFFFu;
+/// An arena slot as the op list carries it: sixteen bits, so one op can name
+/// both a layer's tile and its mask tile (#48).
+const uint kNoSlot16 = 0xFFFFu;
 
 // Deeper nesting than this falls back to the CPU compositor on the host. The
 // arrays below are dynamically indexed, so every extra level costs private
@@ -27,8 +30,11 @@ const uint kNoSlot = 0xFFFFFFFFu;
 const int kMaxDepth = 4;
 const int kMaxOps   = 192;
 
-// ops[i]: x = kind, y = arena slot (kNoSlot for a layer with no tile here),
-//         z = blend mode | clipToBelow << 8, w = float bits of opacity.
+// ops[i]: x = kind,
+//         y = tile slot | mask tile slot << 16 (kNoSlot16 in either half means
+//             "nothing here" — no pixels, or no mask tile),
+//         z = blend mode | clipToBelow << 8 | hasMask << 9 | mask default << 16,
+//         w = float bits of opacity.
 // kind: 0 draw a layer, 1 open a folder, 2 close one, 3 drop the clip mask.
 layout(std140, set = 2, binding = 0) uniform Params {
     uvec4 head;    // x: op count, y: destination slot, z: packed background
@@ -70,6 +76,9 @@ void main() {
             continue;
         }
 
+        uint tileSlot = op.y & kNoSlot16;
+        uint maskSlot = op.y >> 16u;
+
         uvec4 src;
         if (op.x == 2u) {                       // close a folder
             src = dst;                          // what the group composited to
@@ -77,18 +86,34 @@ void main() {
             dst   = stackDst[sp];
             clipA = stackClip[sp];              // the enclosing level's mask
         } else {
-            src = op.y == kNoSlot ? uvec4(0u)
-                                  : unpackRgba(arena[op.y * 65536u + pix]);
+            src = tileSlot == kNoSlot16 ? uvec4(0u)
+                                        : unpackRgba(arena[tileSlot * 65536u + pix]);
         }
 
         uint mode        = op.z & 255u;
         bool clipToBelow = ((op.z >> 8u) & 1u) != 0u;
         bool clipped     = clipToBelow && clipA != kNoSlot;
         float opacity    = uintBitsToFloat(op.w);
-        uint own         = src.w;               // read before opacity scaling
+
+        // #48, and `compositeLevel` in io.cpp line for line: coverage is the
+        // mask tile's RED channel, or the mask's default colour where it has no
+        // tile, and it folds into the same `scale` the opacity and the clip
+        // already share — one rounding, not three. A folder's mask lands here
+        // too, on the op that closes it.
+        float cover = 1.0;
+        if (((op.z >> 9u) & 1u) != 0u) {
+            uint cov = maskSlot == kNoSlot16
+                ? ((op.z >> 16u) & 255u)
+                : unpackRgba(arena[maskSlot * 65536u + pix]).x;
+            cover = float(cov) / 255.0;
+        }
+        // The alpha the clip mask publishes is the MASKED one: a clipped layer
+        // must not show through a pixel its base has hidden. Read before the
+        // opacity scaling, as it always was.
+        uint own = cover < 1.0 ? scale8(src.w, cover) : src.w;
 
         if (src.w != 0u) {
-            float scale = opacity;
+            float scale = opacity * cover;
             if (clipped) scale *= float(clipA) / 255.0;
             if (scale > 0.0) {
                 if (scale < 1.0) src = scale8v(src, scale);

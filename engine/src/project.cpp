@@ -63,8 +63,8 @@ TextAlign alignFromName(const std::string& name) {
     return TextAlign::Left;
 }
 
-std::string tilePath(LayerId layer, TileKey key) {
-    return "layers/" + std::to_string(layer) + "/tiles/" +
+std::string tilePath(LayerId layer, TileKey key, bool mask = false) {
+    return "layers/" + std::to_string(layer) + (mask ? "/mask/" : "/tiles/") +
            std::to_string(key.first) + "_" + std::to_string(key.second) + ".png";
 }
 
@@ -218,8 +218,11 @@ std::expected<void, Error> saveProject(const Document& doc,
     // the newer format — and then the version gate on load is what makes an
     // older reader say "written by a newer version of Sable" instead of reading
     // half-width tiles as though they were the whole picture.
-    manifest["format_version"] = doc.depth == ColourDepth::Bits16
-                                     ? SABLE_FORMAT_VERSION
+    const bool anyMask = std::ranges::any_of(
+        doc.layers, [](const Layer& l) { return l.mask.has_value(); });
+    manifest["format_version"] = anyMask ? SABLE_FORMAT_VERSION_MASK
+                               : doc.depth == ColourDepth::Bits16
+                                     ? SABLE_FORMAT_VERSION_16BIT
                                      : SABLE_FORMAT_VERSION_8BIT;
     manifest["app"]            = "Sable 0.1.0";
     manifest["width"]          = doc.width;
@@ -312,6 +315,10 @@ std::expected<void, Error> saveProject(const Document& doc,
                 strokes.push_back({{"colour", hexColour(stroke.colour)},
                                    {"width", stroke.width},
                                    {"min_width", stroke.minWidthRatio},
+                                   // No format bump for this: a reader that has
+                                   // never heard of it still sees the closed
+                                   // shape, because the tiles are what renders.
+                                   {"closed", stroke.closed},
                                    {"points", std::move(points)}});
             }
             entry["linework"] = {{"strokes", std::move(strokes)}};
@@ -337,6 +344,33 @@ std::expected<void, Error> saveProject(const Document& doc,
             if (!mz_zip_writer_add_mem(&zip, tilePath(layer.id, key).c_str(),
                                        png.data(), png.size(), MZ_NO_COMPRESSION))
                 return abort(ErrorKind::Io, "could not write a tile to " + path.string());
+        }
+
+        // The mask (#48), as ordinary tile PNGs under `mask/` rather than
+        // `tiles/`. Every transparent tile is written, unlike the pixels above:
+        // in a mask a transparent tile means "hide all of this", and dropping
+        // it would let `outside` show the layer back through the hole.
+        if (layer.mask.has_value()) {
+            std::vector<TileKey> maskKeys;
+            maskKeys.reserve(layer.mask->tiles.size());
+            for (const auto& [key, tile] : layer.mask->tiles) maskKeys.push_back(key);
+            std::ranges::sort(maskKeys);
+
+            json maskNode = {{"enabled", layer.mask->enabled},
+                             {"outside", layer.mask->outside},
+                             {"tiles", json::array()}};
+            for (const TileKey key : maskKeys) {
+                maskNode["tiles"].push_back({key.first, key.second});
+                const std::vector<unsigned char> png = encodeTile(*layer.mask->find(key));
+                if (png.empty())
+                    return abort(ErrorKind::Io,
+                                 "could not encode a mask tile of " + layer.name);
+                if (!mz_zip_writer_add_mem(&zip, tilePath(layer.id, key, true).c_str(),
+                                           png.data(), png.size(), MZ_NO_COMPRESSION))
+                    return abort(ErrorKind::Io,
+                                 "could not write a mask tile to " + path.string());
+            }
+            entry["mask"] = std::move(maskNode);
         }
         manifest["layers"].push_back(std::move(entry));
     }
@@ -531,6 +565,7 @@ std::expected<Document, Error> loadProject(const std::filesystem::path& path) {
                 stroke.colour = parseColour(s.value("colour", std::string("#000000ff")));
                 stroke.width  = std::clamp(s.value("width", 4.0f), 0.1f, 4000.0f);
                 stroke.minWidthRatio = std::clamp(s.value("min_width", 0.15f), 0.0f, 1.0f);
+                stroke.closed = s.value("closed", false);
                 if (s.contains("points") && s["points"].is_array()) {
                     for (const auto& p : s["points"]) {
                         // A point that is not three numbers is skipped rather
@@ -556,6 +591,18 @@ std::expected<Document, Error> loadProject(const std::filesystem::path& path) {
         if (layer.kind == LayerKind::Linework && !layer.linework.has_value())
             layer.kind = LayerKind::Raster;
 
+        // #48. Absent before v7 and in any v7 document whose layers have none.
+        // The mask is created here even when it has no tiles, because "a mask
+        // that hides nothing" and "no mask" are different states and only the
+        // first has somewhere to paint.
+        if (entry.contains("mask") && entry["mask"].is_object()) {
+            LayerMask mask;
+            mask.enabled = entry["mask"].value("enabled", true);
+            mask.outside = static_cast<std::uint8_t>(
+                std::clamp(entry["mask"].value("outside", 255), 0, 255));
+            layer.mask = std::move(mask);
+        }
+
         doc.nextLayerId = std::max(doc.nextLayerId, layer.id + 1);
         doc.layers.push_back(std::move(layer));
     }
@@ -574,25 +621,40 @@ std::expected<Document, Error> loadProject(const std::filesystem::path& path) {
         std::string name = stat.m_filename;
         if (!name.starts_with("layers/") || !name.ends_with(".png")) continue;
 
-        // layers/<id>/tiles/<tx>_<ty>.png
+        // layers/<id>/tiles/<tx>_<ty>.png, or layers/<id>/mask/<tx>_<ty>.png
         LayerId layerId = 0;
         int tx = 0, ty = 0;
-        if (std::sscanf(name.c_str(), "layers/%u/tiles/%d_%d.png", &layerId, &tx, &ty) != 3)
-            continue;
+        bool isMask = false;
+        if (std::sscanf(name.c_str(), "layers/%u/tiles/%d_%d.png", &layerId, &tx, &ty) != 3) {
+            if (std::sscanf(name.c_str(), "layers/%u/mask/%d_%d.png",
+                            &layerId, &tx, &ty) != 3)
+                continue;
+            isMask = true;
+        }
 
         Layer* layer = doc.layerById(layerId);
         if (layer == nullptr) { repaired = true; continue; }
+        // A mask tile whose manifest entry was lost still says the layer has a
+        // mask — the ZIP is the truth (see above), and a mask that hides half
+        // the layer is the sort of thing a half-written file should keep.
+        if (isMask && !layer->mask.has_value()) {
+            layer->mask.emplace();
+            repaired = true;
+        }
 
         std::size_t size = 0;
         void* data = mz_zip_reader_extract_to_heap(&zip, i, &size, 0);
         if (data == nullptr) { repaired = true; continue; }
 
-        Tile tile(doc.depth);
+        // A mask tile is always 8-bit, whatever the document's depth: coverage
+        // is eight bits everywhere it is stored, read or exported (#48).
+        Tile tile(isMask ? ColourDepth::Bits8 : doc.depth);
         const bool ok = decodeTile(static_cast<const unsigned char*>(data), size, tile);
         mz_free(data);
         if (!ok) { repaired = true; continue; }       // one bad tile, not a bad file
 
-        layer->tiles.insert_or_assign(TileKey{tx, ty}, std::move(tile));
+        TileMap& into = isMask ? layer->mask->tiles : layer->tiles;
+        into.insert_or_assign(TileKey{tx, ty}, std::move(tile));
     }
     (void)repaired;   // recorded for a future "this file was repaired" notice
 

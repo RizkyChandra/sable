@@ -67,6 +67,16 @@ public:
     [[nodiscard]] virtual UndoRecord transformRegion(Document& doc, LayerId target,
                                                      const Selection& source,
                                                      const Transform& transform) = 0;
+
+    /// The one writer here that is NOT pure, and deliberately (#49). Its body
+    /// is `readback` and then the host implementation — which is exactly what
+    /// every backend without a shader for it would otherwise write out by hand,
+    /// as `GpuBackend` already does for `fillSelection` and `transformRegion`.
+    /// A GPU override remains a pure optimisation, and forgetting to write one
+    /// is a slow gradient rather than a missing tool.
+    [[nodiscard]] virtual UndoRecord gradientFill(Document& doc, LayerId target,
+                                                  const Gradient& gradient);
+
     [[nodiscard]] virtual UndoRecord clearLayer(Layer& layer) = 0;
     [[nodiscard]] virtual UndoRecord mergeLayerDown(Document& doc, LayerId id) = 0;
 
