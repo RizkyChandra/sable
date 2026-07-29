@@ -128,8 +128,9 @@ clever.
 ### Build it
 
 You need a C++23 compiler (GCC 14 / Clang 18 or newer), CMake 3.24+, Ninja and
-SDL3. The first configure fetches Dear ImGui, lodepng, miniz, nlohmann/json and
-doctest, so it needs network access once.
+SDL3. The first configure fetches Dear ImGui, lodepng, miniz, nlohmann/json,
+Little CMS and doctest, so it needs network access once. Every one of them is
+MIT, zlib or public domain.
 
 ```sh
 cmake -S . -B build -G Ninja
@@ -142,7 +143,7 @@ fast loop, and the first thing CI gates on:
 
 ```sh
 cmake -S . -B build -G Ninja -DSABLE_BUILD_APP=OFF && cmake --build build
-ctest --test-dir build --output-on-failure     # 215 cases
+ctest --test-dir build --output-on-failure     # 261 cases
 ```
 
 Worth running before you open a pull request:

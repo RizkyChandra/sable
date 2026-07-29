@@ -723,6 +723,7 @@ selection.png                          8-bit greyscale coverage mask, when there
 selections/<n>.png                     the same, for stored selection n (D-033)
 layers/<layerId>/tiles/<tx>_<ty>.png   one PNG per non-empty tile, straight alpha
 layers/<layerId>/mask/<tx>_<ty>.png    one PNG per allocated mask tile (D-031)
+colour.icc                             the embedded ICC profile, if any (D-034)
 ```
 
 ```jsonc
@@ -732,6 +733,8 @@ layers/<layerId>/mask/<tx>_<ty>.png    one PNG per allocated mask tile (D-031)
   "width": 1024, "height": 1024, "dpi": 72,
   "background": "#ffffff",
   "tile_size": 256,
+  // "profile" is present only on a tagged document; without it "space" is
+  // exactly "sRGB" and the document is untagged, as every v1 file is.
   "colour": { "depth": 8, "space": "sRGB", "premultiplied": true },
   "layers": [
     { "id": 1, "kind": "raster", "name": "Sketch",
@@ -776,19 +779,23 @@ Rules:
   version 3 `selection`, version 4 `"kind": "text"` and the `text` object
   beside it, version 5 `"kind": "linework"` and the `linework` object beside
   it, version 6 16-bit colour, version 7 layer masks, version 8 the
-  `selections` array. Everything each adds is optional, so v1 to v7 files still
-  load unchanged.
+  `selections` array, version 9 an embedded ICC profile. Everything each adds
+  is optional, so v1 to v7 files still load unchanged.
 - **Version 6 is written only by a 16-bit document, version 7 only by a
-  document with a layer mask, and version 8 only by one carrying stored
-  selections.** Every earlier bump was unconditional because each added
-  something an ordinary document might contain; depth, masks and stored
-  selections are per-document choices most documents never make. An 8-bit
-  document with none of them keeps declaring 5, so saving from a build that has
-  all three does not lock an ordinary painting out of an older Sable in
-  exchange for nothing — and a file an older Sable genuinely would misread is
-  still refused by name. A masked document needs that most: an older Sable
-  would open it, show every layer unmasked, and write the masks away on the
-  next save. Stored selections would go the same way.
+  document with a layer mask, version 8 only by one carrying stored selections,
+  and version 9 only by one carrying an ICC profile.** Every earlier bump was
+  unconditional because each added something an ordinary document might
+  contain; depth, masks, stored selections and a colour profile are
+  per-document choices most documents never make. An 8-bit document with none
+  of them keeps declaring 5, so saving from a build that has all four does not
+  lock an ordinary painting out of an older Sable in exchange for nothing — and
+  a file an older Sable genuinely would misread is still refused by name. A
+  masked document needs that most: an older Sable would open it, show every
+  layer unmasked, and write the masks away on the next save. Stored selections
+  would go the same way, and a tagged document worse still — it would come back
+  a differently-coloured file.
+- The four are a ladder, not a set: a version is one number, so a document that
+  is tagged AND carries stored selections declares the highest it needs.
 - Each entry of `selections` is the `selection` object plus a `name` and, when
   it has a coverage mask, the `file` that holds it. Named rather than derived
   from the array position because an entry can be dropped on the way out — an
@@ -804,6 +811,15 @@ Rules:
 - `colour.depth` is 8 or 16 (D-023). At 16 the tile PNGs are 16 bits per
   channel, which PNG carries natively, so they stay openable in any image
   viewer. Absent, or anything that is not 16, means 8.
+- `colour.profile` names the container entry holding the document's ICC profile,
+  and is always `"colour.icc"` when present (D-034). Absent means untagged,
+  which means sRGB — what every file written before version 8 says, and what a
+  new document still is. `colour.space` is then the profile's own description
+  rather than the constant `"sRGB"` D-105 wrote. The profile is stored, not
+  deflated, so `unzip -p x.sable colour.icc` hands a working profile to any
+  colour tool. A profile that will not parse, or that is not RGB, is dropped
+  with a warning and the document opens as sRGB — never as a canvas holding
+  bytes nothing can build a transform from.
 - `"mask": true` means `selection.png` holds the coverage, one byte per pixel of
   the selection's own w x h. A selection whose mask will not decode, or decodes
   at the wrong size, is DROPPED rather than downgraded to its rectangle: a

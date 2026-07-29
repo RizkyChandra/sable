@@ -3,6 +3,8 @@
 #include "sbl/backend.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <system_error>
 
@@ -264,6 +266,43 @@ StraightRgba8 CpuBackend::pickColour(const Document& doc, std::int32_t x,
     return pickLevel(doc, std::nullopt, x, y, doc.background.premultiply()).unpremultiply();
 }
 
+IccProfile iccProfileFromPng(const void* bytes, std::size_t size) {
+    // 8 signature bytes, then chunks. Anything shorter is not a PNG, and
+    // lodepng's chunk walkers assume they are given at least a chunk header.
+    if (bytes == nullptr || size < 8 + 12) return {};
+    const auto* png = static_cast<const unsigned char*>(bytes);
+    const unsigned char* end = png + size;
+    const unsigned char* chunk =
+        lodepng_chunk_find_const(png + 8, end, "iCCP");
+    if (chunk == nullptr) return {};
+
+    const unsigned length = lodepng_chunk_length(chunk);
+    const unsigned char* data = lodepng_chunk_data_const(chunk);
+    // Compared as a size, not as `data + length > end`: the length is four
+    // bytes some other program wrote, and forming the past-the-end pointer to
+    // test it is undefined before it is false.
+    if (length > static_cast<std::size_t>(end - data)) return {};
+
+    // iCCP: a NUL-terminated name, one compression-method byte that must be 0,
+    // then the zlib stream. A name running to the end of the chunk leaves no
+    // profile, which is malformed rather than empty — either way, nothing.
+    const auto* nul = static_cast<const unsigned char*>(
+        std::memchr(data, 0, length));
+    if (nul == nullptr) return {};
+    const std::size_t headerLen = static_cast<std::size_t>(nul - data) + 2;
+    if (headerLen >= length || nul[1] != 0) return {};
+
+    unsigned char* out = nullptr;
+    std::size_t outSize = 0;
+    const unsigned rc = lodepng_zlib_decompress(
+        &out, &outSize, data + headerLen, length - headerLen,
+        &lodepng_default_decompress_settings);
+    IccProfile profile;
+    if (rc == 0 && out != nullptr) profile.data.assign(out, out + outSize);
+    std::free(out);          // lodepng allocates with malloc, not new
+    return profile;
+}
+
 std::expected<void, Error> exportPng(const Document& doc,
                                      const std::filesystem::path& path) {
     if (doc.width <= 0 || doc.height <= 0)
@@ -272,10 +311,38 @@ std::expected<void, Error> exportPng(const Document& doc,
     // Exactly the canvas dimensions — not the viewport, and unaffected by zoom.
     const std::vector<StraightRgba8> pixels = flatten(doc);
 
-    const unsigned rc = lodepng::encode(
-        path.string(),
-        reinterpret_cast<const unsigned char*>(pixels.data()),
-        static_cast<unsigned>(doc.width), static_cast<unsigned>(doc.height));
+    // A State rather than the four-argument encode, so the profile has
+    // somewhere to go. The three lines below are what `lodepng_encode_memory`
+    // sets for itself, so an untagged document still produces the byte-identical
+    // PNG it produced before this existed (D-034) — including lodepng's
+    // auto_convert, which is why a flat black-and-white export is still a small
+    // greyscale file.
+    lodepng::State state;
+    state.info_raw.colortype       = LCT_RGBA;
+    state.info_raw.bitdepth        = 8;
+    state.info_png.color.colortype = LCT_RGBA;
+    state.info_png.color.bitdepth  = 8;
+
+    // No profile is written for an untagged document, deliberately. A bare PNG
+    // already means sRGB by convention, so tagging one would change every
+    // existing export's bytes to say what readers already assume — and #53's
+    // first requirement is that nothing about existing work changes. A document
+    // that actually carries a profile is the case where downstream was guessing.
+    std::vector<unsigned char> profile;
+    if (!doc.colourProfile.empty()) {
+        profile = std::vector<unsigned char>(doc.colourProfile.data.begin(),
+                                             doc.colourProfile.data.end());
+        // lodepng requires a name of 1..79 printable bytes; "ICC profile" is
+        // what libpng and Photoshop write and needs no escaping.
+        lodepng_set_icc(&state.info_png, "ICC profile", profile.data(),
+                        static_cast<unsigned>(profile.size()));
+    }
+
+    std::vector<unsigned char> png;
+    unsigned rc = lodepng::encode(
+        png, reinterpret_cast<const unsigned char*>(pixels.data()),
+        static_cast<unsigned>(doc.width), static_cast<unsigned>(doc.height), state);
+    if (rc == 0) rc = lodepng::save_file(png, path.string());
     if (rc == 0) return {};
 
     // 79 is lodepng's "failed to open file for writing". Everything else that

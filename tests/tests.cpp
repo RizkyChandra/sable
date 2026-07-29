@@ -37,6 +37,7 @@
 #include "sbl/select.hpp"
 #include "sbl/text.hpp"
 
+#include "lcms2.h"    // the colour tests BUILD the profiles they convert
 #include "lodepng.h"
 // App-side, but deliberately SDL-free so the view transform is testable here.
 #include "view_transform.hpp"
@@ -4999,6 +5000,388 @@ TEST_CASE("GPU against CPU on a large canvas with many layers"
     }
 }
 
+// ------------------------------------------------------- colour management
+//
+// D-034, superseding D-105. The order of these cases is the order of the
+// argument: the first is that nothing changed, and the rest are only allowed
+// to be true because that one is.
+
+namespace {
+
+/// Restores whatever display profile was in force. Every case below installs
+/// one, and doctest runs them all in one process — a case that leaked its
+/// monitor into the next would turn every later composite into a converted one.
+struct DisplayProfileGuard {
+    IccProfile saved = displayProfile();
+    ~DisplayProfileGuard() { setDisplayProfile(saved); }
+};
+
+/// A profile built from primaries and a gamma rather than committed as a blob:
+/// the nine numbers below ARE the assertion, and a reader can check them
+/// against the published definitions without unpacking a binary first.
+IccProfile rgbProfile(double gamma, double rx, double ry, double gx, double gy,
+                      double bx, double by) {
+    const cmsCIExyY white{0.3127, 0.3290, 1.0};          // D65
+    const cmsCIExyYTRIPLE primaries{{rx, ry, 1.0}, {gx, gy, 1.0}, {bx, by, 1.0}};
+    cmsToneCurve* curve = cmsBuildGamma(nullptr, gamma);
+    REQUIRE(curve != nullptr);
+    cmsToneCurve* curves[3]{curve, curve, curve};
+    cmsHPROFILE handle = cmsCreateRGBProfile(&white, &primaries, curves);
+    cmsFreeToneCurve(curve);
+    REQUIRE(handle != nullptr);
+
+    cmsUInt32Number size = 0;
+    REQUIRE(cmsSaveProfileToMem(handle, nullptr, &size) != 0);
+    IccProfile profile;
+    profile.data.resize(size);
+    REQUIRE(cmsSaveProfileToMem(handle, profile.data.data(), &size) != 0);
+    profile.data.resize(size);
+    cmsCloseProfile(handle);
+    return profile;
+}
+
+/// Adobe RGB (1998). Gamma 563/256, and a green primary well outside sRGB —
+/// which is what makes a skipped conversion visible.
+IccProfile adobeRgb() {
+    return rgbProfile(563.0 / 256.0, 0.6400, 0.3300, 0.2100, 0.7100, 0.1500, 0.0600);
+}
+
+/// sRGB's primaries with a plain 2.2 curve — near enough for tests that are
+/// about the primaries, and it stands in for "the monitor" below.
+IccProfile srgbLike() {
+    return rgbProfile(2.2, 0.6400, 0.3300, 0.3000, 0.6000, 0.1500, 0.0600);
+}
+
+/// Display P3: the same blue as sRGB, a much wider red and green.
+IccProfile displayP3() {
+    return rgbProfile(2.2, 0.6800, 0.3200, 0.2650, 0.6900, 0.1500, 0.0600);
+}
+
+Document tinyDocument(StraightRgba8 fill) {
+    Document doc = makeDocument(64, 64, fill);
+    paintSquare(doc, doc.activeLayer, StraightRgba8{200, 40, 60, 255}, 30.0, 30.0);
+    return doc;
+}
+
+}  // namespace
+
+TEST_CASE("colour management changes nothing about an untagged document") {
+    // THE acceptance criterion (#53): whatever this feature does, existing work
+    // must open and look exactly as it did. It holds structurally rather than
+    // numerically — with no display profile in force there is no transform for
+    // anything to be rounded by, so the display path hands back the
+    // compositor's own bytes.
+    DisplayProfileGuard guard;
+    setDisplayProfile(IccProfile{});
+
+    const Document doc = tinyDocument(StraightRgba8{255, 255, 255, 255});
+    CHECK(doc.colourProfile.empty());
+    CHECK(profileDescription(doc.colourProfile) == "sRGB");
+
+    // Byte for byte, not within a tolerance.
+    const std::vector<PremulRgba8> raw =
+        cpuBackend().compositeRect(doc, 0, 0, doc.width, doc.height);
+    CHECK(compositeRect(doc, 0, 0, doc.width, doc.height) == raw);
+
+    // And the conversion declines outright rather than running an identity.
+    std::vector<PremulRgba8> scratch = raw;
+    CHECK(convertToDisplay(doc.colourProfile, scratch.data(), scratch.size()) == false);
+    CHECK(scratch == raw);
+
+    // Even with a monitor named, a document tagged with that very profile is
+    // already in the display's space and must not be round-tripped through a
+    // transform at all. `false` rather than "the numbers happened to come back
+    // the same": lcms2's identity is bit-exact today, so only the declining is
+    // observable, and it is what stops a tagged document paying for a
+    // conversion — and risking a rounding — on every repaint of every tile.
+    setDisplayProfile(adobeRgb());
+    Document same = tinyDocument(StraightRgba8{255, 255, 255, 255});
+    same.colourProfile = adobeRgb();
+    std::vector<PremulRgba8> untouched =
+        cpuBackend().compositeRect(same, 0, 0, same.width, same.height);
+    CHECK(convertToDisplay(same.colourProfile, untouched.data(), untouched.size())
+          == false);
+    CHECK(compositeRect(same, 0, 0, same.width, same.height) == untouched);
+}
+
+TEST_CASE("a v1-era .sable still opens as the sRGB document it always was") {
+    // D-105 put `"colour": {"space": "sRGB"}` in every manifest so this build
+    // could tell v1 files apart. Telling them apart has to mean leaving them
+    // alone: no profile entry, so no profile, so no conversion.
+    DisplayProfileGuard guard;
+    setDisplayProfile(IccProfile{});
+
+    const auto path = scratchFile("sable_v1_colour.sable");
+    const Document doc = tinyDocument(StraightRgba8{240, 230, 220, 255});
+    REQUIRE(saveProject(doc, path).has_value());
+
+    mz_zip_archive zip{};
+    REQUIRE(mz_zip_reader_init_file(&zip, path.string().c_str(), 0));
+    std::size_t size = 0;
+    void* data = mz_zip_reader_extract_file_to_heap(&zip, "document.json", &size, 0);
+    REQUIRE(data != nullptr);
+    const nlohmann::json manifest =
+        nlohmann::json::parse(std::string(static_cast<const char*>(data), size));
+    mz_free(data);
+    // Nothing new in the container either: an untagged document writes exactly
+    // the file it wrote before D-034.
+    CHECK(mz_zip_reader_locate_file(&zip, "colour.icc", nullptr, 0) < 0);
+    mz_zip_reader_end(&zip);
+
+    CHECK(manifest["colour"]["space"] == "sRGB");
+    CHECK(manifest["colour"].contains("profile") == false);
+    CHECK(manifest["format_version"] == SABLE_FORMAT_VERSION_8BIT);
+
+    const auto back = loadProject(path);
+    REQUIRE(back.has_value());
+    CHECK(back->colourProfile.empty());
+    CHECK(compositeRect(*back, 0, 0, back->width, back->height) ==
+          compositeRect(doc, 0, 0, doc.width, doc.height));
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("a tagged document round-trips its profile through .sable") {
+    const auto path = scratchFile("sable_tagged.sable");
+    Document doc = tinyDocument(StraightRgba8{255, 255, 255, 255});
+    doc.colourProfile = adobeRgb();
+    REQUIRE(saveProject(doc, path).has_value());
+
+    const auto back = loadProject(path);
+    REQUIRE(back.has_value());
+    CHECK(back->colourProfile == doc.colourProfile);
+    CHECK(back->warnings.empty());
+    // The pixels are the artist's numbers and survive untouched: a load that
+    // converted would repaint the file every time it was opened.
+    CHECK(cpuBackend().compositeRect(*back, 0, 0, 64, 64) ==
+          cpuBackend().compositeRect(doc, 0, 0, 64, 64));
+
+    mz_zip_archive zip{};
+    REQUIRE(mz_zip_reader_init_file(&zip, path.string().c_str(), 0));
+    std::size_t size = 0;
+    void* data = mz_zip_reader_extract_file_to_heap(&zip, "document.json", &size, 0);
+    REQUIRE(data != nullptr);
+    const nlohmann::json manifest =
+        nlohmann::json::parse(std::string(static_cast<const char*>(data), size));
+    mz_free(data);
+    mz_zip_reader_end(&zip);
+    CHECK(manifest["colour"]["profile"] == "colour.icc");
+    CHECK(manifest["colour"]["space"] != "sRGB");     // the profile's own name
+    // Only a tagged file claims the newer format, for the same reason only a
+    // 16-bit one does: an older Sable would read this document as sRGB and
+    // write the profile away on the next save.
+    CHECK(manifest["format_version"] == SABLE_FORMAT_VERSION_ICC);
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("a project claiming a profile it cannot supply loads as sRGB and says so") {
+    // A hand-edited or truncated manifest must not produce a document holding
+    // bytes no transform can be built from — that is a canvas which silently
+    // stops being managed halfway through a session.
+    const auto path = scratchFile("sable_badprofile.sable");
+    Document doc = tinyDocument(StraightRgba8{255, 255, 255, 255});
+    doc.colourProfile.data.assign(600, 0x7F);      // long enough, not a profile
+    CHECK(isUsableProfile(doc.colourProfile) == false);
+    REQUIRE(saveProject(doc, path).has_value());
+
+    const auto back = loadProject(path);
+    REQUIRE(back.has_value());
+    CHECK(back->colourProfile.empty());
+    CHECK(back->warnings.size() == 1);
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("an untagged document on a wide-gamut display stops reading oversaturated") {
+    // #53's second cost, and the one most artists actually hit: sRGB values
+    // sent untagged to a Display P3 monitor are stretched to its gamut and
+    // everything looks too saturated. The fix is that a pure sRGB green is sent
+    // to that monitor as a MIXTURE — some red and blue — so it lands on the
+    // colour sRGB meant.
+    //
+    // Stated as properties rather than a table of numbers somebody would have
+    // to take on trust: neutrals stay neutral, saturated colours pull in by a
+    // lot, the conversion inverts, and alpha is never touched. A wrong matrix,
+    // a swapped white point or a transposed primary breaks at least one.
+    DisplayProfileGuard guard;
+    setDisplayProfile(displayP3());
+
+    // The source is the untagged document itself — empty means sRGB, so this
+    // is exactly the "untagged file on a wide-gamut screen" case.
+    const IccProfile untagged;
+    const auto toDisplay = [&](StraightRgba8 c) {
+        PremulRgba8 px = c.premultiply();
+        REQUIRE(convertToDisplay(untagged, &px, 1));
+        return px.unpremultiply();
+    };
+
+    // A neutral grey has no colour to shift. If it comes out tinted the two
+    // white points do not match, and then every colour in the document is
+    // wrong rather than only the saturated ones.
+    const StraightRgba8 grey = toDisplay(StraightRgba8{128, 128, 128, 255});
+    CHECK(std::abs(int{grey.r} - int{grey.g}) <= 2);
+    CHECK(std::abs(int{grey.g} - int{grey.b}) <= 2);
+    CHECK(std::abs(int{grey.r} - 128) <= 4);
+
+    // Pure sRGB green is not pure P3 green. Sending 0,200,0 through untouched
+    // is precisely the oversaturation the issue describes, so the red channel
+    // coming back at zero is the bug and a substantial value is the fix.
+    const StraightRgba8 green = toDisplay(StraightRgba8{0, 200, 0, 255});
+    CHECK(green.r > 40);
+    CHECK(green.b > 20);
+    // Same for red, which P3 also widens.
+    CHECK(toDisplay(StraightRgba8{255, 0, 0, 255}).g > 20);
+
+    // And it inverts: a P3 document on an sRGB monitor comes back to where it
+    // started. A conversion that is not invertible is one throwing colour away
+    // in a direction nobody chose.
+    //
+    // On a colour comfortably inside both gamuts, deliberately. Round-tripping
+    // the green above would be measuring 8-bit quantisation at the very edge of
+    // sRGB, where a channel sitting at 0 has nowhere below it to round to —
+    // that is the format's limit, not the transform's.
+    const StraightRgba8 midtone{120, 90, 60, 255};
+    PremulRgba8 out = midtone.premultiply();
+    REQUIRE(convertToDisplay(untagged, &out, 1));
+    CHECK(out.unpremultiply() != midtone);          // it did go somewhere
+
+    setDisplayProfile(srgbLike());
+    const IccProfile p3 = displayP3();
+    REQUIRE(convertToDisplay(p3, &out, 1));
+    const StraightRgba8 recovered = out.unpremultiply();
+    CHECK(std::abs(int{recovered.r} - int{midtone.r}) <= 2);
+    CHECK(std::abs(int{recovered.g} - int{midtone.g}) <= 2);
+    CHECK(std::abs(int{recovered.b} - int{midtone.b}) <= 2);
+
+    // Alpha is never a colour and is never touched, including the exact zero
+    // tests/differential.cpp insists on.
+    PremulRgba8 clear{0, 0, 0, 0};
+    CHECK(convertToDisplay(p3, &clear, 1));
+    CHECK(clear.a == 0);
+    PremulRgba8 half = StraightRgba8{200, 40, 60, 128}.premultiply();
+    CHECK(convertToDisplay(p3, &half, 1));
+    CHECK(half.a == 128);
+}
+
+TEST_CASE("a PSD carries its profile in and out, without touching the pixels") {
+    const auto path = scratchFile("colour.psd");
+    Document doc = tinyDocument(StraightRgba8{255, 255, 255, 255});
+    doc.colourProfile = displayP3();
+    REQUIRE(exportDocument(doc, path).has_value());
+
+    const auto back = importDocument(path);
+    REQUIRE(back.has_value());
+    CHECK(back->colourProfile == doc.colourProfile);
+    CHECK(profileDescription(back->colourProfile) != "sRGB");
+
+    // Walking the resource section must leave the cursor exactly where
+    // skipping it used to. The layer section starts immediately after, so one
+    // byte out costs the whole file — which is what this equality is really
+    // checking, over and above "the pixels survived". (The export writes an
+    // extra opaque background layer, hence not comparing layer counts.)
+    const std::vector<StraightRgba8> before = flatten(doc);
+    const std::vector<StraightRgba8> after  = flatten(*back);
+    REQUIRE(before.size() == after.size());
+    CHECK(before == after);
+    CHECK(!back->layers.empty());
+
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
+TEST_CASE("an untagged PSD still opens untagged") {
+    // The fixtures are what an ordinary file looks like: no profile resource,
+    // so no profile, so no warning and nothing to convert.
+    const auto flat = importDocument(testData("flat.psd"));
+    REQUIRE(flat.has_value());
+    CHECK(flat->colourProfile.empty());
+    CHECK(flat->warnings.empty());
+
+    const auto layered = importDocument(testData("layered.psd"));
+    REQUIRE(layered.has_value());
+    CHECK(layered->colourProfile.empty());
+}
+
+TEST_CASE("a PNG export carries the profile, and an untagged one carries none") {
+    Document doc = tinyDocument(StraightRgba8{255, 255, 255, 255});
+
+    const auto plain = scratchFile("colour_plain.png");
+    REQUIRE(exportPng(doc, plain).has_value());
+    std::vector<unsigned char> bytes;
+    REQUIRE(lodepng::load_file(bytes, plain.string()) == 0);
+    CHECK(iccProfileFromPng(bytes.data(), bytes.size()).empty());
+
+    doc.colourProfile = adobeRgb();
+    const auto tagged = scratchFile("colour_tagged.png");
+    REQUIRE(exportPng(doc, tagged).has_value());
+    REQUIRE(lodepng::load_file(bytes, tagged.string()) == 0);
+    CHECK(iccProfileFromPng(bytes.data(), bytes.size()) == doc.colourProfile);
+
+    // The pixels are the same either way: a tag says what the numbers mean, it
+    // does not change them.
+    std::vector<unsigned char> a, b;
+    unsigned w = 0, h = 0;
+    REQUIRE(lodepng::decode(a, w, h, plain.string()) == 0);
+    REQUIRE(lodepng::decode(b, w, h, tagged.string()) == 0);
+    CHECK(a == b);
+
+    // And it survives a hostile file. Every PNG Sable reads a profile out of
+    // came from somewhere else — an ORA or KRA container — so the chunk walk
+    // has to answer "nothing" rather than read off the end. Run under ASan in
+    // CI, which is what makes this case worth more than its assertions.
+    REQUIRE(lodepng::load_file(bytes, tagged.string()) == 0);
+    for (std::size_t cut : {std::size_t{0}, std::size_t{8}, std::size_t{19},
+                            bytes.size() / 2}) {
+        const std::vector<unsigned char> truncated(bytes.begin(),
+                                                   bytes.begin() + static_cast<
+                                                       std::ptrdiff_t>(cut));
+        (void)iccProfileFromPng(truncated.data(), truncated.size());
+    }
+    std::vector<unsigned char> corrupt = bytes;
+    // The iCCP chunk's length field, set to something the file cannot hold.
+    if (const std::size_t at = 8 + 25 + 4; at + 4 <= corrupt.size())
+        corrupt[at] = corrupt[at + 1] = corrupt[at + 2] = corrupt[at + 3] = 0xFF;
+    (void)iccProfileFromPng(corrupt.data(), corrupt.size());
+    CHECK(iccProfileFromPng(nullptr, 0).empty());
+    const unsigned char notAPng[] = {'n', 'o', 't', ' ', 'a', ' ', 'p', 'n', 'g',
+                                     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    CHECK(iccProfileFromPng(notAPng, sizeof notAPng).empty());
+
+    std::error_code ec;
+    std::filesystem::remove(plain, ec);
+    std::filesystem::remove(tagged, ec);
+}
+
+TEST_CASE("a Krita document brings its embedded profile with it") {
+    // The fixture is a real .kra written by Krita, and it carries a profile at
+    // <document>/annotations/icc — which every Krita file has, including the
+    // ones whose profile is plain sRGB.
+    const auto doc = importDocument(std::filesystem::path(SABLE_FIXTURE_DIR) / "krita.kra");
+    REQUIRE(doc.has_value());
+    CHECK(!doc->colourProfile.empty());
+    CHECK(isUsableProfile(doc->colourProfile));
+
+    // The ORA beside it carries none, and stays untagged rather than acquiring
+    // one from somewhere.
+    const auto ora =
+        importDocument(std::filesystem::path(SABLE_FIXTURE_DIR) / "krita.ora");
+    REQUIRE(ora.has_value());
+    CHECK(ora->colourProfile.empty());
+}
+
+TEST_CASE("a document's profile survives the autosave hand-off") {
+    // cloneDocument is what the background save gets. A clone that lost the
+    // profile would write a recovery file that opens as a different painting —
+    // the failure the depth copy beside it already exists to prevent.
+    Document doc = tinyDocument(StraightRgba8{255, 255, 255, 255});
+    doc.colourProfile = displayP3();
+    CHECK(cloneDocument(doc).colourProfile == doc.colourProfile);
+}
+
 /// LeakSanitizer asks this at exit, not at startup, so the answer can depend
 /// on whether a GPU device was actually created.
 ///
@@ -5770,14 +6153,31 @@ TEST_CASE("only a 16-bit file claims the newer format version") {
     REQUIRE(saveProject(maskedDoc, maskedPath).has_value());
     CHECK(manifestOf(maskedPath)["format_version"] == SABLE_FORMAT_VERSION_MASK);
     CHECK(SABLE_FORMAT_VERSION_MASK > SABLE_FORMAT_VERSION_16BIT);
-    // #52 took the same deal one further; the newest known is now theirs.
-    CHECK(SABLE_FORMAT_VERSION == SABLE_FORMAT_VERSION_STORED);
+
+    // #52 took the same deal one further.
     CHECK(SABLE_FORMAT_VERSION_STORED > SABLE_FORMAT_VERSION_MASK);
+
+    // And D-034 takes it again, with the sharpest version of the same problem:
+    // an older Sable would open a Display P3 document, read its numbers as
+    // sRGB, and drop the profile on the next save — the artist's file quietly
+    // becomes a differently-coloured one. An untagged document is what every
+    // Sable has always assumed, so it declares nothing new.
+    const auto taggedPath = dir / "sable_tagged_version.sable";
+    Document taggedDoc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+    // Any non-empty profile: what the version turns on is that the document
+    // HAS one, not what is in it. A real profile is built and converted through
+    // in the colour cases further down.
+    taggedDoc.colourProfile.data.assign(600, 0x7F);
+    REQUIRE(saveProject(taggedDoc, taggedPath).has_value());
+    CHECK(manifestOf(taggedPath)["format_version"] == SABLE_FORMAT_VERSION_ICC);
+    CHECK(SABLE_FORMAT_VERSION_ICC > SABLE_FORMAT_VERSION_STORED);
+    CHECK(SABLE_FORMAT_VERSION == SABLE_FORMAT_VERSION_ICC);    // the newest known
 
     std::error_code ec;
     std::filesystem::remove(narrowPath, ec);
     std::filesystem::remove(widePath, ec);
     std::filesystem::remove(maskedPath, ec);
+    std::filesystem::remove(taggedPath, ec);
 }
 
 TEST_CASE("a 16-bit document composites, picks and exports") {
