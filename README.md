@@ -1,52 +1,133 @@
 # Sable
 
+**A small, fast painting program for Linux.**
+
 [![CI](https://github.com/RizkyChandra/sable/actions/workflows/ci.yml/badge.svg)](https://github.com/RizkyChandra/sable/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/RizkyChandra/sable)](https://github.com/RizkyChandra/sable/releases/latest)
+[![Licence: MIT](https://img.shields.io/badge/licence-MIT-blue)](LICENSE)
 
-A lightweight open-source raster painting application for Linux.
-C++23 · SDL3 · Dear ImGui · MIT.
+Sable opens in well under a second, gets out of your way, and runs on the laptop
+you already have. It is for the artist who wants to sketch for twenty minutes
+and close it again — not to configure a workspace first.
 
-Fast pen response and a small interface, on ordinary hardware. Inspired by
-PaintTool SAI's feel, built from original code.
+C++23 · SDL3 · Dear ImGui · MIT licensed · no account, no telemetry, no network.
 
-**Status: v2 — competing with PaintTool SAI 2 directly.**
+---
 
-Canvas with pan, zoom and rotation, in 8-bit or 16-bit colour. Pencil, opaque,
-airbrush, marker, watercolour and smudge brushes. Pen pressure with editable
-curves, per-device calibration and a pulled-string stabilizer. Layers with 13
-blend modes, clipping, groups, linework and text. Rectangle, lasso and
-magic-wand selection. Bucket fill, transform, perspective and symmetry
-rulers.
+## For artists
 
-**Reads and writes other applications' files:** PSD (layered, both directions,
-with layer masks), OpenRaster, and Krita `.kra` (read). Its own `.sable` is a
-plain ZIP of PNG tiles you can open with `unzip`.
+### Get it
 
-**Painting runs on the CPU or the GPU, your choice** (*View → Paint and
-composite on the GPU*). The CPU path stays the default and the reference
-implementation; the GPU is roughly 100× faster on a large multi-layer
-composite. A test suite compares the two backends pixel for pixel on 32
-scenarios and fails on any colour difference over one level, or any alpha
-difference at all — so what you paint is what you save whichever you use. If no
-GPU is available, Sable says so in the status bar and keeps working.
+Grab a build from the [latest release](https://github.com/RizkyChandra/sable/releases/latest).
 
-Crash recovery that never overwrites your file. Dockable panels, reassignable
-keys for every action, interface scaling, light and dark themes.
+| You have | Take this |
+|---|---|
+| **Linux**, any distribution | `Sable-x86_64.AppImage` — `chmod +x` it and run. Nothing to install. |
+| **Linux**, prefer an archive | `sable-linux-x86_64.tar.gz` |
+| **Windows** 10 or 11 | `sable-windows-x86_64.zip` |
+| **macOS**, Apple silicon or Intel | `sable-macos-universal.zip` |
 
-**One requirement remains unmet, and it is the important one: US-00.** The
-stylus spike has never been run, on any platform, because no tablet was
-available at any point during development. Every claim about pressure, tilt and
-sample rate is verified against *synthetic* input only. The engine maths has
-204 tests behind it; the hardware path has none. **Run US-00 before trusting
-the pen.** It is half a day, and `docs/DECISION-LOG.md` D-002a is the recorded
-fallback if it fails.
+SDL3 is linked in, so there is nothing to install alongside. Check your download
+against `SHA256SUMS` if you like.
 
-Windows and macOS builds compile and pass CI, but nobody has painted a stroke
-in either by hand, and neither is signed or notarised.
+### What it does
 
-## Build
+Paint with a **pencil, opaque brush, airbrush, marker, watercolour or smudge**,
+in 8-bit or 16-bit colour. Pressure from a graphics tablet drives brush size and
+density through a curve you shape yourself, with a stabilizer for steady line
+art.
 
-Needs a C++23 compiler (GCC 14 / Clang 18 or newer), CMake 3.24+, Ninja, and
-SDL3. Dear ImGui and lodepng are fetched at configure time.
+Work in **layers** — 13 blend modes, clipping, folders, plus text layers you can
+re-edit and linework layers whose curves stay adjustable after you draw them.
+Select with a **rectangle, lasso or magic wand**, then fill, transform or paint
+inside it. Draw along **perspective and symmetry rulers**. Rotate the canvas to
+whatever angle your hand prefers.
+
+**Your files stay yours.** Sable saves `.sable` projects, imports and exports
+**Photoshop PSD** (layers, groups, masks) and **OpenRaster**, and reads **Krita
+`.kra`**. A `.sable` file is an ordinary ZIP — run `unzip -l` on one and you will
+find a readable JSON manifest and one PNG per painted tile. Nothing about your
+artwork is locked inside this program.
+
+**It tries hard not to lose your work.** While a drawing has unsaved changes,
+Sable writes a recovery copy every couple of minutes on a background thread,
+into its own directory. It never writes over your file, and restoring is always
+something you choose. Undo is capped at 256 MB by default, and if it ever has to
+drop old steps it says so in the status bar rather than doing it quietly.
+
+### Getting around
+
+| | |
+|---|---|
+| Draw | Left mouse button, or the pen |
+| Sample a colour | `Alt` + click |
+| Pan / zoom | `Space` + drag or middle-drag / scroll wheel |
+| Rotate canvas | `,` and `.` — `Ctrl+Shift+0` to straighten |
+| Fit / actual size | `Ctrl+0` / `Ctrl+Alt+0` |
+| Brush, eraser | `B`, `E` — or just turn the pen over |
+| Fill, select, lasso, wand | `G`, `M`, `L`, `W` |
+| Transform, text, linework | `T`, `F`, `V` |
+| Brush size | `[` and `]`, or the slider |
+| Swap / reset colours | `X` / `C` |
+| Fill selection / clear layer | `Backspace` / `Delete` |
+| Undo / redo / deselect | `Ctrl+Z` / `Ctrl+Y` / `Ctrl+D` |
+| Open / save / export | `Ctrl+O` / `Ctrl+S` / `Ctrl+E` |
+
+**Every one of those can be changed.** *View → Keyboard and interface* rebinds
+any action and scales the whole interface for a large or small display.
+Right-click a brush-size preset to set it to your current size.
+
+*View* also holds the **pressure calibration curve** and a **tablet test pad** —
+if the pen feels wrong, look there first. It shows raw and normalised pressure
+side by side, which is how you tell a tablet problem from a calibration one.
+
+### Painting on the GPU
+
+*View → Paint and composite on the GPU* moves painting and layer compositing to
+your graphics card. On a large multi-layer canvas it is roughly a hundred times
+faster.
+
+It is **off by default, and the CPU stays the reference implementation.** A test
+suite compares the two across 32 scenarios and fails on any colour difference
+above one level, or any alpha difference at all — so a picture is the same
+picture whichever one drew it. If your machine has no usable GPU, Sable says so
+in the status bar and carries on.
+
+### Things to know before you rely on it
+
+**Tablet support has never been tested on a tablet.** Not on any platform. No
+hardware was available while Sable was written, so every claim about pressure,
+tilt and sample rate is verified against simulated input only. The drawing
+engine has 215 automated tests behind it; the pen path has none. If your tablet
+works, that is good news rather than a guarantee — please
+[open an issue](https://github.com/RizkyChandra/sable/issues) either way.
+
+**Sable is not screen-reader accessible.** Its interface toolkit provides no
+AT-SPI integration, and that was accepted knowingly when the toolkit was chosen
+([D-002](docs/DECISION-LOG.md)). Full keyboard operability and interface scaling
+are offered instead. This is a real gap, recorded as a decision rather than left
+as an oversight.
+
+**Windows and macOS builds are unproven.** They compile and pass the automated
+tests, but nobody has painted a stroke in either by hand, and neither is signed —
+Windows SmartScreen will warn, and macOS needs permission under *Privacy &
+Security*.
+
+Preferences and recovery files live under `$XDG_DATA_HOME/sable` and
+`$XDG_STATE_HOME/sable`: plain text and ordinary ZIPs, safe to inspect or delete.
+
+---
+
+## For contributors
+
+You are welcome here, and the codebase is arranged to be readable before it is
+clever.
+
+### Build it
+
+You need a C++23 compiler (GCC 14 / Clang 18 or newer), CMake 3.24+, Ninja and
+SDL3. The first configure fetches Dear ImGui, lodepng, miniz, nlohmann/json and
+doctest, so it needs network access once.
 
 ```sh
 cmake -S . -B build -G Ninja
@@ -54,120 +135,88 @@ cmake --build build
 ./build/sable
 ```
 
-The first configure needs network access: Dear ImGui, lodepng, miniz,
-nlohmann/json and doctest are fetched by CMake rather than vendored (D-014).
-SDL3 must already be installed.
-
-To build only the engine and its tests — no SDL3, no display server, which is
-what CI's fast job does:
+The engine builds and tests **with no SDL and no display server**. This is the
+fast loop, and the first thing CI gates on:
 
 ```sh
 cmake -S . -B build -G Ninja -DSABLE_BUILD_APP=OFF && cmake --build build
+ctest --test-dir build --output-on-failure     # 215 cases
 ```
 
-Run the tests — they are headless and need no display server:
+Worth running before you open a pull request:
 
 ```sh
-ctest --test-dir build --output-on-failure
+SDL_VIDEODRIVER=offscreen ./build/sable --selftest     # drives the real app, headless
+cmake -S . -B build-asan -G Ninja -DSABLE_ASAN=ON -DSABLE_BUILD_APP=OFF
+cmake --build build-asan && ./build-asan/engine_tests   # ASan + UBSan
 ```
 
-Check the SDL and ImGui wiring without a window:
-
-```sh
-SDL_VIDEODRIVER=offscreen ./build/sable --selftest
-```
-
-Install, or build a self-contained AppImage:
-
-```sh
-sudo cmake --install build            # /usr/local by default
-packaging/build-appimage.sh           # -> Sable-x86_64.AppImage, ~3.7 MB
-```
-
-Sanitizers, as the cross-cutting requirements ask for:
-
-```sh
-cmake -S . -B build-asan -G Ninja -DSABLE_ASAN=ON && cmake --build build-asan
-./build-asan/engine_tests
-```
-
-## Using it
-
-| | |
-|---|---|
-| Draw | Left mouse button, or the pen |
-| Sample a colour | `Alt` + click |
-| Pan | Space + drag, or middle mouse button |
-| Zoom | Scroll wheel, about the cursor |
-| Fit / actual size | `Ctrl+0` / `Ctrl+Alt+0` |
-| Brush / eraser | `B` / `E` — or just turn the pen over |
-| Brush size | `[` and `]`, or the slider |
-| Swap / reset colours | `X` / `D` |
-| Fill / select tool | `G` / `M` |
-| Text tool | `F` — then click, or press Enter to place it in the middle |
-| Undo / redo | `Ctrl+Z` / `Ctrl+Y` |
-| New canvas | `Ctrl+N` |
-| Open / save project | `Ctrl+O` / `Ctrl+S` |
-| Export PNG | `Ctrl+E` |
-| Quit | `Ctrl+Q` |
-
-**Every one of those is reassignable** — *View → Keyboard and interface*, which
-also holds the interface scale. Those two are the accessibility commitment the
-PRD makes in place of screen-reader support, so they are features rather than
-preferences.
-
-**Text** goes on a layer of its own and stays editable: select that layer, press
-the tool's key, and the words come back. Typing goes through SDL's text-input
-events rather than a UI text field, so an input method composes straight onto
-the canvas — the half-finished characters appear underlined at the caret. A text
-layer refuses paint until *Rasterise text* in the layer panel gives up the words
-and keeps the picture.
-
-Right-click a size preset to set it to the current brush size. **View** opens
-the pressure calibration curve and the tablet test pad — the test pad is where
-to look first if the pen feels wrong, and it says so plainly when no tablet is
-present rather than showing zeros.
-
-Projects save as `.sable`, which is a ZIP: `unzip -l yours.sable` lists a JSON
-manifest and one PNG per painted tile, all openable in any image viewer. That
-is deliberate (D-011) — save bugs are debuggable without writing a parser.
-
-While a document has unsaved changes Sable writes a recovery copy under
-`$XDG_STATE_HOME/sable/recovery` every couple of minutes, on a worker thread
-holding its own private copy of the document. It **never** writes over your
-file, and restoring is always something you choose (D-013).
-
-Undo history is capped at 256 MB by default, adjustable in *View → Keyboard
-and interface*. Ordinary work never reaches it; if it ever does, the oldest
-steps go first and the status bar says how many (D-017).
-
-Preferences live in `$XDG_DATA_HOME/sable/sable/settings.conf` (usually
-`~/.local/share/...`), alongside `layout.ini` for the panel arrangement. Both
-are plain text, safe to edit or delete.
-
-Every action is reachable from the keyboard. Dear ImGui has no AT-SPI
-integration, so Sable is **not screen-reader accessible** — a known gap,
-accepted knowingly as the cost of the input layer, with keyboard operability
-as the compensation. See `docs/PRD.md` §6.
-
-## Layout
+### How it is arranged
 
 ```
-engine/     static library. Links NO SDL, NO ImGui — a stray SDL include
-            here fails to build rather than being caught at review time.
-app/        SDL3 + ImGui: event loop, canvas viewport, menus, dialogs.
-tests/      doctest unit tests, all runnable headless.
-docs/       the specification. Start with docs/README.md.
+engine/     The painting engine. Pure C++23 — tiles, layers, brushes, undo,
+            file formats. Testable with no window and no graphics driver.
+app/        SDL3 + Dear ImGui: event loop, canvas view, panels, input.
+tests/      215 doctest cases, all headless. differential.cpp compares the
+            CPU and GPU backends against one another.
+docs/       The specification. Start at docs/README.md.
+packaging/  Desktop entry, icon, AppStream metadata, AppImage script.
 ```
 
-## Documentation
+The canvas is **sparse 256×256 tiles** in premultiplied RGBA, so memory follows
+the painted area rather than the canvas size — a 4000×4000 document with a mark
+in one corner allocates a handful of tiles. Compositing runs on the CPU by
+default; the GPU backend is a second implementation behind the same interface.
+The main loop **blocks** when nobody is drawing, so an idle window costs nothing.
 
-`docs/README.md` is the entry point. In short: `PRD.md` is what we are
-building and what is out of scope, `DECISION-LOG.md` is which option we picked
-and why, `DATA-MODEL.md` is the types the engine owns, and `USER-STORIES.md`
-is the acceptance criteria this milestone was built against.
+### Read the decision log
 
-## Originality
+`docs/DECISION-LOG.md` holds 31 entries answering *"why is it like this?"* — why
+premultiplied and straight colour are different C++ types, why the undo budget
+counts bytes and not steps, why the GPU is opt-in. If something looks odd, the
+reason is usually written down.
 
-No PaintTool SAI source, icons, brush textures, bundled assets, interface
-artwork, or project-format internals. See `docs/DECISION-LOG.md` D-010.
+It has one rule: **append, never edit a decided entry.** If a decision changes,
+add a new one and mark the old superseded. That history is what lets you argue
+with this codebase instead of guessing at it.
+
+### What a change is expected to carry
+
+- **Tests.** Non-trivial logic gets one that fails without your change. Several tests here were validated by deliberately breaking the code to confirm they caught it — that is the standard.
+- **Green CI.** Five jobs: engine tests, ASan + UBSan, the application build, ThreadSanitizer on the background save, and packaging metadata.
+- **No warnings.** `-Wall -Wextra -Wpedantic`, and the tree is clean today.
+- **Comments that explain *why*.** The code already says what it does.
+- **Agreement between backends.** If you touch a pixel path, `tests/differential.cpp` must still pass, or a drawing changes depending on a setting.
+- **Your own gaps, named.** A pull request that says what it did not do is worth more than one that quietly leaves it out.
+
+### Good places to start
+
+Browse the [open issues](https://github.com/RizkyChandra/sable/issues). Two in
+particular:
+
+- **[#47 — brush shapes and textures](https://github.com/RizkyChandra/sable/issues/47)** are declared in `BrushPreset` and read by nothing, so every dab is round. Self-contained, a large effect on how the brushes feel, and a good way to learn the dab path.
+- **[#16 — run the stylus spike](https://github.com/RizkyChandra/sable/issues/16).** If you own a graphics tablet you can close the single largest unknown in this project in an afternoon. `docs/USER-STORIES.md` US-00 spells out what to check, and the tablet test pad already displays most of it.
+
+Reports are as valuable as code. If a `.psd` opens wrong or your tablet behaves
+strangely, that is worth an issue.
+
+### The documentation
+
+`docs/README.md` is the entry point. In short: **PRD.md** is what is being built
+and what is deliberately out of scope; **DECISION-LOG.md** is every choice and
+its cost; **DATA-MODEL.md** is the types the engine owns and the `.sable`
+format; **USER-STORIES.md** is the acceptance criteria the first milestones were
+built against.
+
+---
+
+## Originality and licence
+
+MIT — see [LICENSE](LICENSE). Every dependency is MIT, zlib or public domain.
+
+Sable was inspired by PaintTool SAI's *feel* and contains none of its code,
+icons, brush textures, artwork or file-format internals, and neither reads nor
+writes `.sai2`. The application icon is drawn by Sable's own engine
+(`packaging/make-icon.cpp`). Krita `.kra` support was written from the
+documented format, never from Krita's GPL source. See
+[D-010](docs/DECISION-LOG.md) and D-020.
