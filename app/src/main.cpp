@@ -593,7 +593,32 @@ void doRedo(App& app) {
     app.doc.dirty = true;
 }
 
+/// True when "Paint on mask" is on and the tool about to run cannot honour it.
+///
+/// The brush family takes `PaintTarget::toMask` and paints the mask properly
+/// (D-031). The fill family — bucket, fill selection, gradient, clear — does
+/// not: those are `PaintBackend` methods that write layer tiles, so a mask path
+/// means changing the backend interface and both implementations, and that is
+/// its own change (#58).
+///
+/// What must not happen in the meantime is the silent version. The artist has
+/// said "I am editing the mask"; a fill that quietly lands on the artwork
+/// instead is destructive, is easy to miss until the mask is switched off, and
+/// is exactly the class of defect this project keeps finding — a control that
+/// reports one thing and does another. Refusing and saying so is worse than
+/// working and better than lying.
+bool refusesMask(App& app) {
+    const sbl::Layer* layer = app.doc.layerById(app.doc.activeLayer);
+    if (!app.paintOnMask || layer == nullptr || !layer->mask.has_value()) return false;
+    app.notices = {"Paint on mask is on, and fill, bucket, gradient and clear "
+                   "still write the layer rather than its mask (#58) — so they "
+                   "are held back. Paint the mask with a brush, or switch Paint "
+                   "on mask off to use these on the layer."};
+    return true;
+}
+
 void doClear(App& app) {
+    if (refusesMask(app)) return;
     sbl::Layer* layer = app.doc.active();
     if (layer == nullptr || layer->tiles.empty()) return;   // harmless when empty
     sbl::UndoRecord rec = sbl::clearLayer(*layer);
@@ -863,6 +888,7 @@ void endPaint(App& app) {
 }
 
 void doFill(App& app, double sx, double sy) {
+    if (refusesMask(app)) return;
     const auto x = static_cast<std::int32_t>(std::floor(toCanvasX(app.view, sx, sy)));
     const auto y = static_cast<std::int32_t>(std::floor(toCanvasY(app.view, sx, sy)));
 
@@ -877,6 +903,7 @@ void doFill(App& app, double sx, double sy) {
 }
 
 void beginGradient(App& app, double sx, double sy) {
+    if (refusesMask(app)) return;   // refuse before the drag, not after it draws
     app.gradientDragging  = true;
     app.gradientPreviewed = false;
     app.gradientAnchorX   = toCanvasX(app.view, sx, sy);
@@ -1360,6 +1387,7 @@ void handleKey(App& app, const SDL_KeyboardEvent& key) {
         case Action::Redo:  doRedo(app); break;
         case Action::Clear: doClear(app); break;
         case Action::FillSelection: {
+            if (refusesMask(app)) break;
             sbl::UndoRecord rec =
                 sbl::fillSelection(app.doc, app.doc.activeLayer, app.foreground);
             if (!rec.empty()) {
@@ -1698,6 +1726,113 @@ void buildDefaultLayout(ImGuiID dockspace) {
     ImGui::DockBuilderFinish(dockspace);
 }
 
+/// The "Selection" submenu (#52): keeping one, combining it back in, and the
+/// two places in the document a selection can be made out of.
+///
+/// Storing and restoring are NOT undo steps, because selecting is not one
+/// either — Ctrl+Z on a drawing application takes back a mark, and an artist
+/// who has just spent a minute lassoing would not thank us for spending their
+/// undo history on it. Writing a layer's mask IS one, and goes through
+/// `setLayerMask` for exactly that reason.
+void drawSelectionMenu(App& app) {
+    if (!ImGui::BeginMenu("Selection")) return;
+
+    const bool haveSelection =
+        app.doc.selection.has_value() && !app.doc.selection->empty();
+    sbl::Layer* layer = app.doc.active();
+
+    // A static buffer rather than a field on App: this is the whole of the
+    // widget's state, it lives exactly as long as the menu, and App is being
+    // restructured under us by #50.
+    static std::array<char, 64> nameBuffer{};
+    ImGui::BeginDisabled(!haveSelection);
+    ImGui::SetNextItemWidth(140.0f * app.uiScale);
+    ImGui::InputTextWithHint("##selname", "name", nameBuffer.data(), nameBuffer.size());
+    ImGui::SameLine();
+    if (ImGui::Button("Store")) {
+        std::string name(nameBuffer.data());
+        if (name.empty())
+            name = "Selection " + std::to_string(app.doc.storedSelections.size() + 1);
+        app.doc.storedSelections.push_back(
+            sbl::StoredSelection{std::move(name), *app.doc.selection});
+        nameBuffer.fill('\0');
+        app.doc.dirty = true;
+    }
+    ImGui::EndDisabled();
+
+    if (app.doc.storedSelections.empty()) {
+        ImGui::TextDisabled("Nothing stored yet.");
+    } else {
+        ImGui::Separator();
+        std::size_t remove = app.doc.storedSelections.size();
+        for (std::size_t i = 0; i < app.doc.storedSelections.size(); ++i) {
+            const sbl::StoredSelection& stored = app.doc.storedSelections[i];
+            ImGui::PushID(static_cast<int>(i));
+            if (ImGui::BeginMenu(stored.name.c_str())) {
+                // The four modifiers the selection tools already offer, against
+                // whatever is selected now. Replace on an empty current
+                // selection is the plain "restore this" case and needs no
+                // separate item.
+                const std::array<std::pair<const char*, sbl::SelectMode>, 4> modes{{
+                    {"Replace",   sbl::SelectMode::Replace},
+                    {"Add",       sbl::SelectMode::Add},
+                    {"Subtract",  sbl::SelectMode::Subtract},
+                    {"Intersect", sbl::SelectMode::Intersect}}};
+                for (const auto& [label, mode] : modes) {
+                    if (!ImGui::MenuItem(label)) continue;
+                    const sbl::Selection base =
+                        app.doc.selection.has_value() ? *app.doc.selection : sbl::Selection{};
+                    sbl::Selection combined =
+                        sbl::combineSelections(base, stored.selection, mode);
+                    if (combined.empty()) app.doc.selection.reset();
+                    else                  app.doc.selection = std::move(combined);
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Forget")) remove = i;
+                ImGui::EndMenu();
+            }
+            ImGui::PopID();
+        }
+        // After the loop: erasing inside it would invalidate the reference the
+        // loop is reading through.
+        if (remove < app.doc.storedSelections.size()) {
+            app.doc.storedSelections.erase(app.doc.storedSelections.begin() +
+                                           static_cast<std::ptrdiff_t>(remove));
+            app.doc.dirty = true;
+        }
+    }
+
+    ImGui::Separator();
+    if (ImGui::MenuItem("From layer alpha", nullptr, false,
+                        layer != nullptr && !layer->tiles.empty())) {
+        sbl::Selection shape =
+            sbl::selectionFromLayerAlpha(*layer, app.doc.width, app.doc.height);
+        if (shape.empty()) app.doc.selection.reset();
+        else               app.doc.selection = std::move(shape);
+    }
+    if (ImGui::MenuItem("From layer mask", nullptr, false,
+                        layer != nullptr && layer->mask.has_value())) {
+        sbl::Selection shape =
+            sbl::selectionFromMask(*layer->mask, app.doc.width, app.doc.height);
+        if (shape.empty()) app.doc.selection.reset();
+        else               app.doc.selection = std::move(shape);
+    }
+    if (ImGui::MenuItem("To layer mask", nullptr, false,
+                        haveSelection && layer != nullptr)) {
+        sbl::UndoRecord rec =
+            sbl::setLayerMask(app.doc, layer->id,
+                              sbl::maskFromSelection(*app.doc.selection));
+        if (!rec.empty()) {
+            // releaseAll rather than per-tile: the mask covers whatever the
+            // selection did, and the composite of every tile under it changed.
+            app.canvas->releaseAll();
+            app.doc.undo.push(std::move(rec));
+            app.doc.dirty = true;
+        }
+    }
+    ImGui::EndMenu();
+}
+
 void drawMenuBar(App& app, float& menuHeight) {
     if (!ImGui::BeginMainMenuBar()) return;
     menuHeight = ImGui::GetWindowSize().y;
@@ -1737,7 +1872,8 @@ void drawMenuBar(App& app, float& menuHeight) {
         if (ImGui::MenuItem("Clear", nullptr, false,
                             layer != nullptr && !layer->tiles.empty())) doClear(app);
         ImGui::Separator();
-        if (ImGui::MenuItem("Fill selection", nullptr, false, layer != nullptr)) {
+        if (ImGui::MenuItem("Fill selection", nullptr, false, layer != nullptr) &&
+            !refusesMask(app)) {
             sbl::UndoRecord rec =
                 sbl::fillSelection(app.doc, app.doc.activeLayer, app.foreground);
             if (!rec.empty()) {
@@ -1749,6 +1885,7 @@ void drawMenuBar(App& app, float& menuHeight) {
         if (ImGui::MenuItem("Deselect", app.shortcuts.get(Action::Deselect).label().c_str(), false,
                             app.doc.selection.has_value()))
             app.doc.selection.reset();
+        drawSelectionMenu(app);
         ImGui::Separator();
         ImGui::TextDisabled("History: %zu steps, %.1f MB of %d MB",
                             app.doc.undo.size(),
@@ -3842,6 +3979,47 @@ int main(int argc, char** argv) {
             }
             doRedo(app);
             SDL_Log("selftest: a gradient drag is one undo step (midpoint %d)", half);
+        }
+
+        // The fill family refuses to run while the artist is painting a mask,
+        // rather than silently writing the layer instead (#58). Checked here
+        // because the whole point is what does NOT happen, and a tool that
+        // quietly paints the wrong target is invisible to every other check.
+        {
+            sbl::Layer* layer = app.doc.active();
+            layer->mask.emplace();
+            app.paintOnMask = true;
+            const std::size_t before = app.doc.undo.size();
+            const std::size_t tiles  = layer->tiles.size();
+            const sbl::StraightRgba8 spot = sbl::pickColour(app.doc, 500, 20);
+
+            doFill(app, toScreenX(app.view, 500.0, 20.0),
+                        toScreenY(app.view, 500.0, 20.0));
+            doClear(app);
+            beginGradient(app, toScreenX(app.view, 10.0, 10.0),
+                               toScreenY(app.view, 10.0, 10.0));
+
+            if (app.doc.undo.size() != before || layer->tiles.size() != tiles ||
+                !(sbl::pickColour(app.doc, 500, 20) == spot)) {
+                SDL_Log("selftest FAILED: a fill tool wrote the layer while Paint "
+                        "on mask was on");
+                return 1;
+            }
+            if (app.gradientDragging) {
+                SDL_Log("selftest FAILED: the gradient started a drag it cannot "
+                        "commit to a mask");
+                return 1;
+            }
+            if (app.notices.empty()) {
+                SDL_Log("selftest FAILED: the fill tools refused silently, which is "
+                        "the failure this check exists to prevent");
+                return 1;
+            }
+            app.paintOnMask = false;
+            layer->mask.reset();
+            app.notices.clear();
+            SDL_Log("selftest: the fill tools refuse a mask out loud rather than "
+                    "painting the layer");
         }
 
         // Drive one background recovery to completion. This is the only path

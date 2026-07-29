@@ -220,12 +220,20 @@ std::expected<void, Error> saveProject(const Document& doc,
     // half-width tiles as though they were the whole picture.
     const bool anyMask = std::ranges::any_of(
         doc.layers, [](const Layer& l) { return l.mask.has_value(); });
+    // An empty stored selection is dropped below, so it must not claim the
+    // version either — a file that says 8 and contains nothing an 8 reader
+    // needs would lock older Sables out for no gain.
+    const bool anyStored = std::ranges::any_of(
+        doc.storedSelections, [](const StoredSelection& s) { return !s.selection.empty(); });
     const bool tagged = !doc.colourProfile.empty();
-    manifest["format_version"] = tagged  ? SABLE_FORMAT_VERSION_ICC
-                               : anyMask ? SABLE_FORMAT_VERSION_MASK
-                               : doc.depth == ColourDepth::Bits16
-                                     ? SABLE_FORMAT_VERSION_16BIT
-                                     : SABLE_FORMAT_VERSION_8BIT;
+    // Highest wins: a version is one number, and a document that is tagged AND
+    // carries stored selections needs a reader that understands both.
+    manifest["format_version"] =
+        tagged                             ? SABLE_FORMAT_VERSION_ICC
+      : anyStored                          ? SABLE_FORMAT_VERSION_STORED
+      : anyMask                            ? SABLE_FORMAT_VERSION_MASK
+      : doc.depth == ColourDepth::Bits16   ? SABLE_FORMAT_VERSION_16BIT
+                                           : SABLE_FORMAT_VERSION_8BIT;
     manifest["app"]            = "Sable 0.1.0";
     manifest["width"]          = doc.width;
     manifest["height"]         = doc.height;
@@ -260,21 +268,54 @@ std::expected<void, Error> saveProject(const Document& doc,
     // after lunch. Only the bounding box goes in the manifest; the coverage
     // mask, when there is one, is a greyscale PNG beside the tiles — same
     // container rule as everything else, and openable in any image viewer.
+    //
+    // One writer for the current selection and for every stored one (#52):
+    // they are the same bytes in the same shape, and a second copy of this is
+    // how the two would eventually disagree about what a mask entry means.
+    const auto writeMask = [&](const Selection& sel, const char* entry) {
+        std::vector<unsigned char> png;
+        lodepng::encode(png, sel.mask, static_cast<unsigned>(sel.w),
+                        static_cast<unsigned>(sel.h), LCT_GREY, 8);
+        return !png.empty() &&
+               mz_zip_writer_add_mem(&zip, entry, png.data(), png.size(),
+                                     MZ_NO_COMPRESSION);
+    };
+    const auto selectionNode = [](const Selection& sel) {
+        return json{{"x", sel.x}, {"y", sel.y}, {"w", sel.w}, {"h", sel.h},
+                    {"mask", !sel.mask.empty()}};
+    };
+
     if (doc.selection.has_value() && !doc.selection->empty()) {
         const Selection& sel = *doc.selection;
-        manifest["selection"] = {{"x", sel.x}, {"y", sel.y},
-                                 {"w", sel.w}, {"h", sel.h},
-                                 {"mask", !sel.mask.empty()}};
-        if (!sel.mask.empty()) {
-            std::vector<unsigned char> png;
-            lodepng::encode(png, sel.mask, static_cast<unsigned>(sel.w),
-                            static_cast<unsigned>(sel.h), LCT_GREY, 8);
-            if (png.empty())
-                return abort(ErrorKind::Io, "could not encode the selection mask");
-            if (!mz_zip_writer_add_mem(&zip, "selection.png", png.data(), png.size(),
-                                       MZ_NO_COMPRESSION))
-                return abort(ErrorKind::Io,
-                             "could not write the selection to " + path.string());
+        manifest["selection"] = selectionNode(sel);
+        if (!sel.mask.empty() && !writeMask(sel, "selection.png"))
+            return abort(ErrorKind::Io,
+                         "could not write the selection to " + path.string());
+    }
+
+    // The selections the artist chose to keep (#52). The ZIP entries are
+    // numbered rather than named: a name is the artist's and may contain
+    // anything, a slash included, and a ZIP path is not the place to find that
+    // out. The name lives in the manifest, where JSON already escapes it.
+    if (anyStored) {
+        manifest["selections"] = json::array();
+        for (std::size_t i = 0; i < doc.storedSelections.size(); ++i) {
+            const StoredSelection& stored = doc.storedSelections[i];
+            if (stored.selection.empty()) continue;   // nothing to restore later
+            json node = selectionNode(stored.selection);
+            node["name"] = stored.name;
+            if (!stored.selection.mask.empty()) {
+                // Named in the manifest rather than derived from the array
+                // position on load: an empty one skipped above would shift
+                // every index after it, and the wrong mask on the right name is
+                // worse than none.
+                const std::string entry = "selections/" + std::to_string(i) + ".png";
+                if (!writeMask(stored.selection, entry.c_str()))
+                    return abort(ErrorKind::Io,
+                                 "could not write a stored selection to " + path.string());
+                node["file"] = entry;
+            }
+            manifest["selections"].push_back(std::move(node));
         }
     }
 
@@ -518,36 +559,52 @@ std::expected<Document, Error> loadProject(const std::filesystem::path& path) {
     // malformed one is dropped rather than repaired: a selection that is not
     // the one the artist drew would send the next fill somewhere they did not
     // ask for, and no selection at all is the honest answer.
-    if (manifest.contains("selection") && manifest["selection"].is_object()) {
-        const auto& node = manifest["selection"];
+    //
+    // One reader for the current selection and for every stored one (#52), for
+    // the same reason `writeMask` above is one writer. Returns nothing for a
+    // node it cannot read in full.
+    const auto readSelection = [&](const json& node,
+                                   const std::string& file) -> std::optional<Selection> {
         Selection sel;
         sel.x = node.value("x", 0);
         sel.y = node.value("y", 0);
         sel.w = node.value("w", 0);
         sel.h = node.value("h", 0);
+        if (sel.empty() || sel.w > doc.width || sel.h > doc.height) return std::nullopt;
+        if (!node.value("mask", false)) return sel;
 
-        const bool plausible = !sel.empty() && sel.w <= doc.width && sel.h <= doc.height;
-        bool usable = plausible;
-        if (plausible && node.value("mask", false)) {
-            usable = false;
-            std::size_t size = 0;
-            if (void* data = mz_zip_reader_extract_file_to_heap(&zip, "selection.png",
-                                                                &size, 0);
-                data != nullptr) {
-                std::vector<unsigned char> grey;
-                unsigned mw = 0, mh = 0;
-                const bool ok =
-                    lodepng::decode(grey, mw, mh, static_cast<const unsigned char*>(data),
-                                    size, LCT_GREY, 8) == 0;
-                mz_free(data);
-                if (ok && mw == static_cast<unsigned>(sel.w) &&
-                    mh == static_cast<unsigned>(sel.h)) {
-                    sel.mask = std::move(grey);
-                    usable = true;
-                }
-            }
+        std::size_t size = 0;
+        void* data = mz_zip_reader_extract_file_to_heap(&zip, file.c_str(), &size, 0);
+        if (data == nullptr) return std::nullopt;
+        std::vector<unsigned char> grey;
+        unsigned mw = 0, mh = 0;
+        const bool ok =
+            lodepng::decode(grey, mw, mh, static_cast<const unsigned char*>(data), size,
+                            LCT_GREY, 8) == 0;
+        mz_free(data);
+        if (!ok || mw != static_cast<unsigned>(sel.w) ||
+            mh != static_cast<unsigned>(sel.h))
+            return std::nullopt;
+        sel.mask = std::move(grey);
+        return sel;
+    };
+
+    if (manifest.contains("selection") && manifest["selection"].is_object())
+        if (auto sel = readSelection(manifest["selection"], "selection.png"))
+            doc.selection = std::move(*sel);
+
+    // Absent before v8, and in any v8 document the artist kept none in. A
+    // stored selection that will not read is dropped rather than repaired, for
+    // the same reason as the current one above: half a lasso is not the lasso.
+    if (manifest.contains("selections") && manifest["selections"].is_array()) {
+        for (const auto& node : manifest["selections"]) {
+            if (!node.is_object()) continue;
+            auto sel = readSelection(node, node.value("file", std::string{}));
+            if (!sel.has_value()) continue;
+            doc.storedSelections.push_back(
+                StoredSelection{node.value("name", std::string("Selection")),
+                                std::move(*sel)});
         }
-        if (usable) doc.selection = std::move(sel);
     }
 
     // Absent in v1, and in any v2 document that has none — both mean "no

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -64,6 +65,29 @@ constexpr int kSubRows = 4;
     }
     if (solid) out.mask.clear();
     return out;
+}
+
+/// Builds a selection over [x0, x1) x [y0, y1) from a per-pixel coverage
+/// function, and trims it. The sources at the bottom of this file differ only
+/// in where the byte comes from, and `tighten` is what keeps a source that
+/// happens to be a solid rectangle on the fast path afterwards.
+template <class Fn>
+[[nodiscard]] Selection fromCoverage(std::int32_t x0, std::int32_t y0,
+                                     std::int32_t x1, std::int32_t y1, Fn&& at) {
+    if (x0 >= x1 || y0 >= y1) return Selection{};
+
+    Selection out;
+    out.x = x0;
+    out.y = y0;
+    out.w = x1 - x0;
+    out.h = y1 - y0;
+    out.mask.resize(static_cast<std::size_t>(out.w) * static_cast<std::size_t>(out.h));
+
+    for (std::int32_t row = 0; row < out.h; ++row)
+        for (std::int32_t col = 0; col < out.w; ++col)
+            out.mask[static_cast<std::size_t>(row) * static_cast<std::size_t>(out.w) +
+                     static_cast<std::size_t>(col)] = at(x0 + col, y0 + row);
+    return tighten(out);
 }
 
 /// Adds the horizontal span [a, b) to one row of coverage, weighted, with the
@@ -264,6 +288,104 @@ Selection combineSelections(const Selection& current, const Selection& next,
         }
     }
     return tighten(out);
+}
+
+// ------------------------------------------------------------------- sources
+
+Selection selectionFromLayerAlpha(const Layer& layer, std::int32_t width,
+                                  std::int32_t height) {
+    if (width <= 0 || height <= 0 || layer.tiles.empty()) return Selection{};
+
+    // The box the layer's TILES cover, clipped to the canvas — not the canvas
+    // itself. A few strokes in one corner of a 4000 x 4000 document should cost
+    // one tile's worth of work, not sixteen megapixels of it.
+    std::int32_t x0 = width, y0 = height, x1 = 0, y1 = 0;
+    for (const auto& [key, tile] : layer.tiles) {
+        x0 = std::min(x0, key.first  * TILE_SIZE);
+        y0 = std::min(y0, key.second * TILE_SIZE);
+        x1 = std::max(x1, (key.first  + 1) * TILE_SIZE);
+        y1 = std::max(y1, (key.second + 1) * TILE_SIZE);
+    }
+    x0 = std::max<std::int32_t>(0, x0);
+    y0 = std::max<std::int32_t>(0, y0);
+    x1 = std::min(width,  x1);
+    y1 = std::min(height, y1);
+
+    const LayerMask* mask =
+        layer.mask.has_value() && layer.mask->enabled ? &*layer.mask : nullptr;
+
+    // The tile pointer is cached across a row rather than looked up per pixel:
+    // `fromCoverage` walks row-major, so the key changes once every 256 pixels
+    // and this turns a hash lookup per pixel into one per tile per row.
+    TileKey      lastKey{std::numeric_limits<std::int32_t>::min(), 0};
+    const Tile*  tile = nullptr;
+
+    return fromCoverage(x0, y0, x1, y1,
+                        [&](std::int32_t px, std::int32_t py) -> std::uint8_t {
+        const TileKey key{tileIndex(px), tileIndex(py)};
+        if (key != lastKey) {
+            lastKey = key;
+            tile    = layer.find(key);
+        }
+        if (tile == nullptr) return 0;      // never painted: fully transparent
+
+        const int tx = px - key.first  * TILE_SIZE;
+        const int ty = py - key.second * TILE_SIZE;
+        // 8-bit is the overwhelmingly common case and reads straight out;
+        // `pixel()` is the depth-agnostic path a 16-bit document needs, and
+        // reading `pixels8()` on one of those would dereference null.
+        const PremulRgba8* px8 = tile->pixels8();
+        std::uint32_t a =
+            px8 != nullptr
+                ? px8[static_cast<std::size_t>(ty) * TILE_SIZE +
+                      static_cast<std::size_t>(tx)].a
+                : narrowChannel(tile->pixel(tx, ty).a);
+        // Rounded, not truncated, so a fully opaque pixel under a reveal-all
+        // mask still comes out at 255 rather than 254.
+        if (mask != nullptr) a = (a * maskCoverage(*mask, px, py) + 127u) / 255u;
+        return static_cast<std::uint8_t>(a);
+    });
+}
+
+Selection selectionFromMask(const LayerMask& mask, std::int32_t width,
+                            std::int32_t height) {
+    return fromCoverage(0, 0, width, height,
+                        [&](std::int32_t px, std::int32_t py) {
+                            return maskCoverage(mask, px, py);
+                        });
+}
+
+LayerMask maskFromSelection(const Selection& selection) {
+    LayerMask mask;
+    // Everything outside a selection is unselected, and this is the one byte
+    // that says so for the whole rest of the canvas.
+    mask.outside = 0;
+    if (selection.empty()) return mask;
+
+    const std::int32_t tx0 = tileIndex(selection.x);
+    const std::int32_t ty0 = tileIndex(selection.y);
+    const std::int32_t tx1 = tileIndex(selection.x + selection.w - 1);
+    const std::int32_t ty1 = tileIndex(selection.y + selection.h - 1);
+
+    for (std::int32_t ty = ty0; ty <= ty1; ++ty) {
+        for (std::int32_t tx = tx0; tx <= tx1; ++tx) {
+            Tile& tile = mask.tileFor(TileKey{tx, ty});
+            // One handle for the whole tile: `setPixel` would tick the tile
+            // stamp 65'536 times to say what one tick already says.
+            PremulRgba8* px = tile.pixels8();
+            for (int row = 0; row < TILE_SIZE; ++row) {
+                for (int col = 0; col < TILE_SIZE; ++col) {
+                    // Opaque grey with coverage in red (D-031), which is what
+                    // the brush lays down and what `maskCoverage` reads back.
+                    const std::uint8_t v =
+                        selection.coverage(tx * TILE_SIZE + col, ty * TILE_SIZE + row);
+                    px[static_cast<std::size_t>(row) * TILE_SIZE +
+                       static_cast<std::size_t>(col)] = PremulRgba8{v, v, v, 255};
+                }
+            }
+        }
+    }
+    return mask;
 }
 
 }  // namespace sbl

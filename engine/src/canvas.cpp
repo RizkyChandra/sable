@@ -615,6 +615,9 @@ Document cloneDocument(const Document& doc) {
     copy.activeLayer = doc.activeLayer;
     copy.nextLayerId = doc.nextLayerId;
     copy.selection   = doc.selection;
+    // Without this the autosave worker writes a recovery file with the stored
+    // selections missing, which is exactly the work #52 exists to stop losing.
+    copy.storedSelections = doc.storedSelections;
     copy.path        = doc.path;
     copy.dirty       = doc.dirty;
     copy.vanishingPoints = doc.vanishingPoints;
@@ -934,6 +937,35 @@ UndoRecord deleteLayerMask(Document& doc, LayerId id) {
     // above is what puts the pixels back into it. Undo runs the tiles first and
     // they recreate an empty mask to land in, so the two halves compose in
     // either direction (see `swapRecord`).
+    rec.structure = LayerStructureDelta{LayerChange::Properties, id, indexOf(doc, id),
+                                        std::nullopt, std::move(before)};
+    return rec;
+}
+
+UndoRecord setLayerMask(Document& doc, LayerId id, LayerMask&& mask) {
+    UndoRecord rec;
+    Layer* layer = doc.layerById(id);
+    if (layer == nullptr) return rec;
+
+    LayerProps before = propsOf(*layer);
+
+    // Moved, not cloned, exactly as `deleteLayerMask` does: these tiles are
+    // being replaced either way, so the record may simply take them.
+    if (layer->mask.has_value()) {
+        rec.tiles.reserve(layer->mask->tiles.size() + mask.tiles.size());
+        for (auto& [key, tile] : layer->mask->tiles)
+            rec.tiles.push_back(TileSnapshot{id, key, std::move(tile), true});
+    }
+    // A null snapshot for every tile only the NEW mask has. Without these, undo
+    // would put the old flags back over the new coverage — a mask that hides
+    // what the artist never asked to hide, and no way to see why.
+    for (const auto& entry : mask.tiles)
+        if (!layer->mask.has_value() || !layer->mask->tiles.contains(entry.first))
+            rec.tiles.push_back(TileSnapshot{id, entry.first, std::nullopt, true});
+
+    layer->mask = std::move(mask);
+
+    rec.label = "Set mask";
     rec.structure = LayerStructureDelta{LayerChange::Properties, id, indexOf(doc, id),
                                         std::nullopt, std::move(before)};
     return rec;
