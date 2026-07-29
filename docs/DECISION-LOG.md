@@ -1124,6 +1124,59 @@ the format version is the hook — the same one this used.
 
 ---
 
+## D-029 — Linework editing: one selection model, one transform, one flag
+
+**Status:** Decided
+**Affects:** `engine/include/sbl/linework.hpp`, `engine/src/linework.cpp`,
+`app/src/linework_tool.cpp`, `LineStroke`, #51
+
+D-028 stands unchanged; this is what was built on top of it, and the four
+choices it needed.
+
+**The stabiliser sits in the same place it does for paint.** `Stabilizer` is a
+pure sample-to-sample function, so a freehand curve runs its samples through one
+before deciding where to put a control point — the same class, the same 0..3
+levels, the same `finish()` at pen-up so the line ends where the pen lifted. A
+level of its own rather than the brush's: a line wants more smoothing than a
+sketch, and one shared number would have the artist resetting it on every
+switch.
+
+**`appendFreehand` is in the engine, not the tool.** Smoothing and point spacing
+only mean anything together — the stabiliser removes the wobble and the spacing
+decides how many handles the artist is left holding — and the pair is the thing
+worth a test. Split across a header and a window, it could only be tested by a
+window.
+
+**Whole-stroke editing reuses `Transform` from sbl/paint.hpp.** A second
+transform type would be a second definition of what an angle means, and the day
+they drift the artist finds out by turning a selection the wrong way. The
+selection itself is a list of stroke indices held by the TOOL, not the document:
+it is not part of the drawing, it does not survive a save, and it must not cost
+an undo step. `transformStrokes` scales the stroke width with the geometry —
+a curve blown up to twice the size that kept its 4 px line is a different
+drawing, not the same one enlarged.
+
+**`closed` is a flag, not a repeated end point.** A duplicate would give the
+artist two handles on one corner and leave the join the one place the spline is
+not smooth. The rasteriser needed nothing: coverage is already accumulated with
+max and composited once per stroke (D-028), which is exactly the artefact a
+closed curve would otherwise show as a dark dot where the ends meet.
+
+**No format version bump for `closed`.** It is one optional key in the manifest,
+and an older reader that ignores it still sees the closed shape, because the
+tiles are what renders. Bumping would lock every ordinary painting out of an
+older Sable for a flag it is not using — the same reasoning that keeps an 8-bit
+document declaring version 5.
+
+**What was left undone, stated plainly:** scale and rotate are panel controls
+with an Apply button, not on-canvas handles — the transform tool's handle
+machinery is built around a pixel selection and reusing it is its own change.
+There is no marquee for selecting several strokes at once; Shift-click adds one
+at a time. And nothing auto-closes a curve whose ends meet: closing is an
+explicit toggle on a selected stroke.
+
+---
+
 ## Open decisions
 
 These blocked the milestone named. They have all been answered — the entries

@@ -325,6 +325,11 @@ struct LineStroke {
     StraightRgba8 colour{0, 0, 0, 255};
     float width         = 4.0f;    // diameter in canvas pixels at full pressure
     float minWidthRatio = 0.15f;   // width at zero pressure, as a fraction of it
+    /// The curve runs from the last point back to the first, with the spline
+    /// continuous across the join. A flag rather than a repeated end point: a
+    /// duplicate would give the artist two handles on one corner, and the join
+    /// would be the one place the curve is not smooth.
+    bool closed = false;
 
     friend bool operator==(const LineStroke&, const LineStroke&) = default;
 };

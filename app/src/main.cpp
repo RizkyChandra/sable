@@ -326,6 +326,11 @@ void applySettings(App& app, const Settings& settings) {
     app.brushIndex = static_cast<std::size_t>(std::clamp(
         settings.getInt("brush.active", 0), 0, static_cast<int>(app.brushes.size()) - 1));
     app.fillTolerance = std::clamp(settings.getInt("fill.tolerance", 16), 0, 255);
+    // Its own level, like every brush: a line wants more smoothing than a
+    // sketch does, and one shared number would have the artist re-setting it
+    // every time they switch.
+    app.linework.stabilizerLevel = static_cast<std::uint8_t>(
+        std::clamp(settings.getInt("linework.stabilizer", 0), 0, 3));
 
     const std::string presets = settings.getString("brush.sizePresets", "");
     if (!presets.empty()) {
@@ -398,6 +403,7 @@ void collectSettings(const App& app, Settings& settings) {
     settings.setInt("eraser.stabilizer", app.eraser.stabilizerLevel);
     settings.setInt("brush.active", static_cast<int>(app.brushIndex));
     settings.setInt("fill.tolerance", app.fillTolerance);
+    settings.setInt("linework.stabilizer", app.linework.stabilizerLevel);
 
     std::string presets;
     for (std::size_t i = 0; i < app.sizePresets.size(); ++i) {
@@ -1007,8 +1013,15 @@ void placeText(App& app, double sx, double sy) {
 /// Ctrl adds a control point on the curve, Shift takes one away, and a plain
 /// press draws or drags. Alt is left alone: it is the colour picker everywhere
 /// else, and a tool that redefines it is a tool that surprises people.
-[[nodiscard]] LineworkAction lineworkAction() {
+///
+/// In whole-stroke mode all three are one gesture on the line itself, with
+/// Shift adding to the selection — the same key that extends a selection
+/// everywhere else in the program.
+[[nodiscard]] LineworkAction lineworkAction(const App& app) {
     const SDL_Keymod mods = SDL_GetModState();
+    if (app.linework.selectMode)
+        return (mods & SDL_KMOD_SHIFT) != 0 ? LineworkAction::SelectAdd
+                                            : LineworkAction::Select;
     if ((mods & SDL_KMOD_CTRL)  != 0) return LineworkAction::Insert;
     if ((mods & SDL_KMOD_SHIFT) != 0) return LineworkAction::Erase;
     return LineworkAction::Draw;
@@ -1017,7 +1030,7 @@ void placeText(App& app, double sx, double sy) {
 void lineworkPress(App& app, double sx, double sy, float pressure) {
     app.linework.colour = app.foreground;
     app.linework.press(app.doc, toCanvasX(app.view, sx, sy),
-                       toCanvasY(app.view, sx, sy), pressure, lineworkAction(),
+                       toCanvasY(app.view, sx, sy), pressure, lineworkAction(app),
                        lineworkGrab(app));
     syncTextures(app, app.linework.takeChanged());
 }
@@ -1701,19 +1714,12 @@ void drawToolPanel(App& app) {
         }
 
         if (app.tool == Tool::Linework) {
-            ImGui::SetNextItemWidth(-1.0f);
-            ImGui::SliderFloat("##linewidth", &app.linework.width, 0.5f, 64.0f,
-                               "%.1f px");
-            ImGui::TextDisabled("line width");
-            ImGui::SetNextItemWidth(-1.0f);
-            ImGui::SliderFloat("##linetaper", &app.linework.minWidthRatio, 0.0f, 1.0f,
-                               "%.2f");
-            ImGui::TextDisabled("width at no pressure");
-            // The one thing that is not discoverable by trying it. Three
-            // gestures on one button is a lot to remember and nothing to guess.
-            ImGui::TextDisabled("drag: draw or move a point");
-            ImGui::TextDisabled("ctrl+click: add a point");
-            ImGui::TextDisabled("shift+click: remove one");
+            // The foreground colour is what a new stroke takes and what the
+            // panel writes over a selected one, so it is read here rather than
+            // only at pen-down: the artist picks the colour, then applies it.
+            app.linework.colour = app.foreground;
+            app.linework.drawPanel(app.doc);
+            syncTextures(app, app.linework.takeChanged());
         }
 
         if (app.tool == Tool::Transform) {
@@ -2627,9 +2633,14 @@ void drawLineworkHandles(const App& app) {
 
     ImDrawList* draw = ImGui::GetForegroundDrawList();
     const std::optional<sbl::PointRef> held = app.linework.held();
+    const std::vector<std::size_t>& selected = app.linework.selection();
     const float r = 4.0f * app.uiScale;
 
     for (std::size_t s = 0; s < content->strokes.size(); ++s) {
+        // A selected stroke has to be tellable from an unselected one before
+        // the artist commits to a transform they would otherwise have to undo.
+        const bool inSelection =
+            std::find(selected.begin(), selected.end(), s) != selected.end();
         for (std::size_t i = 0; i < content->strokes[s].points.size(); ++i) {
             const sbl::LinePoint& p = content->strokes[s].points[i];
             const ImVec2 at(static_cast<float>(toScreenX(app.view, p.x, p.y)),
@@ -2638,8 +2649,10 @@ void drawLineworkHandles(const App& app) {
             // Two-tone like every other overlay, so a handle stays visible on
             // both the white of a fresh canvas and the black of the line.
             draw->AddCircleFilled(at, r + 1.0f, IM_COL32(0, 0, 0, 160));
-            draw->AddCircleFilled(at, r, grabbed ? IM_COL32(120, 220, 255, 255)
-                                                 : IM_COL32(255, 255, 255, 230));
+            draw->AddCircleFilled(at, r,
+                                  grabbed      ? IM_COL32(120, 220, 255, 255)
+                                  : inSelection ? IM_COL32(255, 190, 80, 255)
+                                                : IM_COL32(255, 255, 255, 230));
         }
     }
 }
@@ -3544,6 +3557,38 @@ int main(int argc, char** argv) {
             }
             SDL_Log("selftest: linework draws, re-shapes and undoes as one step "
                     "(%zu control points)", line->linework->strokes[0].points.size());
+
+            // #51: a whole stroke is grabbed by the line rather than a handle,
+            // and moves as one. The engine's geometry is tested headlessly; what
+            // only a running app can show is that the tool's selection survives
+            // press, drag and release, and leaves one undo step behind.
+            app.linework.selectMode = true;
+            const std::size_t beforeMove = app.doc.undo.size();
+            app.linework.press(app.doc, 200.0, 500.0, 1.0f, LineworkAction::Select, 12.0);
+            if (app.linework.selection().size() != 1) {
+                SDL_Log("selftest FAILED: clicking a line selected %zu strokes",
+                        app.linework.selection().size());
+                return 1;
+            }
+            app.linework.drag(app.doc, 200.0, 300.0, 1.0f);
+            app.linework.release(app.doc);
+            syncTextures(app, app.linework.takeChanged());
+            if (!inkAt(300, 300) || inkAt(300, 500)) {
+                SDL_Log("selftest FAILED: the whole stroke did not move");
+                return 1;
+            }
+            if (app.doc.undo.size() != beforeMove + 1) {
+                SDL_Log("selftest FAILED: moving a stroke left %zu undo steps",
+                        app.doc.undo.size() - beforeMove);
+                return 1;
+            }
+            doUndo(app);
+            if (!inkAt(300, 500)) {
+                SDL_Log("selftest FAILED: undoing the move left the wrong line");
+                return 1;
+            }
+            app.linework.selectMode = false;
+            SDL_Log("selftest: a whole linework stroke selects, moves and undoes");
         }
 
         // Drive one background recovery to completion. This is the only path
