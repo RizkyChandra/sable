@@ -57,6 +57,23 @@
 
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="3.5.0" date="2026-07-30">
+      <description>
+        <p>
+          The brush ring follows the stylus. It was drawn where the interface
+          toolkit believed the mouse to be, and while an artist hovers with a
+          pen that toolkit falls back to polling the desktop cursor — so the
+          ring sat wherever the mouse had been left, hundreds of pixels from
+          the mark being made.
+        </p>
+        <p>
+          Alt and a tap samples the canvas with a stylus, as it always has with
+          a mouse; the pen path never looked at the modifier. Picking a colour
+          also has a binding of its own now, I by default, which needs no
+          button held down.
+        </p>
+      </description>
+    </release>
     <release version="3.4.1" date="2026-07-30">
       <description>
         <p>

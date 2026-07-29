@@ -79,6 +79,9 @@ constexpr std::array<Entry, static_cast<std::size_t>(Action::Count)> kDefaults{{
     // H for hand, the one every other painting application uses. Space still
     // pans with any tool held down; this is the same thing without the hold.
     {Action::ToolHand,      "Hand tool",      SDLK_H, SDL_KMOD_NONE},
+    // I for eyedropper, which is where every other application puts it. Holding
+    // Alt and clicking does the same thing without letting go of the stylus.
+    {Action::PickColour,    "Pick colour",    SDLK_I, SDL_KMOD_NONE},
     {Action::SizeDown,      "Smaller brush",  SDLK_LEFTBRACKET,  SDL_KMOD_NONE},
     {Action::SizeUp,        "Larger brush",   SDLK_RIGHTBRACKET, SDL_KMOD_NONE},
     {Action::SwapColours,   "Swap colours",   SDLK_X, SDL_KMOD_NONE},

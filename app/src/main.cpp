@@ -279,6 +279,20 @@ struct App {
     std::vector<sbl::SymmetryImage> mirrors;   // scratch, one dab's images
     int draggingGuide = kNoGuide;
 
+    /// Where the pointer is, in window coordinates, taken from the SDL event
+    /// that moved it — NOT from ImGui.
+    ///
+    /// ImGui's SDL3 backend polls the OS cursor and overwrites its own
+    /// `MousePos` on any frame where no window has MOUSE focus, which is every
+    /// frame while an artist hovers with a stylus: there are no mouse events to
+    /// give the window mouse focus, so the poll fires and answers with wherever
+    /// the mouse was left. Anything drawn at that position — the brush ring —
+    /// then sits somewhere the pen is not. Read from the same events the paint
+    /// does and the two cannot disagree.
+    float pointerX = 0.0f, pointerY = 0.0f;
+    bool  pointerSeen    = false;
+    bool  pointerFromPen = false;
+
     SDL_PenID activePen = 0;
     bool      penSeen   = false;
     bool      lastFromMouse = true;
@@ -388,6 +402,12 @@ struct App {
 [[nodiscard]] sbl::BrushPreset& activeBrush(App& app) {
     if (app.tool == Tool::Eraser) return app.eraser;
     return app.brushes[std::min(app.brushIndex, app.brushes.size() - 1)];
+}
+
+/// Where the pointer is on screen, whichever device moved it last.
+[[nodiscard]] ImVec2 pointerPos(const App& app) {
+    if (!app.pointerSeen) return ImGui::GetIO().MousePos;
+    return ImVec2(app.pointerX, app.pointerY);
 }
 
 [[nodiscard]] bool paintingTool(const App& app) {
@@ -2097,6 +2117,15 @@ void handleKey(App& app, const SDL_KeyboardEvent& key) {
             app.perspective.enabled = !app.perspective.enabled;
             break;
 
+        case Action::PickColour: {
+            // Under the pointer, wherever it is and whichever device put it
+            // there. A binding that needs no button held is also the one an
+            // artist who cannot hold Alt and click at once can reach at all.
+            const ImVec2 at = pointerPos(app);
+            if (overCanvas(app, at.x, at.y)) pickColourAt(app, at.x, at.y);
+            break;
+        }
+
         case Action::ToolHand:
             app.cur().text.finish(app.window, app.cur().doc);
             app.tool = Tool::Hand;
@@ -2188,6 +2217,9 @@ void handleEvent(App& app, const SDL_Event& e) {
         case SDL_EVENT_PEN_DOWN:
             app.penSeen = true;
             app.activePen = e.ptouch.which;
+            app.pointerX = e.ptouch.x;
+            app.pointerY = e.ptouch.y;
+            app.pointerSeen = app.pointerFromPen = true;
             // The hand pans with a stylus as well as a mouse: on a tablet it
             // is the ONLY way to pan, since there is no middle button to hold
             // and no second hand free for the space bar.
@@ -2205,6 +2237,14 @@ void handleEvent(App& app, const SDL_Event& e) {
             ImGui::GetIO().AddMousePosEvent(e.ptouch.x, e.ptouch.y);
             ImGui::GetIO().AddMouseButtonEvent(ImGuiMouseButton_Left, true);
             if (io.WantCaptureMouse || !overCanvas(app, e.ptouch.x, e.ptouch.y)) break;
+            // Alt samples the canvas, the same as it does under a mouse
+            // (US-13.3). It was on the mouse path only, so the artists this
+            // application is FOR — the ones holding a stylus — had no way to
+            // pick a colour without putting it down and reaching for the wheel.
+            if ((SDL_GetModState() & SDL_KMOD_ALT) != 0) {
+                pickColourAt(app, e.ptouch.x, e.ptouch.y);
+                break;
+            }
             // The eraser end is a different tool, not a modifier (US-08.6).
             if (e.ptouch.eraser) app.tool = Tool::Eraser;
             else if (app.tool == Tool::Eraser) app.tool = Tool::Brush;
@@ -2246,6 +2286,9 @@ void handleEvent(App& app, const SDL_Event& e) {
         case SDL_EVENT_PEN_MOTION:
             app.activePen = e.pmotion.which;
             ++app.motionThisFrame;
+            app.pointerX = e.pmotion.x;
+            app.pointerY = e.pmotion.y;
+            app.pointerSeen = app.pointerFromPen = true;
             if (app.panning) {
                 app.cur().view.panX = e.pmotion.x - app.panAnchorX;
                 app.cur().view.panY = e.pmotion.y - app.panAnchorY;
@@ -2295,6 +2338,10 @@ void handleEvent(App& app, const SDL_Event& e) {
 
         // ----------------------------------------------------------- mouse
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
+            app.pointerX = e.button.x;
+            app.pointerY = e.button.y;
+            app.pointerSeen    = true;
+            app.pointerFromPen = false;
             if (io.WantCaptureMouse || !overCanvas(app, e.button.x, e.button.y)) break;
             if (e.button.button == SDL_BUTTON_MIDDLE ||
                 (e.button.button == SDL_BUTTON_LEFT &&
@@ -2338,6 +2385,10 @@ void handleEvent(App& app, const SDL_Event& e) {
 
         case SDL_EVENT_MOUSE_MOTION:
             ++app.motionThisFrame;
+            app.pointerX = e.motion.x;
+            app.pointerY = e.motion.y;
+            app.pointerSeen    = true;
+            app.pointerFromPen = false;
             if (app.panning) {
                 // Panning never alters pixels: no undo state, no dirty flag,
                 // no tile upload (US-05.5).
@@ -3427,7 +3478,8 @@ void drawColourPanel(App& app) {
             app.background = sbl::StraightRgba8{255, 255, 255, 255};
             syncHsvFromColour(app);
         }
-        ImGui::TextDisabled("Alt+click samples the canvas");
+        ImGui::TextDisabled("Alt+click, or %s, samples the canvas",
+                            app.shortcuts.get(Action::PickColour).label().c_str());
     }
     ImGui::End();
 }
@@ -4251,20 +4303,22 @@ void drawEmptyCanvasHint(const App& app, ImDrawList* overlay) {
 /// re-applies ImGui's choice every frame, so a cursor set behind its back
 /// survives exactly until the next one.
 void applyCursor(const App& app) {
-    const ImGuiIO& io = ImGui::GetIO();
-    if (io.WantCaptureMouse) return;      // a panel's own cursor wins there
-    ImGui::SetMouseCursor(cursorFor(app, io.MousePos.x, io.MousePos.y));
+    const ImVec2 at = pointerPos(app);
+    // Off the canvas is a panel's business, and ImGui has already set whatever
+    // that panel asked for. Deliberately not `WantCaptureMouse`: that is
+    // computed from ImGui's own idea of where the mouse is, which is the thing
+    // this does not trust.
+    if (!overCanvas(app, at.x, at.y)) return;
+    ImGui::SetMouseCursor(cursorFor(app, at.x, at.y));
 }
 
 void drawBrushCursor(const App& app) {
-    const ImGuiIO& io = ImGui::GetIO();
-    if (io.WantCaptureMouse) return;
-    // Where ImGui thinks the pointer is, not SDL_GetMouseState: the pen feeds
-    // that position (there being no synthetic mouse events to carry it), and
-    // asking SDL would draw the ring at the mouse while the artist hovers with
-    // a stylus.
-    const float mx = io.MousePos.x;
-    const float my = io.MousePos.y;
+    const ImVec2 at = pointerPos(app);
+    const float mx = at.x;
+    const float my = at.y;
+    // `overCanvas` and nothing else: a ring is drawn over the canvas or not at
+    // all, and asking ImGui whether it wants the mouse would take the answer
+    // from a position that may belong to a device the artist is not holding.
     if (!overCanvas(app, mx, my)) return;
 
     if (!paintingTool(app)) return;
@@ -5957,8 +6011,76 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
+            // The ring is drawn where the PEN is, not where ImGui thinks the
+            // mouse is. The two differ on a tablet — the backend polls the OS
+            // cursor whenever no window has mouse focus, which is every frame
+            // an artist hovers with a stylus — and a ring drawn at the wrong
+            // one of them is the mark sitting somewhere it was not aimed.
+            {
+                const auto px = static_cast<float>(
+                    toScreenX(app.cur().view, static_cast<double>(midX),
+                                              static_cast<double>(midY)));
+                const auto py = static_cast<float>(
+                    toScreenY(app.cur().view, static_cast<double>(midX),
+                                              static_cast<double>(midY)));
+                SDL_Event motion{};
+                motion.type = SDL_EVENT_PEN_MOTION;
+                motion.pmotion.which = 3;
+                motion.pmotion.x = px;
+                motion.pmotion.y = py;
+                handleEvent(app, motion);
+                // Whatever ImGui believes, and it is asked to believe something
+                // else on purpose.
+                ImGui::GetIO().MousePos = ImVec2(px + 300.0f, py + 200.0f);
+
+                const ImVec2 at = pointerPos(app);
+                // And Alt with a stylus samples the canvas, which was a mouse
+                // gesture only: the pen path never looked at the modifier.
+                app.foreground = sbl::StraightRgba8{7, 7, 7, 255};
+                SDL_Event alt{};
+                alt.type = SDL_EVENT_PEN_DOWN;
+                alt.ptouch.which = 3;
+                alt.ptouch.x = px;
+                alt.ptouch.y = py;
+                ImGui::GetIO().WantCaptureMouse = false;
+                const sbl::StraightRgba8 under =
+                    sbl::pickColour(app.cur().doc, midX, midY);
+                const std::size_t steps = app.cur().doc.undo.size();
+                SDL_SetModState(SDL_KMOD_LALT);
+                handleEvent(app, alt);
+                SDL_Event lift{};
+                lift.type = SDL_EVENT_PEN_UP;
+                lift.ptouch.which = 3;
+                lift.ptouch.x = px;
+                lift.ptouch.y = py;
+                handleEvent(app, lift);
+                SDL_SetModState(SDL_KMOD_NONE);
+                if (!(app.foreground.r == under.r && app.foreground.g == under.g &&
+                      app.foreground.b == under.b) ||
+                    app.cur().doc.undo.size() != steps) {
+                    SDL_Log("selftest FAILED: Alt and a pen tap did not sample the "
+                            "canvas — the colour is %d,%d,%d where %d,%d,%d is under "
+                            "the pen, and it left %zu undo steps",
+                            app.foreground.r, app.foreground.g, app.foreground.b,
+                            under.r, under.g, under.b,
+                            app.cur().doc.undo.size() - steps);
+                    return 1;
+                }
+
+                if (at.x != px || at.y != py) {
+                    SDL_Log("selftest FAILED: the pointer reads %.0f,%.0f after a "
+                            "pen moved to %.0f,%.0f — the brush ring would be drawn "
+                            "off the pen by %.0f,%.0f",
+                            static_cast<double>(at.x), static_cast<double>(at.y),
+                            static_cast<double>(px), static_cast<double>(py),
+                            static_cast<double>(at.x - px),
+                            static_cast<double>(at.y - py));
+                    return 1;
+                }
+            }
+
             SDL_Log("selftest: the transform box drags, previews as one undo step "
-                    "and cancels; the pointer follows the tool");
+                    "and cancels; the pointer follows the tool and the pen");
         }
 
         SDL_Log("selftest OK");
