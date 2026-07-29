@@ -5770,7 +5770,9 @@ TEST_CASE("only a 16-bit file claims the newer format version") {
     REQUIRE(saveProject(maskedDoc, maskedPath).has_value());
     CHECK(manifestOf(maskedPath)["format_version"] == SABLE_FORMAT_VERSION_MASK);
     CHECK(SABLE_FORMAT_VERSION_MASK > SABLE_FORMAT_VERSION_16BIT);
-    CHECK(SABLE_FORMAT_VERSION == SABLE_FORMAT_VERSION_MASK);   // the newest known
+    // #52 took the same deal one further; the newest known is now theirs.
+    CHECK(SABLE_FORMAT_VERSION == SABLE_FORMAT_VERSION_STORED);
+    CHECK(SABLE_FORMAT_VERSION_STORED > SABLE_FORMAT_VERSION_MASK);
 
     std::error_code ec;
     std::filesystem::remove(narrowPath, ec);
@@ -6649,4 +6651,323 @@ TEST_CASE("an ORA export bakes the mask into the alpha it writes") {
                           std::abs(ours[i].b - theirs[i].b),
                           std::abs(ours[i].a - theirs[i].a)});
     CHECK(worst <= 2);
+}
+
+// ------------------------------------------------ selection sources (#52)
+
+namespace {
+
+/// `lassoSelection` takes a span, and C++23 has no span-from-braced-list; this
+/// is only here so the cases below can spell a path out where they use it.
+[[nodiscard]] Selection lassoOf(const std::vector<Point>& path, std::int32_t w,
+                                std::int32_t h) {
+    return lassoSelection(path, w, h);
+}
+
+/// A layer's own alpha at a canvas pixel, read straight out of its tiles.
+/// Deliberately not `selectionFromLayerAlpha` — the cases below compare that
+/// function against the pixels, so the comparison cannot be made with it.
+[[nodiscard]] int rawAlpha(const Document& doc, LayerId id, std::int32_t x,
+                           std::int32_t y) {
+    const Layer* layer = doc.layerById(id);
+    if (layer == nullptr) return 0;
+    const TileKey key{tileIndex(x), tileIndex(y)};
+    const Tile* tile = layer->find(key);
+    if (tile == nullptr) return 0;
+    return narrowChannel(
+        tile->pixel(x - key.first * TILE_SIZE, y - key.second * TILE_SIZE).a);
+}
+
+}  // namespace
+
+TEST_CASE("booleans over two anti-aliased selections stay anti-aliased") {
+    // #52's acceptance criterion that matters most, and the one that goes wrong
+    // quietly: a boolean written for a hard edge gives the RIGHT REGION with its
+    // gradient rounded to 0 or 255 along the overlap, which the artist sees as a
+    // jagged seam the next time they fill through it.
+    //
+    // The same lasso half a pixel along, so the two anti-aliased edges run
+    // through the SAME pixels rather than merely crossing at a point. Two
+    // shapes that only touch at a corner exercise one soft edge at a time,
+    // which is exactly the case a hard boolean gets away with.
+    const Selection a =
+        lassoOf({{10.0, 10.0}, {90.0, 10.0}, {10.0, 90.0}}, 120, 120);
+    const Selection b =
+        lassoOf({{10.5, 10.5}, {90.5, 10.5}, {10.5, 90.5}}, 120, 120);
+    REQUIRE(!a.mask.empty());
+    REQUIRE(!b.mask.empty());
+
+    for (const SelectMode mode : {SelectMode::Add, SelectMode::Subtract,
+                                  SelectMode::Intersect}) {
+        CAPTURE(static_cast<int>(mode));
+        const Selection out = combineSelections(a, b, mode);
+        REQUIRE(!out.mask.empty());
+
+        // Elementwise on the coverage BYTES rather than on contains(): the
+        // region can be right to the pixel while every soft value in it has
+        // been thrown away, and only the bytes catch that.
+        int mismatched = 0;
+        for (std::int32_t py = 0; py < 120; ++py) {
+            for (std::int32_t px = 0; px < 120; ++px) {
+                const int va = a.coverage(px, py);
+                const int vb = b.coverage(px, py);
+                const int want = mode == SelectMode::Add      ? std::max(va, vb)
+                               : mode == SelectMode::Subtract ? va * (255 - vb) / 255
+                                                              : std::min(va, vb);
+                if (out.coverage(px, py) != want) ++mismatched;
+            }
+        }
+        CHECK(mismatched == 0);
+
+        // Independent of the arithmetic above: the result has to CONTAIN soft
+        // values. A hard boolean passes nothing but 0 and 255 through, so this
+        // is what fails first if anyone thresholds.
+        int partial = 0;
+        for (const std::uint8_t v : out.mask)
+            if (v != 0 && v != 255) ++partial;
+        CHECK(partial > 40);
+    }
+}
+
+TEST_CASE("where two soft edges cross, the combination is soft too") {
+    // The seam itself, and the tightest statement of it: at every pixel where
+    // BOTH operands are partly covered, add, subtract and intersect must all
+    // come out partly covered. This is the pixel a hard boolean snaps, and the
+    // row of them along a crossing is the jagged edge the artist sees.
+    const Selection a =
+        lassoOf({{10.0, 10.0}, {90.0, 10.0}, {10.0, 90.0}}, 120, 120);
+    const Selection b =
+        lassoOf({{10.5, 10.5}, {90.5, 10.5}, {10.5, 90.5}}, 120, 120);
+
+    const Selection sum  = combineSelections(a, b, SelectMode::Add);
+    const Selection cut  = combineSelections(a, b, SelectMode::Subtract);
+    const Selection both = combineSelections(a, b, SelectMode::Intersect);
+
+    const auto soft = [](std::uint8_t v) { return v != 0 && v != 255; };
+    int seam = 0, hard = 0;
+    for (std::int32_t y = 0; y < 120; ++y) {
+        for (std::int32_t x = 0; x < 120; ++x) {
+            if (!soft(a.coverage(x, y)) || !soft(b.coverage(x, y))) continue;
+            ++seam;
+            // Subtract is the one that can legitimately reach 0 here — a soft
+            // pixel taken out by a soft pixel of nearly full coverage — so it
+            // is checked for not having snapped to 255 rather than for both.
+            if (!soft(sum.coverage(x, y)) || !soft(both.coverage(x, y)) ||
+                cut.coverage(x, y) == 255)
+                ++hard;
+        }
+    }
+    CHECK(seam > 0);      // the two edges really did cross
+    CHECK(hard == 0);
+}
+
+TEST_CASE("a named selection survives a save, a reload and a clone") {
+    Document doc = makeDocument(120, 120, StraightRgba8{255, 255, 255, 255});
+    const Selection lasso =
+        lassoOf({{10.0, 10.0}, {100.0, 10.0}, {10.0, 100.0}}, 120, 120);
+    REQUIRE(!lasso.mask.empty());
+
+    doc.storedSelections.push_back(StoredSelection{"Character", lasso});
+    doc.storedSelections.push_back(StoredSelection{"Sky", Selection{4, 5, 30, 40}});
+    // The current selection is something else entirely, so a loader that mixed
+    // the two up is caught rather than accidentally right.
+    doc.selection = Selection{0, 0, 8, 8};
+
+    const auto path = scratchFile("stored_selections.sable");
+    REQUIRE(saveProject(doc, path).has_value());
+    const auto back = loadProject(path);
+    REQUIRE(back.has_value());
+    REQUIRE(back->storedSelections.size() == 2);
+    CHECK(back->storedSelections[0].name == "Character");
+    CHECK(back->storedSelections[0].selection == lasso);
+    CHECK(back->storedSelections[1].name == "Sky");
+    CHECK(back->storedSelections[1].selection == Selection{4, 5, 30, 40});
+    CHECK(back->storedSelections[1].selection.mask.empty());   // still a rectangle
+    REQUIRE(back->selection.has_value());
+    CHECK(*back->selection == Selection{0, 0, 8, 8});
+
+    // The autosave hand-off has to carry them too (D-013), or a recovered file
+    // comes back without the work #52 exists to keep.
+    const Document copy = cloneDocument(*back);
+    CHECK(copy.storedSelections == back->storedSelections);
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("a document with no stored selections declares no newer format") {
+    // Same deal as the mask (#48): a document not using the feature stays
+    // openable by an older Sable, or the bump costs every painting something in
+    // exchange for nothing.
+    Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+    const auto plain = scratchFile("stored_none.sable");
+    REQUIRE(saveProject(doc, plain).has_value());
+
+    doc.storedSelections.push_back(StoredSelection{"Kept", Selection{1, 1, 10, 10}});
+    const auto kept = scratchFile("stored_some.sable");
+    REQUIRE(saveProject(doc, kept).has_value());
+
+    const auto versionOf = [](const std::filesystem::path& p) {
+        mz_zip_archive zip{};
+        REQUIRE(mz_zip_reader_init_file(&zip, p.string().c_str(), 0));
+        std::size_t size = 0;
+        void* data = mz_zip_reader_extract_file_to_heap(&zip, "document.json", &size, 0);
+        REQUIRE(data != nullptr);
+        const auto manifest =
+            nlohmann::json::parse(std::string(static_cast<const char*>(data), size));
+        mz_free(data);
+        mz_zip_reader_end(&zip);
+        return manifest.value("format_version", 0);
+    };
+    CHECK(versionOf(plain) == SABLE_FORMAT_VERSION_8BIT);
+    CHECK(versionOf(kept)  == SABLE_FORMAT_VERSION_STORED);
+    std::filesystem::remove(plain);
+    std::filesystem::remove(kept);
+}
+
+TEST_CASE("restoring a stored selection replaces the live one with no stale mask") {
+    // The lasso leaves a per-pixel mask behind. Restoring a plain rectangle over
+    // it has to drop that mask, or the rectangle keeps the lasso's holes and the
+    // artist fills a shape they are not looking at.
+    Document doc = makeDocument(120, 120, StraightRgba8{255, 255, 255, 255});
+    doc.selection = lassoOf({{10.0, 10.0}, {100.0, 10.0}, {10.0, 100.0}},
+                                   120, 120);
+    REQUIRE(!doc.selection->mask.empty());
+    doc.storedSelections.push_back(StoredSelection{"Box", Selection{40, 40, 20, 20}});
+
+    doc.selection = combineSelections(*doc.selection,
+                                      doc.storedSelections[0].selection,
+                                      SelectMode::Replace);
+    REQUIRE(doc.selection.has_value());
+    CHECK(doc.selection->mask.empty());
+    CHECK(*doc.selection == Selection{40, 40, 20, 20});
+    CHECK(doc.selection->coverage(20, 20) == 0);   // a corner only the lasso had
+}
+
+TEST_CASE("a layer's alpha as a selection reproduces its shape when filled") {
+    // #52's third acceptance criterion. Painted with a soft-edged dab on
+    // purpose: an alpha source that kept only the solid middle would pass a
+    // hard-edged test and put a staircase round everything real.
+    Document doc = makeDocument(120, 120, StraightRgba8{255, 255, 255, 255});
+    const LayerId source = doc.activeLayer;
+    paintSquare(doc, source, StraightRgba8{200, 30, 40, 255}, 60.0, 60.0);
+
+    const Selection shape =
+        selectionFromLayerAlpha(*doc.layerById(source), doc.width, doc.height);
+    REQUIRE(!shape.empty());
+    REQUIRE(!shape.mask.empty());        // the dab's edge is soft, so this must be
+
+    doc.undo.push(addLayerAbove(doc, source, "Copy"));
+    const LayerId copy = doc.activeLayer;
+    doc.selection = shape;
+    doc.undo.push(fillSelection(doc, copy, StraightRgba8{200, 30, 40, 255}));
+
+    int worst = 0, soft = 0, painted = 0;
+    for (std::int32_t y = 0; y < doc.height; ++y) {
+        for (std::int32_t x = 0; x < doc.width; ++x) {
+            const int want = rawAlpha(doc, source, x, y);
+            const int got  = rawAlpha(doc, copy, x, y);
+            worst = std::max(worst, std::abs(want - got));
+            if (want != 0) ++painted;
+            if (want != 0 && want != 255) ++soft;
+        }
+    }
+    CHECK(painted > 0);
+    CHECK(soft > 20);                    // there really was an anti-aliased rim
+    // One level, not zero: the fill lerps a premultiplied colour towards the
+    // coverage in float and rounds once at the store, which the source alpha
+    // never went through. Two would mean the shape itself came out different.
+    CHECK(worst <= 1);
+}
+
+TEST_CASE("a layer's alpha as a selection sees through its own mask") {
+    // The shape an artist means is the shape they can see. A masked-away corner
+    // is not part of the layer any more, and selecting it would send the next
+    // fill somewhere the screen says is empty.
+    Document doc = makeDocument(120, 120, StraightRgba8{255, 255, 255, 255});
+    const LayerId id = doc.activeLayer;
+    paintSquare(doc, id, StraightRgba8{0, 0, 0, 255}, 60.0, 60.0);
+    REQUIRE(selectionFromLayerAlpha(*doc.layerById(id), 120, 120).contains(60, 60));
+
+    doc.layerById(id)->mask.emplace();
+    paintMaskSquare(doc, id, StraightRgba8{0, 0, 0, 255}, 60.0, 60.0);
+    CHECK(!selectionFromLayerAlpha(*doc.layerById(id), 120, 120).contains(60, 60));
+
+    // Switching the mask off is not the same as deleting it, here too.
+    doc.layerById(id)->mask->enabled = false;
+    CHECK(selectionFromLayerAlpha(*doc.layerById(id), 120, 120).contains(60, 60));
+}
+
+TEST_CASE("a layer with nothing on it selects nothing") {
+    Document doc = makeDocument(64, 64, StraightRgba8{255, 255, 255, 255});
+    CHECK(selectionFromLayerAlpha(*doc.active(), 64, 64).empty());
+}
+
+TEST_CASE("a selection and a mask are the same coverage in two places") {
+    // D-033: no rounding and no threshold in either direction — the units and
+    // the convention already agree (D-031), so a soft edge crosses intact and
+    // comes back byte for byte.
+    const Selection lasso =
+        lassoOf({{10.0, 10.0}, {100.0, 10.0}, {10.0, 100.0}}, 120, 120);
+    REQUIRE(!lasso.mask.empty());
+
+    const LayerMask mask = maskFromSelection(lasso);
+    CHECK(mask.outside == 0);            // nothing outside a selection is selected
+    int soft = 0, differing = 0;
+    for (std::int32_t y = 0; y < 120; ++y) {
+        for (std::int32_t x = 0; x < 120; ++x) {
+            const std::uint8_t v = lasso.coverage(x, y);
+            if (maskCoverage(mask, x, y) != v) ++differing;
+            if (v != 0 && v != 255) ++soft;
+        }
+    }
+    CHECK(differing == 0);
+    CHECK(soft > 40);                    // the diagonal really was anti-aliased
+
+    CHECK(selectionFromMask(mask, 120, 120) == lasso);
+}
+
+TEST_CASE("a reveal-all mask selects the whole canvas, on the fast path") {
+    // `outside` covers the plane, so a mask with no tiles still says something
+    // about every pixel — and what it says is a plain rectangle, which must not
+    // arrive carrying a canvas of 255s.
+    LayerMask mask;
+    const Selection all = selectionFromMask(mask, 64, 48);
+    CHECK(all == Selection{0, 0, 64, 48});
+    CHECK(all.mask.empty());
+
+    mask.outside = 0;
+    CHECK(selectionFromMask(mask, 64, 48).empty());
+}
+
+TEST_CASE("setting a layer's mask from a selection is one undoable step") {
+    Document doc = makeDocument(120, 120, StraightRgba8{255, 255, 255, 255});
+    const LayerId id = doc.activeLayer;
+    paintSquare(doc, id, StraightRgba8{0, 0, 0, 255}, 60.0, 60.0);
+
+    // An existing mask with a tile in it, so the record has to carry both the
+    // tiles it replaces and the ones only the new mask has.
+    doc.layerById(id)->mask.emplace();
+    doc.layerById(id)->mask->outside = 200;
+    paintMaskSquare(doc, id, StraightRgba8{255, 255, 255, 255}, 20.0, 20.0);
+    const std::uint64_t before = hashCanvas(doc);
+
+    const Selection lasso =
+        lassoOf({{40.0, 40.0}, {110.0, 40.0}, {40.0, 110.0}}, 120, 120);
+    UndoRecord rec = setLayerMask(doc, id, maskFromSelection(lasso));
+    CHECK(!rec.empty());
+    doc.undo.push(std::move(rec));
+
+    REQUIRE(doc.layerById(id)->mask.has_value());
+    CHECK(doc.layerById(id)->mask->outside == 0);
+    CHECK(maskCoverage(*doc.layerById(id)->mask, 50, 50) == lasso.coverage(50, 50));
+    CHECK(maskCoverage(*doc.layerById(id)->mask, 20, 20) == 0);   // outside the lasso
+    CHECK(hashCanvas(doc) != before);
+
+    doc.undo.undo(doc);
+    REQUIRE(doc.layerById(id)->mask.has_value());
+    CHECK(doc.layerById(id)->mask->outside == 200);
+    CHECK(hashCanvas(doc) == before);    // exactly the mask that was there
+
+    doc.undo.redo(doc);
+    CHECK(doc.layerById(id)->mask->outside == 0);
+    CHECK(maskCoverage(*doc.layerById(id)->mask, 20, 20) == 0);
 }
